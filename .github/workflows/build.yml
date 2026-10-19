@@ -12,15 +12,20 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Create App Bundle & Download FFmpeg
+      - name: Create App Bundle & Bundle FFmpeg
         run: |
           mkdir -p MyTangerine.app/Contents/MacOS
           mkdir -p MyTangerine.app/Contents/Resources
 
-          # 비디오/오디오 만능 변환 엔진(FFmpeg)을 앱 내부에 내장
-          curl -L https://evermeet.cx/ffmpeg/getrelease/zip -o ffmpeg.zip
-          unzip -q ffmpeg.zip -d MyTangerine.app/Contents/Resources/
-          chmod +x MyTangerine.app/Contents/Resources/ffmpeg
+          # GitHub 가상 맥에 기본 내장된 FFmpeg를 찾아 앱 내부에 복사 (다운로드 오류 완벽 방지)
+          if command -v ffmpeg >/dev/null 2>&1; then
+            cp $(which ffmpeg) MyTangerine.app/Contents/Resources/ffmpeg
+            chmod +x MyTangerine.app/Contents/Resources/ffmpeg
+          else
+            brew install ffmpeg
+            cp $(which ffmpeg) MyTangerine.app/Contents/Resources/ffmpeg
+            chmod +x MyTangerine.app/Contents/Resources/ffmpeg
+          fi
 
           # Info.plist 생성
           cat << 'EOF' > MyTangerine.app/Contents/Info.plist
