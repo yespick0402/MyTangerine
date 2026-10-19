@@ -1,0 +1,61 @@
+name: Build MyTangerine App
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Create App Bundle & Download FFmpeg
+        run: |
+          mkdir -p MyTangerine.app/Contents/MacOS
+          mkdir -p MyTangerine.app/Contents/Resources
+
+          # 비디오/오디오 만능 변환 엔진(FFmpeg)을 앱 내부에 내장
+          curl -L https://evermeet.cx/ffmpeg/getrelease/zip -o ffmpeg.zip
+          unzip -q ffmpeg.zip -d MyTangerine.app/Contents/Resources/
+          chmod +x MyTangerine.app/Contents/Resources/ffmpeg
+
+          # Info.plist 생성
+          cat << 'EOF' > MyTangerine.app/Contents/Info.plist
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleExecutable</key>
+              <string>MyTangerine</string>
+              <key>CFBundleIdentifier</key>
+              <string>com.custom.mytangerine</string>
+              <key>CFBundleName</key>
+              <string>MyTangerine</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+              <key>CFBundleShortVersionString</key>
+              <string>1.0</string>
+              <key>LSUIElement</key>
+              <true/>
+              <key>NSHighResolutionCapable</key>
+              <true/>
+          </dict>
+          </plist>
+          EOF
+
+      - name: Compile Universal macOS App (Apple Silicon + Intel)
+        run: |
+          swiftc main.swift -o MyTangerine_arm64 -target arm64-apple-macos13.0 -O
+          swiftc main.swift -o MyTangerine_x86_64 -target x86_64-apple-macos13.0 -O
+          lipo -create -output MyTangerine.app/Contents/MacOS/MyTangerine MyTangerine_arm64 MyTangerine_x86_64
+          codesign --force --deep --sign - MyTangerine.app
+          zip -r MyTangerine.zip MyTangerine.app
+
+      - name: Upload Finished Mac App
+        uses: actions/upload-artifact@v4
+        with:
+          name: MyTangerine-Mac-App
+          path: MyTangerine.zip
