@@ -69,7 +69,7 @@ class AppState: ObservableObject {
                     WheelItem(title: "M4A", icon: "music.quarternote.3", actionKey: "conv_m4a"),
                     WheelItem(title: "WAV", icon: "waveform", actionKey: "conv_wav"),
                     WheelItem(title: "FLAC", icon: "hifispeaker", actionKey: "conv_flac"),
-                    WheelItem(title: "AIFF", icon: "OpticalDisc", actionKey: "conv_aiff"),
+                    WheelItem(title: "AIFF", icon: "opticaldisc", actionKey: "conv_aiff"),
                     WheelItem(title: "OGG", icon: "speaker.wave.2", actionKey: "conv_ogg")
                 ]
             } else {
@@ -159,7 +159,6 @@ class FileProcessor {
     static func execute(actionKey: String, files: [URL]) {
         guard !files.isEmpty else { return }
         
-        // 팝업 도구 창을 띄우는 작업들
         if actionKey == "tool_edit_photo", let first = files.first {
             ToolWindowManager.shared.showEditPhotoWindow(url: first)
             return
@@ -193,7 +192,6 @@ class FileProcessor {
             return
         }
         
-        // 즉시 실행 액션 (Control 휠)
         if actionKey == "act_copy_path" {
             let paths = files.map { $0.path }.joined(separator: "\n")
             NSPasteboard.general.clearContents()
@@ -225,7 +223,6 @@ class FileProcessor {
             return
         }
         
-        // 파일 변환 작업
         for file in files {
             if actionKey.hasPrefix("conv_") {
                 let targetExt = actionKey.replacingOccurrences(of: "conv_", with: "")
@@ -384,65 +381,76 @@ struct RadialWheelView: View {
                 .overlay(Circle().stroke(Color.white.opacity(0.35), lineWidth: 1.5))
                 .shadow(color: .black.opacity(0.32), radius: 18, x: 0, y: 8)
             
-            let count = max(state.items.count, 1)
-            let angleStep = 360.0 / Double(count)
-            
-            ForEach(Array(state.items.enumerated()), id: \.element.id) { index, item in
-                let start = Angle(degrees: Double(index) * angleStep - 90.0 - angleStep / 2.0 + 1.8)
-                let end = Angle(degrees: Double(index + 1) * angleStep - 90.0 - angleStep / 2.0 - 1.8)
-                let midAngle = (start.radians + end.radians) / 2.0
-                let isHovered = (state.hoveredIndex == index)
-                
-                ZStack {
-                    PieSliceShape(startAngle: start, endAngle: end)
-                        .fill(isHovered ?
-                              LinearGradient(colors: [Color.orange, Color.red], startPoint: .topLeading, endPoint: .bottomTrailing) :
-                              LinearGradient(colors: [Color.white.opacity(0.75), Color.white.opacity(0.45)], startPoint: .top, endPoint: .bottom)
-                        )
-                        .overlay(
-                            PieSliceShape(startAngle: start, endAngle: end)
-                                .stroke(isHovered ? Color.white : Color.black.opacity(0.08), lineWidth: 1.2)
-                        )
-                    
-                    let labelRadius = (wheelSize / 2.0) * 0.67
-                    VStack(spacing: 4) {
-                        Image(systemName: item.icon)
-                            .font(.system(size: 16, weight: .semibold))
-                        Text(item.title)
-                            .font(.system(size: 11, weight: .bold, design: .rounded))
-                            .lineLimit(1)
-                    }
-                    .foregroundColor(isHovered ? .white : .black.opacity(0.85))
-                    .position(
-                        x: wheelSize / 2.0 + CGFloat(cos(midAngle)) * labelRadius,
-                        y: wheelSize / 2.0 + CGFloat(sin(midAngle)) * labelRadius
-                    )
-                }
-                .frame(width: wheelSize, height: wheelSize)
-            }
-            
-            // 중앙 파일 용량 및 현재 모드 배지
-            VStack(spacing: 2) {
-                Text(state.wheelMode.rawValue)
-                    .font(.system(size: 9, weight: .heavy, design: .rounded))
-                    .foregroundColor(.orange)
-                Text(state.totalSizeText)
-                    .font(.system(size: 13, weight: .bold, design: .rounded))
-                    .foregroundColor(.primary)
-                Text("\(state.draggedFiles.count)개 파일")
-                    .font(.system(size: 10))
-                    .foregroundColor(.secondary)
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .background(.regularMaterial, in: Capsule())
-            .overlay(Capsule().stroke(Color.white.opacity(0.5), lineWidth: 1))
+            slicesView
+            centerBadgeView
         }
         .frame(width: wheelSize + 30, height: wheelSize + 30)
     }
+    
+    var slicesView: some View {
+        let count = max(state.items.count, 1)
+        let angleStep = 360.0 / Double(count)
+        return ForEach(0..<state.items.count, id: \.self) { index in
+            sliceItemView(index: index, angleStep: angleStep)
+        }
+    }
+    
+    func sliceItemView(index: Int, angleStep: Double) -> some View {
+        let item = state.items[index]
+        let start = Angle(degrees: Double(index) * angleStep - 90.0 - angleStep / 2.0 + 1.8)
+        let end = Angle(degrees: Double(index + 1) * angleStep - 90.0 - angleStep / 2.0 - 1.8)
+        let midAngle = (start.radians + end.radians) / 2.0
+        let isHovered = (state.hoveredIndex == index)
+        let labelRadius = (wheelSize / 2.0) * 0.67
+        
+        let fillGrad = isHovered ?
+            LinearGradient(colors: [Color.orange, Color.red], startPoint: .topLeading, endPoint: .bottomTrailing) :
+            LinearGradient(colors: [Color.white.opacity(0.75), Color.white.opacity(0.45)], startPoint: .top, endPoint: .bottom)
+        
+        return ZStack {
+            PieSliceShape(startAngle: start, endAngle: end)
+                .fill(fillGrad)
+                .overlay(
+                    PieSliceShape(startAngle: start, endAngle: end)
+                        .stroke(isHovered ? Color.white : Color.black.opacity(0.08), lineWidth: 1.2)
+                )
+            
+            VStack(spacing: 4) {
+                Image(systemName: item.icon)
+                    .font(.system(size: 16, weight: .semibold))
+                Text(item.title)
+                    .font(.system(size: 11, weight: .bold, design: .rounded))
+                    .lineLimit(1)
+            }
+            .foregroundColor(isHovered ? .white : .black.opacity(0.85))
+            .position(
+                x: wheelSize / 2.0 + CGFloat(cos(midAngle)) * labelRadius,
+                y: wheelSize / 2.0 + CGFloat(sin(midAngle)) * labelRadius
+            )
+        }
+        .frame(width: wheelSize, height: wheelSize)
+    }
+    
+    var centerBadgeView: some View {
+        VStack(spacing: 2) {
+            Text(state.wheelMode.rawValue)
+                .font(.system(size: 9, weight: .heavy, design: .rounded))
+                .foregroundColor(.orange)
+            Text(state.totalSizeText)
+                .font(.system(size: 13, weight: .bold, design: .rounded))
+                .foregroundColor(.primary)
+            Text("\(state.draggedFiles.count)개 파일")
+                .font(.system(size: 10))
+                .foregroundColor(.secondary)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(.regularMaterial, in: Capsule())
+        .overlay(Capsule().stroke(Color.white.opacity(0.5), lineWidth: 1))
+    }
 }
 
-// MARK: - 미니 편집 도구 창들 (Edit Photo, Add BG, Redact, Audio Trim/Bleep, Compress, Metadata)
+// MARK: - 미니 편집 도구 창 매니저
 class ToolWindowManager {
     static let shared = ToolWindowManager()
     var activeWindows: [NSWindow] = []
@@ -521,7 +529,7 @@ class ToolWindowManager {
     }
 }
 
-// 1. 사진 보정 창 (스크린샷 3번 구현)
+// 1. 사진 보정 창
 struct EditPhotoView: View {
     let fileURL: URL
     @State private var exposure: Double = 0.0
@@ -619,7 +627,7 @@ struct EditPhotoView: View {
     }
 }
 
-// 2. 배경 추가 창 (스크린샷 4번 Add BG 구현)
+// 2. 배경 추가 창 (Add BG)
 struct AddBGView: View {
     let fileURL: URL
     @State private var selectedPreset = 0
@@ -782,7 +790,7 @@ struct RedactPhotoView: View {
     }
 }
 
-// 4. 오디오 파형 편집 / 채널 변환 / Bleep 스튜디오 (스크린샷 5번 구현)
+// 4. 오디오 파형 편집 / 채널 변환 / Bleep 스튜디오 (컴파일 최적화 완료)
 struct AudioStudioView: View {
     let fileURL: URL
     let initialMode: String
@@ -796,102 +804,147 @@ struct AudioStudioView: View {
     @State private var enableBleep: Bool = false
     @State private var duration: Double = 40.0
     
-    let sampleBars: [CGFloat] = (0..<65).map { i in
-        CGFloat(abs(sin(Double(i) * 0.35) * cos(Double(i) * 0.15))) * 0.8 + 0.15
+    let sampleBars: [CGFloat] = AudioStudioView.makeSampleBars()
+    
+    static func makeSampleBars() -> [CGFloat] {
+        var result: [CGFloat] = []
+        for i in 0..<65 {
+            let d = Double(i)
+            let val = abs(sin(d * 0.35) * cos(d * 0.15)) * 0.8 + 0.15
+            result.append(CGFloat(val))
+        }
+        return result
     }
     
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            HStack {
-                Text("Trim & Convert Audio").font(.headline)
-                Spacer()
-                Text(String(format: "%.2fs selected", duration * (endRatio - startRatio)))
-                    .font(.caption.monospacedDigit()).foregroundColor(.secondary)
-            }
-            
-            // 오디오 파형 시각화 및 구간 조절 바
-            ZStack(alignment: .leading) {
-                RoundedRectangle(cornerRadius: 10)
-                    .fill(Color.yellow.opacity(0.25))
-                    .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.red, lineWidth: 2))
-                
-                HStack(spacing: 3) {
-                    ForEach(0..<sampleBars.count, id: \.self) { idx in
-                        let pos = Double(idx) / Double(sampleBars.count)
-                        let inRange = pos >= startRatio && pos <= endRatio
-                        let inBleep = enableBleep && (pos >= bleepStartRatio && pos <= bleepEndRatio)
-                        Capsule()
-                            .fill(inBleep ? Color.purple : (inRange ? Color.red : Color.gray.opacity(0.35)))
-                            .frame(width: 4, height: 85 * sampleBars[idx])
-                    }
-                }
-                .padding(.horizontal, 12)
-            }
-            .frame(height: 105)
-            
-            HStack {
-                VStack(alignment: .leading) {
-                    Text("Start: \(String(format: "%.1fs", duration * startRatio))").font(.caption)
-                    Slider(value: $startRatio, in: 0.0...max(0.01, endRatio - 0.05)).tint(.red)
-                }
-                VStack(alignment: .leading) {
-                    Text("End: \(String(format: "%.1fs", duration * endRatio))").font(.caption)
-                    Slider(value: $endRatio, in: min(0.99, startRatio + 0.05)...1.0).tint(.red)
-                }
-            }
-            
+            headerSection
+            waveformSection
+            trimSlidersSection
             Toggle("Trim silent ends automatically (앞뒤 무음 자동 제거)", isOn: $trimSilence)
                 .font(.caption)
-            
             Divider()
-            
-            HStack(spacing: 20) {
-                Picker("채널", selection: $isMono) {
-                    Text("Stereo").tag(false)
-                    Text("Mono").tag(true)
-                }.pickerStyle(.segmented).frame(width: 160)
-                
-                HStack {
-                    Text("볼륨").font(.caption)
-                    Slider(value: $volumePercent, in: 20...200).tint(.orange)
-                    Text("\(Int(volumePercent))%").font(.caption.monospacedDigit()).frame(width: 40)
-                }
-            }
-            
-            HStack {
-                Toggle("Bleep (삐- 소리 덮어쓰기)", isOn: $enableBleep).font(.caption.bold())
-                if enableBleep {
-                    Slider(value: $bleepStartRatio, in: 0.0...0.9).tint(.purple)
-                    Text("~")
-                    Slider(value: $bleepEndRatio, in: min(0.95, bleepStartRatio + 0.02)...1.0).tint(.purple)
-                }
-            }
-            
-            HStack {
-                Button("▶ Play Preview") {
-                    NSWorkspace.shared.open(fileURL)
-                }
-                Spacer()
-                Button("Apply & Save") {
-                    applyAudioChanges()
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.orange)
-            }
+            channelAndVolumeSection
+            bleepSection
+            bottomButtonsSection
         }
         .padding(18)
         .background(LinearGradient(colors: [Color.orange.opacity(0.22), Color.red.opacity(0.12)], startPoint: .top, endPoint: .bottom))
         .onAppear {
             if initialMode == "tool_audio_bleep" { enableBleep = true }
+            loadAudioDuration()
+        }
+    }
+    
+    var headerSection: some View {
+        HStack {
+            Text("Trim & Convert Audio").font(.headline)
+            Spacer()
+            let selectedSec = duration * (endRatio - startRatio)
+            Text(String(format: "%.2fs selected", selectedSec))
+                .font(.caption.monospacedDigit())
+                .foregroundColor(.secondary)
+        }
+    }
+    
+    var waveformSection: some View {
+        ZStack(alignment: .leading) {
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color.yellow.opacity(0.25))
+                .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.red, lineWidth: 2))
+            
+            HStack(spacing: 3) {
+                ForEach(0..<sampleBars.count, id: \.self) { idx in
+                    waveformBar(at: idx)
+                }
+            }
+            .padding(.horizontal, 12)
+        }
+        .frame(height: 105)
+    }
+    
+    func waveformBar(at idx: Int) -> some View {
+        let pos = Double(idx) / Double(sampleBars.count)
+        let inRange = (pos >= startRatio && pos <= endRatio)
+        let inBleep = enableBleep && (pos >= bleepStartRatio && pos <= bleepEndRatio)
+        let barColor: Color = inBleep ? .purple : (inRange ? .red : Color.gray.opacity(0.35))
+        return Capsule()
+            .fill(barColor)
+            .frame(width: 4, height: 85 * sampleBars[idx])
+    }
+    
+    var trimSlidersSection: some View {
+        HStack {
+            VStack(alignment: .leading) {
+                Text("Start: \(String(format: "%.1fs", duration * startRatio))").font(.caption)
+                Slider(value: $startRatio, in: 0.0...0.95).tint(.red)
+            }
+            VStack(alignment: .leading) {
+                Text("End: \(String(format: "%.1fs", duration * endRatio))").font(.caption)
+                Slider(value: $endRatio, in: 0.05...1.0).tint(.red)
+            }
+        }
+    }
+    
+    var channelAndVolumeSection: some View {
+        HStack(spacing: 20) {
+            Picker("채널", selection: $isMono) {
+                Text("Stereo").tag(false)
+                Text("Mono").tag(true)
+            }
+            .pickerStyle(.segmented)
+            .frame(width: 160)
+            
+            HStack {
+                Text("볼륨").font(.caption)
+                Slider(value: $volumePercent, in: 20...200).tint(.orange)
+                Text("\(Int(volumePercent))%").font(.caption.monospacedDigit()).frame(width: 40)
+            }
+        }
+    }
+    
+    var bleepSection: some View {
+        HStack {
+            Toggle("Bleep (삐- 소리 덮어쓰기)", isOn: $enableBleep).font(.caption.bold())
+            if enableBleep {
+                Slider(value: $bleepStartRatio, in: 0.0...0.9).tint(.purple)
+                Text("~")
+                Slider(value: $bleepEndRatio, in: 0.05...1.0).tint(.purple)
+            }
+        }
+    }
+    
+    var bottomButtonsSection: some View {
+        HStack {
+            Button("▶ Play Preview") {
+                NSWorkspace.shared.open(fileURL)
+            }
+            Spacer()
+            Button("Apply & Save") {
+                applyAudioChanges()
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.orange)
+        }
+    }
+    
+    func loadAudioDuration() {
+        Task {
             let asset = AVURLAsset(url: fileURL)
-            let sec = CMTimeGetSeconds(asset.duration)
-            if sec.isFinite && sec > 0 { duration = sec }
+            if let cmTime = try? await asset.load(.duration) {
+                let sec = CMTimeGetSeconds(cmTime)
+                if sec.isFinite && sec > 0 {
+                    await MainActor.run { duration = sec }
+                }
+            }
         }
     }
     
     func applyAudioChanges() {
-        let startSec = duration * startRatio
-        let endSec = duration * endRatio
+        let actualStart = min(startRatio, endRatio)
+        let actualEnd = max(startRatio, endRatio)
+        let startSec = duration * actualStart
+        let endSec = duration * actualEnd
         let outURL = FileProcessor.uniqueOutputURL(for: fileURL, newExt: fileURL.pathExtension, suffix: "_edited")
         
         var filters: [String] = []
@@ -1001,7 +1054,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         
-        // 상단 메뉴바 아이콘 생성
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let btn = statusItem.button {
             btn.image = NSImage(systemSymbolName: "circle.hexagongrid.fill", accessibilityDescription: "MyTangerine")
@@ -1042,12 +1094,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let dragPboard = NSPasteboard(name: .drag)
         lastPasteboardChangeCount = dragPboard.changeCount
         
-        // 드래그 중 이동 감지
         NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDragged, .flagsChanged]) { [weak self] event in
             self?.handleDragOrFlags(event: event)
         }
         
-        // 마우스 드롭 감지
         NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseUp]) { [weak self] _ in
             self?.handleMouseUp()
         }
@@ -1128,7 +1178,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         
-        // 화면 좌표계(Y가 위쪽)를 시계방향 각도(12시 기준 0도)로 변환
         var degrees = atan2(dx, dy) * 180.0 / .pi
         if degrees < 0 { degrees += 360.0 }
         
