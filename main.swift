@@ -9,123 +9,70 @@ import Vision
 import UniformTypeIdentifiers
 import AudioToolbox
 
-// MARK: - 0. 사용자 단축키 설정 매니저 (UserDefaults 영구 저장)
-enum DragModifierPreset: String, CaseIterable, Identifiable {
-    case shift = "shift"
-    case control = "control"
-    case option = "option"
-    case command = "command"
-    case optionShift = "option_shift"
-    case controlShift = "control_shift"
-    case commandShift = "command_shift"
-    case controlOption = "control_option"
-    
-    var id: String { rawValue }
-    
-    var displayName: String {
-        switch self {
-        case .shift: return "⇧ Shift"
-        case .control: return "⌃ Control"
-        case .option: return "⌥ Option"
-        case .command: return "⌘ Command"
-        case .optionShift: return "⌥⇧ Option + Shift"
-        case .controlShift: return "⌃⇧ Control + Shift"
-        case .commandShift: return "⌘⇧ Command + Shift"
-        case .controlOption: return "⌃⌥ Control + Option"
-        }
-    }
-    
-    var requiredFlags: NSEvent.ModifierFlags {
-        switch self {
-        case .shift: return [.shift]
-        case .control: return [.control]
-        case .option: return [.option]
-        case .command: return [.command]
-        case .optionShift: return [.option, .shift]
-        case .controlShift: return [.control, .shift]
-        case .commandShift: return [.command, .shift]
-        case .controlOption: return [.control, .option]
-        }
-    }
-}
-
-enum CycleKeyPreset: String, CaseIterable, Identifiable {
-    case spaceAndTab = "space_tab"
-    case spaceOnly = "space"
-    case tabOnly = "tab"
-    case backtick = "backtick"
-    
-    var id: String { rawValue }
-    
-    var displayName: String {
-        switch self {
-        case .spaceAndTab: return "Space(스페이스바) 또는 Tab 키"
-        case .spaceOnly: return "Space(스페이스바)만 사용"
-        case .tabOnly: return "Tab 키만 사용"
-        case .backtick: return "` (백틱/물결) 키"
-        }
-    }
-    
-    func matches(keyCode: Int64) -> Bool {
-        switch self {
-        case .spaceAndTab: return keyCode == 49 || keyCode == 48
-        case .spaceOnly: return keyCode == 49
-        case .tabOnly: return keyCode == 48
-        case .backtick: return keyCode == 50
-        }
-    }
-}
-
+// MARK: - 0. 직접 키보드를 눌러 설정하는 단축키 매니저 (오리지널 Tangerine 기본값)
 class ShortcutSettings: ObservableObject {
     static let shared = ShortcutSettings()
     
-    @Published var convertModifier: DragModifierPreset {
-        didSet { UserDefaults.standard.set(convertModifier.rawValue, forKey: "shortcut_convert") }
+    // CGEventFlags rawValue를 저장 (기본값: Convert = Shift, Tools = Option + Shift)
+    @Published var convertFlagsRaw: UInt64 {
+        didSet { UserDefaults.standard.set(convertFlagsRaw, forKey: "tangerine_sc_convert_v38") }
     }
-    @Published var toolsModifier: DragModifierPreset {
-        didSet { UserDefaults.standard.set(toolsModifier.rawValue, forKey: "shortcut_tools") }
+    @Published var toolsFlagsRaw: UInt64 {
+        didSet { UserDefaults.standard.set(toolsFlagsRaw, forKey: "tangerine_sc_tools_v38") }
     }
-    @Published var actionsModifier: DragModifierPreset {
-        didSet { UserDefaults.standard.set(actionsModifier.rawValue, forKey: "shortcut_actions") }
-    }
-    @Published var cycleKey: CycleKeyPreset {
-        didSet { UserDefaults.standard.set(cycleKey.rawValue, forKey: "shortcut_cycle") }
-    }
+    
+    static let defaultConvertRaw: UInt64 = NSEvent.ModifierFlags.shift.rawValue
+    static let defaultToolsRaw: UInt64 = NSEvent.ModifierFlags([.option, .shift]).rawValue
     
     init() {
-        let convRaw = UserDefaults.standard.string(forKey: "shortcut_convert") ?? DragModifierPreset.shift.rawValue
-        let toolRaw = UserDefaults.standard.string(forKey: "shortcut_tools") ?? DragModifierPreset.optionShift.rawValue
-        let actRaw = UserDefaults.standard.string(forKey: "shortcut_actions") ?? DragModifierPreset.control.rawValue
-        let cycRaw = UserDefaults.standard.string(forKey: "shortcut_cycle") ?? CycleKeyPreset.spaceAndTab.rawValue
-        
-        self.convertModifier = DragModifierPreset(rawValue: convRaw) ?? .shift
-        self.toolsModifier = DragModifierPreset(rawValue: toolRaw) ?? .optionShift
-        self.actionsModifier = DragModifierPreset(rawValue: actRaw) ?? .control
-        self.cycleKey = CycleKeyPreset(rawValue: cycRaw) ?? .spaceAndTab
+        let savedConv = UserDefaults.standard.object(forKey: "tangerine_sc_convert_v38") as? UInt64
+        let savedTools = UserDefaults.standard.object(forKey: "tangerine_sc_tools_v38") as? UInt64
+        self.convertFlagsRaw = (savedConv != nil && savedConv != 0) ? savedConv! : Self.defaultConvertRaw
+        self.toolsFlagsRaw = (savedTools != nil && savedTools != 0) ? savedTools! : Self.defaultToolsRaw
     }
     
-    func resetToDefaults() {
-        convertModifier = .shift
-        toolsModifier = .optionShift
-        actionsModifier = .control
-        cycleKey = .spaceAndTab
+    var convertFlags: NSEvent.ModifierFlags {
+        NSEvent.ModifierFlags(rawValue: UInt(convertFlagsRaw)).intersection([.shift, .option, .control, .command])
+    }
+    
+    var toolsFlags: NSEvent.ModifierFlags {
+        NSEvent.ModifierFlags(rawValue: UInt(toolsFlagsRaw)).intersection([.shift, .option, .control, .command])
+    }
+    
+    func resetToTangerineDefaults() {
+        convertFlagsRaw = Self.defaultConvertRaw
+        toolsFlagsRaw = Self.defaultToolsRaw
+    }
+    
+    static func formatFlags(_ flags: NSEvent.ModifierFlags) -> String {
+        let clean = flags.intersection([.control, .option, .shift, .command])
+        var parts: [String] = []
+        if clean.contains(.control) { parts.append("⌃ Control") }
+        if clean.contains(.option) { parts.append("⌥ Option") }
+        if clean.contains(.shift) { parts.append("⇧ Shift") }
+        if clean.contains(.command) { parts.append("⌘ Command") }
+        return parts.isEmpty ? "키를 눌러주세요..." : parts.joined(separator: " + ")
     }
     
     func matchWheelMode(for flags: NSEvent.ModifierFlags) -> WheelMode? {
-        let cleanFlags = flags.intersection([.shift, .control, .option, .command])
-        guard !cleanFlags.isEmpty else { return nil }
+        let clean = flags.intersection([.shift, .option, .control, .command])
+        guard !clean.isEmpty else { return nil }
         
+        let tFlags = toolsFlags
+        let cFlags = convertFlags
+        
+        // 정확히 일치하는 키 조합 우선 판정
+        if clean == tFlags { return .tools }
+        if clean == cFlags { return .convert }
+        
+        // 복합키(예: Option+Shift)가 단일키(예: Shift)보다 먼저 매칭되도록 비트 수 정렬
         let candidates: [(WheelMode, NSEvent.ModifierFlags)] = [
-            (.tools, toolsModifier.requiredFlags),
-            (.actions, actionsModifier.requiredFlags),
-            (.convert, convertModifier.requiredFlags)
-        ]
-        for (mode, req) in candidates {
-            if cleanFlags == req { return mode }
-        }
-        let sorted = candidates.sorted { $0.1.rawValue.nonzeroBitCount > $1.1.rawValue.nonzeroBitCount }
-        for (mode, req) in sorted {
-            if cleanFlags.isSuperset(of: req) { return mode }
+            (.tools, tFlags),
+            (.convert, cFlags)
+        ].sorted { $0.1.rawValue.nonzeroBitCount > $1.1.rawValue.nonzeroBitCount }
+        
+        for (mode, req) in candidates where !req.isEmpty {
+            if clean.isSuperset(of: req) { return mode }
         }
         return nil
     }
@@ -179,7 +126,6 @@ class JobProgressManager: ObservableObject {
 enum WheelMode: String {
     case convert = "CONVERT"
     case tools = "TOOLS"
-    case actions = "ACTIONS"
 }
 
 struct WheelItem: Identifiable {
@@ -202,15 +148,6 @@ class AppState: ObservableObject {
     
     var firstFileExtension: String {
         draggedFiles.first?.pathExtension.lowercased() ?? ""
-    }
-    
-    func cycleMode() {
-        switch wheelMode {
-        case .convert: wheelMode = .tools
-        case .tools: wheelMode = .actions
-        case .actions: wheelMode = .convert
-        }
-        updateItems()
     }
     
     func updateItems() {
@@ -310,17 +247,10 @@ class AppState: ObservableObject {
                 items = [
                     WheelItem(title: "ZIP 압축", icon: "doc.zipper", actionKey: "conv_zip"),
                     WheelItem(title: "PDF 병합", icon: "doc.on.doc.fill", actionKey: "tool_merge_pdf"),
-                    WheelItem(title: "용량 압축", icon: "arrow.down.right.and.arrow.up.left", actionKey: "tool_compress")
+                    WheelItem(title: "용량 압축", icon: "arrow.down.right.and.arrow.up.left", actionKey: "tool_compress"),
+                    WheelItem(title: "경로 복사", icon: "doc.on.clipboard", actionKey: "act_copy_path")
                 ]
             }
-        case .actions:
-            items = [
-                WheelItem(title: "경로 복사", icon: "doc.on.clipboard", actionKey: "act_copy_path"),
-                WheelItem(title: "터미널 열기", icon: "terminal", actionKey: "act_terminal"),
-                WheelItem(title: "AirDrop", icon: "airplayaudio", actionKey: "act_airdrop"),
-                WheelItem(title: "Finder 표시", icon: "folder", actionKey: "act_finder"),
-                WheelItem(title: "사본 만들기", icon: "plus.square.on.square", actionKey: "act_duplicate")
-            ]
         }
     }
 }
@@ -580,35 +510,11 @@ class FileProcessor {
             mergeToPDF(files: files)
             return
         }
-        
         if actionKey == "act_copy_path" {
             let paths = files.map { $0.path }.joined(separator: "\n")
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(paths, forType: .string)
             showToast("파일 경로가 클립보드에 복사되었습니다.")
-            return
-        }
-        if actionKey == "act_terminal", let first = files.first {
-            let folder = first.hasDirectoryPath ? first.path : first.deletingLastPathComponent().path
-            runShell("/usr/bin/open", args: ["-a", "Terminal", folder]) { _ in }
-            return
-        }
-        if actionKey == "act_finder" {
-            NSWorkspace.shared.activateFileViewerSelecting(files)
-            return
-        }
-        if actionKey == "act_airdrop" {
-            if let service = NSSharingService(named: .sendViaAirDrop) {
-                service.perform(withItems: files)
-            }
-            return
-        }
-        if actionKey == "act_duplicate" {
-            for f in files {
-                let out = uniqueOutputURL(for: f, newExt: f.pathExtension, suffix: "_copy")
-                try? FileManager.default.copyItem(at: f, to: out)
-            }
-            showToast("사본 생성 완료!")
             return
         }
         
@@ -956,8 +862,8 @@ struct RadialWheelView: View {
                     .font(.system(size: 10, weight: .heavy, design: .monospaced))
                     .foregroundColor(.orange)
             } else {
-                Text("모드 전환 키 지원")
-                    .font(.system(size: 8.5, weight: .medium))
+                Text("\(state.draggedFiles.count)개 파일")
+                    .font(.system(size: 9.5, weight: .medium))
                     .foregroundColor(.secondary)
             }
         }
@@ -968,7 +874,7 @@ struct RadialWheelView: View {
     }
 }
 
-// MARK: - 7. 도구 창 매니저 (설명 및 단축키 설정 팝업 포함)
+// MARK: - 7. 도구 창 매니저
 class ToolWindowManager {
     static let shared = ToolWindowManager()
     var activeWindows: [NSWindow] = []
@@ -1026,8 +932,8 @@ class ToolWindowManager {
         openWindow(
             title: "🍊 MyTangerine — 설명 및 단축키 설정",
             view: HelpAndSettingsView(),
-            size: NSSize(width: 780, height: 640),
-            minSize: NSSize(width: 700, height: 560)
+            size: NSSize(width: 760, height: 600),
+            minSize: NSSize(width: 680, height: 520)
         )
     }
     
@@ -1056,10 +962,15 @@ class ToolWindowManager {
     }
 }
 
-// MARK: - 7-B. 사용법 안내 및 단축키 커스터마이징 창
+// MARK: - 7-B. 직접 키보드를 눌러 입력하고 [완료]를 누르는 단축키 설정 & 사용 설명서 창
 struct HelpAndSettingsView: View {
     @ObservedObject var settings = ShortcutSettings.shared
     @State private var selectedTab: Int = 0
+    
+    // 현재 녹음 중인 대상 ("convert" 또는 "tools" 또는 nil)
+    @State private var recordingTarget: String? = nil
+    @State private var tempRecordedFlags: NSEvent.ModifierFlags = []
+    @State private var localMonitor: Any? = nil
     
     var body: some View {
         VStack(spacing: 0) {
@@ -1068,9 +979,9 @@ struct HelpAndSettingsView: View {
                     .font(.system(size: 36))
                     .foregroundColor(.orange)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("MyTangerine 3.7 Pro")
+                    Text("MyTangerine 3.8 Pro")
                         .font(.system(size: 20, weight: .heavy, design: .rounded))
-                    Text("어디서나 파일을 잡고 드래그하여 즉시 변환·편집하는 올인원 맥 유틸리티")
+                    Text("파인더에서 파일을 드래그하며 단축키를 눌러 즉시 변환·편집하는 맥 유틸리티")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
@@ -1088,7 +999,7 @@ struct HelpAndSettingsView: View {
             Divider()
             
             if selectedTab == 0 {
-                shortcutSettingsTab
+                shortcutRecorderTab
             } else {
                 usageGuideTab
             }
@@ -1096,15 +1007,17 @@ struct HelpAndSettingsView: View {
             Divider()
             
             HStack {
-                Text("💡 변경한 단축키는 저장 버튼 없이 즉시 반영되며 앱을 껐다 켜도 유지됩니다.")
+                Text("💡 오리지널 Tangerine 기본값: 변환 = ⇧ Shift  |  도구 = ⌥⇧ Option + Shift")
                     .font(.caption)
                     .foregroundColor(.secondary)
                 Spacer()
-                Button("기본값으로 초기화") {
-                    settings.resetToDefaults()
-                    FileProcessor.showToast("단축키가 기본 설정으로 초기화되었습니다.")
+                Button("Tangerine 기본 단축키로 복원") {
+                    stopRecording()
+                    settings.resetToTangerineDefaults()
+                    FileProcessor.showToast("Tangerine 기본 단축키(Shift / Option+Shift)로 복원되었습니다.")
                 }
                 Button("닫기") {
+                    stopRecording()
                     NSApp.keyWindow?.close()
                 }
                 .buttonStyle(.borderedProminent)
@@ -1113,123 +1026,155 @@ struct HelpAndSettingsView: View {
             .padding(14)
             .background(.regularMaterial)
         }
+        .onDisappear {
+            stopRecording()
+        }
     }
     
-    var shortcutSettingsTab: some View {
+    var shortcutRecorderTab: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 20) {
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("1. 드래그 중 원형 휠(Radial Wheel) 호출 단축키")
+                    Text("단축키 직접 입력 설정")
                         .font(.headline)
                         .foregroundColor(.orange)
-                    Text("Finder나 바탕화면에서 파일을 마우스로 잡고 드래그하는 상태에서 아래 보조키를 누르면 각 모드의 원형 휠이 마우스 주변에 나타납니다.")
+                    Text("바꾸고 싶은 기능의 [단축키 입력하기] 버튼을 누른 뒤, 키보드에서 원하는 조합(예: Shift, Option+Shift, Control+Shift 등)을 누르고 마우스로 [완료] 버튼을 클릭하면 적용됩니다.")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
                 
-                VStack(spacing: 12) {
-                    shortcutRow(
+                VStack(spacing: 16) {
+                    recorderCard(
+                        targetID: "convert",
                         title: "🔄 포맷 변환 휠 (CONVERT)",
-                        subtitle: "JPG, PNG, WEBP, HEIC, PDF, MP4, MOV, GIF, MP3, WAV, FLAC, ZIP 등 즉시 변환",
-                        selection: $settings.convertModifier
+                        subtitle: "파일을 드래그하면서 이 키를 누르면 JPG, PNG, WEBP, HEIC, PDF, MP4, MOV, GIF, MP3, WAV 등으로 즉시 변환합니다.",
+                        currentFlags: settings.convertFlags,
+                        onSave: { newFlags in
+                            settings.convertFlagsRaw = UInt64(newFlags.rawValue)
+                            FileProcessor.showToast("변환(CONVERT) 단축키가 저장되었습니다.")
+                        }
                     )
                     
-                    shortcutRow(
+                    recorderCard(
+                        targetID: "tools",
                         title: "🛠️ 전용 편집 도구 휠 (TOOLS)",
-                        subtitle: "사진 보정(Edit), 8방향 크롭(Crop), 모자이크(Redact), 배경 합성(Add BG), 영상/오디오 트림, 압축 등",
-                        selection: $settings.toolsModifier
-                    )
-                    
-                    shortcutRow(
-                        title: "⚡ 빠른 액션 휠 (ACTIONS)",
-                        subtitle: "파일 경로 복사, 해당 폴더에서 터미널 열기, AirDrop 전송, 사본 생성 등",
-                        selection: $settings.actionsModifier
+                        subtitle: "파일을 드래그하면서 이 키를 누르면 사진 보정(Edit), 크롭(Crop), 모자이크(Redact), 배경 추가(Add BG), 영상/오디오 트림, 압축 도구가 열립니다.",
+                        currentFlags: settings.toolsFlags,
+                        onSave: { newFlags in
+                            settings.toolsFlagsRaw = UInt64(newFlags.rawValue)
+                            FileProcessor.showToast("도구(TOOLS) 단축키가 저장되었습니다.")
+                        }
                     )
                 }
                 
-                if settings.convertModifier == settings.toolsModifier ||
-                   settings.convertModifier == settings.actionsModifier ||
-                   settings.toolsModifier == settings.actionsModifier {
+                if settings.convertFlags == settings.toolsFlags {
                     HStack(spacing: 8) {
                         Image(systemName: "exclamationmark.triangle.fill").foregroundColor(.yellow)
-                        Text("서로 다른 두 모드가 동일한 단축키로 설정되어 있습니다. 구분해서 설정하시는 것을 권장합니다.")
+                        Text("변환 휠과 도구 휠의 단축키가 똑같습니다. 서로 다른 키 조합으로 설정해 주세요.")
                             .font(.caption.bold())
                             .foregroundColor(.orange)
                     }
-                    .padding(10)
+                    .padding(12)
                     .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
                 }
-                
-                Divider().padding(.vertical, 4)
-                
-                VStack(alignment: .leading, spacing: 10) {
-                    Text("2. 휠이 떠 있을 때 모드 순환 전환 키")
-                        .font(.headline)
-                        .foregroundColor(.orange)
-                    Text("보조키 하나(예: Shift)만 누른 채로도 이 키를 톡톡 누르면 CONVERT ➔ TOOLS ➔ ACTIONS 순서로 휠이 즉시 바뀝니다.")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
+            }
+            .padding(24)
+        }
+    }
+    
+    @ViewBuilder
+    func recorderCard(
+        targetID: String,
+        title: String,
+        subtitle: String,
+        currentFlags: NSEvent.ModifierFlags,
+        onSave: @escaping (NSEvent.ModifierFlags) -> Void
+    ) -> some View {
+        let isRecordingThis = (recordingTarget == targetID)
+        
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(title).font(.system(size: 15, weight: .bold))
+                    Text(subtitle).font(.caption).foregroundColor(.secondary)
+                }
+                Spacer()
+            }
+            
+            HStack(spacing: 12) {
+                // 현재 키 또는 입력 중인 키 표시창
+                HStack {
+                    Image(systemName: isRecordingThis ? "keyboard.badge.ellipsis" : "keyboard")
+                        .foregroundColor(isRecordingThis ? .orange : .secondary)
                     
-                    HStack {
-                        Text("모드 전환 키 선택").font(.subheadline.bold())
-                        Spacer()
-                        Picker("", selection: $settings.cycleKey) {
-                            ForEach(CycleKeyPreset.allCases) { preset in
-                                Text(preset.displayName).tag(preset)
-                            }
+                    if isRecordingThis {
+                        Text(tempRecordedFlags.isEmpty ? "원하는 키 조합(Shift, Option, Control, Command)을 누르세요..." : ShortcutSettings.formatFlags(tempRecordedFlags))
+                            .font(.system(size: 14, weight: .heavy, design: .rounded))
+                            .foregroundColor(.orange)
+                    } else {
+                        Text("파일 드래그 + " + ShortcutSettings.formatFlags(currentFlags))
+                            .font(.system(size: 14, weight: .bold, design: .rounded))
+                            .foregroundColor(.primary)
+                    }
+                    Spacer()
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .background(Color.black.opacity(isRecordingThis ? 0.28 : 0.14), in: RoundedRectangle(cornerRadius: 8))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(isRecordingThis ? Color.orange : Color.white.opacity(0.2), lineWidth: isRecordingThis ? 2 : 1)
+                )
+                
+                if isRecordingThis {
+                    Button("완료") {
+                        if !tempRecordedFlags.isEmpty {
+                            onSave(tempRecordedFlags)
                         }
-                        .frame(width: 260)
+                        stopRecording()
                     }
-                    .padding(14)
-                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
-                }
-                
-                Divider().padding(.vertical, 4)
-                
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("✅ 현재 내 단축키 요약")
-                        .font(.subheadline.bold())
-                    HStack(spacing: 14) {
-                        summaryBadge(mode: "CONVERT (변환)", key: settings.convertModifier.displayName, color: .orange)
-                        summaryBadge(mode: "TOOLS (편집 도구)", key: settings.toolsModifier.displayName, color: .pink)
-                        summaryBadge(mode: "ACTIONS (빠른 액션)", key: settings.actionsModifier.displayName, color: .blue)
+                    .buttonStyle(.borderedProminent)
+                    .tint(.green)
+                    .disabled(tempRecordedFlags.isEmpty)
+                    
+                    Button("취소") {
+                        stopRecording()
                     }
+                } else {
+                    Button("단축키 입력하기") {
+                        startRecording(for: targetID)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.orange)
                 }
-                .padding(14)
-                .background(Color.black.opacity(0.15), in: RoundedRectangle(cornerRadius: 12))
             }
-            .padding(22)
+        }
+        .padding(16)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+    }
+    
+    func startRecording(for targetID: String) {
+        stopRecording()
+        recordingTarget = targetID
+        tempRecordedFlags = []
+        
+        localMonitor = NSEvent.addLocalMonitorForEvents(matching: [.flagsChanged, .keyDown]) { event in
+            let flags = event.modifierFlags.intersection([.control, .option, .shift, .command])
+            if !flags.isEmpty {
+                // 사용자가 누른 키 조합을 기록하여 키를 떼고 마우스로 [완료]를 눌러도 유지되도록 함
+                self.tempRecordedFlags = flags
+            }
+            return nil
         }
     }
     
-    func shortcutRow(title: String, subtitle: String, selection: Binding<DragModifierPreset>) -> some View {
-        HStack {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(title).font(.system(size: 14, weight: .bold))
-                Text(subtitle).font(.caption).foregroundColor(.secondary)
-            }
-            Spacer()
-            Picker("", selection: selection) {
-                ForEach(DragModifierPreset.allCases) { preset in
-                    Text(preset.displayName).tag(preset)
-                }
-            }
-            .frame(width: 210)
+    func stopRecording() {
+        if let mon = localMonitor {
+            NSEvent.removeMonitor(mon)
+            localMonitor = nil
         }
-        .padding(14)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
-    }
-    
-    func summaryBadge(mode: String, key: String, color: Color) -> some View {
-        VStack(spacing: 4) {
-            Text(mode).font(.caption2.bold()).foregroundColor(.secondary)
-            Text("파일 드래그 + \(key)")
-                .font(.system(size: 12, weight: .heavy, design: .rounded))
-                .foregroundColor(color)
-        }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 10)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+        recordingTarget = nil
+        tempRecordedFlags = []
     }
     
     var usageGuideTab: some View {
@@ -1237,35 +1182,33 @@ struct HelpAndSettingsView: View {
             VStack(alignment: .leading, spacing: 16) {
                 guideCard(
                     icon: "hand.draw.fill",
-                    title: "1. 기본 작동법 (드래그 & 드롭 휠)",
+                    title: "1. 기본 작동법 (오리지널 Tangerine 방식)",
                     items: [
-                        "Finder나 바탕화면에서 파일(사진, 영상, 오디오, 문서 등 여러 개 동시 선택 가능)을 마우스로 잡고 드래그를 시작합니다.",
-                        "드래그한 채로 설정한 단축키(기본값: Shift)를 누르면 마우스 포인터 주위에 원형 휠이 펼쳐집니다.",
-                        "각 포맷 조각에는 변환 시 예상되는 파일 크기(예: ~1.2 MB)가 실시간으로 안내됩니다.",
-                        "원하는 기능 위에 마우스를 올리고 버튼을 놓으면 원본 파일 바로 옆에 결과물이 저장됩니다.",
-                        "취소하고 싶을 때는 휠의 가운데 원 안쪽이나 휠 바깥 허공에 마우스를 놓으면 안전하게 취소됩니다."
+                        "Finder나 바탕화면에서 변환·편집할 파일을 마우스로 잡고 드래그를 시작합니다.",
+                        "드래그 중 Shift 키를 누르면 변환(CONVERT) 휠이 나타나며, 각 포맷 조각에 예상 파일 크기가 함께 표시됩니다.",
+                        "드래그 중 Option + Shift 키를 누르면 해당 파일 종류에 맞는 전용 편집 도구(TOOLS) 휠이 나타납니다.",
+                        "원하는 조각 위에 마우스를 놓으면 작업이 실행되며, 아무것도 선택하지 않고 취소해도 파일이 복제되지 않습니다."
                     ]
                 )
                 
                 guideCard(
                     icon: "photo.on.rectangle.angled",
-                    title: "2. 이미지 편집 도구 (Edit Photo / Crop / Redact / Add BG)",
+                    title: "2. 사진 편집 도구 (Edit Photo / Crop / Redact / Add BG)",
                     items: [
-                        "EDIT PHOTO: 노출, 휘도, 하이라이트, 그림자, 대비, 채도, 색온도, 선명도 등 14가지 슬라이더로 원본 화질 손실 없이 보정합니다.",
-                        "CROP (8방향 자르기): 노란색 모서리 핸들 4곳을 끌면 가로·세로 두 변이 동시에 조절되고, 상·하·좌·우 흰색 바 4곳을 끌면 해당 변만 정밀하게 조절됩니다.",
-                        "REDACT (가리기): 원하는 영역을 마우스로 드래그하면 픽셀 모자이크, 블러(흐림), 검은 박스 중 선택한 스타일로 개인정보를 가려줍니다.",
-                        "확대/축소 및 이동: 모든 이미지 프리뷰 창에서 마우스 스크롤 휠로 정중앙 기준 확대/축소가 가능하며, '화면 이동(Pan)' 버튼이나 Option+드래그로 위치를 이동할 수 있습니다."
+                        "EDIT PHOTO: 노출, 휘도, 하이라이트, 그림자, 대비, 채도, 색온도 등 14가지 슬라이더로 원본 화질 그대로 보정합니다.",
+                        "CROP (8방향 자르기): 노란색 모서리 핸들 4곳으로 두 변을 동시에 조절하거나, 상·하·좌·우 흰색 바 4곳으로 각 변을 개별 조절합니다.",
+                        "REDACT (가리기): 원하는 영역을 드래그하여 픽셀 모자이크, 블러(흐림), 검은 박스로 민감한 정보를 가립니다.",
+                        "확대/축소 및 이동: 마우스 스크롤 휠로 정중앙 기준 확대/축소가 가능하며, 드래그하여 이미지를 이동할 수 있습니다."
                     ]
                 )
                 
                 guideCard(
                     icon: "film.stack",
-                    title: "3. QuickTime 영상 트림 & 다중 채널 오디오 스튜디오",
+                    title: "3. 영상/오디오 정밀 트림 & 다중 채널 스튜디오",
                     items: [
-                        "영상 화면을 직접 보면서 타임라인을 클릭/드래그해 원하는 장면을 탐색할 수 있습니다.",
-                        "타임라인 양끝의 노란색 트림 바를 움직이거나, 하단 입력칸에서 시:분:초:프레임(HH:MM:SS:FF) 단위 및 -1F / +1F 버튼으로 1프레임씩 정밀하게 시작·끝점을 지정합니다.",
-                        "다중 채널 오디오 믹서: 2채널 스테레오부터 4채널, 6채널, 8채널 이상의 오디오 트랙을 자동 감지하여 각 채널별로 켜기/끄기(ON/MUTE) 또는 단독 청취(SOLO)가 가능합니다.",
-                        "작업 진행률 확인: 대용량 영상 변환 및 편집 시 상단 메뉴바 아이콘 옆에 실시간 진행 퍼센트(%)가 표시됩니다."
+                        "타임라인 양끝의 노란색 트림 바(시작점 In ~ 종료점 Out) 안쪽 구간만 정확하게 보고 들을 수 있도록 재생 범위가 고정됩니다.",
+                        "하단 입력칸에서 시:분:초:프레임(HH:MM:SS:FF) 단위로 입력하거나 -1F / +1F 버튼으로 1프레임씩 정밀하게 시작·끝점을 맞출 수 있습니다.",
+                        "다중 채널 오디오 믹서: 2채널부터 4채널, 8채널 이상의 오디오 트랙을 자동 감지하여 원하는 채널만 켜고 끄거나(ON/MUTE) 단독 청취(SOLO)할 수 있습니다."
                     ]
                 )
             }
@@ -1993,7 +1936,7 @@ struct RedactCropStudioView: View {
     }
 }
 
-// MARK: - 10. QuickTime 비디오 프리뷰 + 프레임(HH:MM:SS:FF) 트림 + 다중 채널(1ch~8ch+) 오디오 스튜디오
+// MARK: - 10. QuickTime 비디오 프리뷰 + 트림 구간 외 재생 차단 + 사운드 완벽 보장 스튜디오
 struct VideoPlayerPreview: NSViewRepresentable {
     let player: AVPlayer
     func makeNSView(context: Context) -> AVPlayerView {
@@ -2023,12 +1966,14 @@ class MultiChannelMediaController: ObservableObject {
     @Published var channelCount: Int = 2
     @Published var channelEnabled: [Bool] = [true, true]
     @Published var soloChannel: Int? = nil
+    @Published var previewVolume: Float = 1.0
     
     private var timeObserver: Any?
     private var audioEngine: AVAudioEngine?
     private var audioPlayerNode: AVAudioPlayerNode?
     private var audioFile: AVAudioFile?
-    private var useAudioEngineForMultiChannel: Bool = false
+    private var audioSegmentStartTime: Double = 0.0
+    private var audioPlayTimer: Timer?
     
     init(url: URL) {
         self.fileURL = url
@@ -2037,10 +1982,18 @@ class MultiChannelMediaController: ObservableObject {
         setupMedia()
     }
     
+    // 모든 채널이 기본 ON 상태인지 확인 (기본 상태에서는 AVPlayer 순정 오디오를 사용하여 100% 소리 출력 보장)
+    var isCustomChannelFilterActive: Bool {
+        if soloChannel != nil { return true }
+        return channelEnabled.contains(false)
+    }
+    
     func setupMedia() {
         let asset = AVURLAsset(url: fileURL)
         let item = AVPlayerItem(asset: asset)
         player.replaceCurrentItem(with: item)
+        player.isMuted = false
+        player.volume = previewVolume
         
         let sec = CMTimeGetSeconds(asset.duration)
         if sec.isFinite && sec > 0 {
@@ -2075,30 +2028,41 @@ class MultiChannelMediaController: ObservableObject {
                 channelCount = ch
                 channelEnabled = Array(repeating: true, count: ch)
             }
-            useAudioEngineForMultiChannel = true
         }
         
+        // 60fps 주기로 현재 재생 위치를 감시하며 트림 구간(startTime ~ endTime)을 절대 벗어나지 못하게 강제 고정
         timeObserver = player.addPeriodicTimeObserver(
             forInterval: CMTime(seconds: 1.0 / 60.0, preferredTimescale: 600),
             queue: .main
         ) { [weak self] time in
             guard let self = self else { return }
+            guard self.audioEngine == nil else { return }
             let sec = CMTimeGetSeconds(time)
             if sec.isFinite {
-                self.currentTime = sec
-                if self.isPlaying && sec >= self.endTime {
+                if sec < self.startTime - 0.02 {
+                    self.seek(to: self.startTime)
+                } else if sec >= self.endTime {
                     self.pause()
                     self.seek(to: self.startTime)
+                } else {
+                    self.currentTime = sec
                 }
             }
         }
+    }
+    
+    func setPreviewVolume(_ vol: Float) {
+        previewVolume = max(0.0, min(2.0, vol))
+        player.volume = previewVolume
+        audioEngine?.mainMixerNode.outputVolume = previewVolume
     }
     
     func togglePlay() {
         if isPlaying {
             pause()
         } else {
-            if currentTime < startTime || currentTime >= endTime {
+            // 재생 시작 시 현재 위치가 트림 시작점 이전이거나 끝점 이후면 무조건 트림 시작점(startTime)에서 출발!
+            if currentTime < startTime || currentTime >= endTime - 0.02 {
                 seek(to: startTime)
             }
             play()
@@ -2107,10 +2071,15 @@ class MultiChannelMediaController: ObservableObject {
     
     func play() {
         isPlaying = true
-        if useAudioEngineForMultiChannel {
-            playMultiChannelAudioEngine(from: currentTime)
+        // 오디오 전용 파일에서 특정 채널을 끄거나 솔로(Solo)를 켠 경우에만 커스텀 멀티채널 엔진 구동
+        if !isVideo && isCustomChannelFilterActive && audioFile != nil {
+            player.pause()
+            playCustomMultiChannelAudio(from: currentTime)
         } else {
-            applyPlayerChannelMix()
+            stopAudioEngine()
+            applyPlayerAudioState()
+            // 재생할 구간의 끝점(forwardPlaybackEndTime)을 AVPlayerItem에도 지정하여 트림 밖 재생 원천 차단
+            player.currentItem?.forwardPlaybackEndTime = CMTime(seconds: endTime, preferredTimescale: 6000)
             player.play()
         }
     }
@@ -2118,17 +2087,28 @@ class MultiChannelMediaController: ObservableObject {
     func pause() {
         isPlaying = false
         player.pause()
-        audioPlayerNode?.stop()
-        audioEngine?.stop()
+        stopAudioEngine()
     }
     
+    private func stopAudioEngine() {
+        audioPlayTimer?.invalidate()
+        audioPlayTimer = nil
+        audioPlayerNode?.stop()
+        audioEngine?.stop()
+        audioEngine = nil
+        audioPlayerNode = nil
+    }
+    
+    // 재생 위치를 이동할 때 무조건 [startTime ... endTime] 트림 구간 안으로만 제한(Clamp)!
     func seek(to sec: Double) {
-        let clamped = max(0.0, min(duration, sec))
-        currentTime = clamped
-        let cm = CMTime(seconds: clamped, preferredTimescale: 6000)
+        let clampedToTrim = max(startTime, min(endTime, sec))
+        currentTime = clampedToTrim
+        player.currentItem?.forwardPlaybackEndTime = CMTime(seconds: endTime, preferredTimescale: 6000)
+        let cm = CMTime(seconds: clampedToTrim, preferredTimescale: 6000)
         player.seek(to: cm, toleranceBefore: .zero, toleranceAfter: .zero)
-        if useAudioEngineForMultiChannel && isPlaying {
-            playMultiChannelAudioEngine(from: clamped)
+        
+        if isPlaying && !isVideo && isCustomChannelFilterActive && audioFile != nil {
+            playCustomMultiChannelAudio(from: clampedToTrim)
         }
     }
     
@@ -2145,17 +2125,22 @@ class MultiChannelMediaController: ObservableObject {
     }
     
     func updateChannelRouting() {
-        if useAudioEngineForMultiChannel {
-            if isPlaying { playMultiChannelAudioEngine(from: currentTime) }
+        if isPlaying {
+            let resumeTime = currentTime
+            pause()
+            seek(to: resumeTime)
+            play()
         } else {
-            applyPlayerChannelMix()
+            applyPlayerAudioState()
         }
     }
     
-    private func applyPlayerChannelMix() {
-        guard let item = player.currentItem else { return }
+    private func applyPlayerAudioState() {
         let anyActive = (0..<channelCount).contains { isChannelActive($0) }
         player.isMuted = !anyActive
+        player.volume = previewVolume
+        
+        guard let item = player.currentItem else { return }
         let tracks = item.asset.tracks(withMediaType: .audio)
         if tracks.count > 1 {
             let mix = AVMutableAudioMix()
@@ -2168,21 +2153,31 @@ class MultiChannelMediaController: ObservableObject {
             }
             mix.inputParameters = params
             item.audioMix = mix
+        } else {
+            item.audioMix = nil
         }
     }
     
-    private func playMultiChannelAudioEngine(from startSec: Double) {
+    // 최대 15초 단위 청크로 안전하게 멀티채널을 라우팅하여 대용량 파일에서도 소리가 끊기지 않도록 보장
+    private func playCustomMultiChannelAudio(from startSec: Double) {
         guard let af = audioFile else { return }
-        audioPlayerNode?.stop()
-        audioEngine?.stop()
+        stopAudioEngine()
         
         let fmt = af.processingFormat
         let sr = fmt.sampleRate
         let totalFrames = af.length
-        let startFrame = AVAudioFramePosition(max(0, min(Double(totalFrames), startSec * sr)))
+        let clampedStart = max(startTime, min(endTime, startSec))
+        let startFrame = AVAudioFramePosition(max(0, min(Double(totalFrames), clampedStart * sr)))
         let endFrame = AVAudioFramePosition(max(Double(startFrame), min(Double(totalFrames), endTime * sr)))
-        let frameCount = AVAudioFrameCount(max(0, endFrame - startFrame))
-        guard frameCount > 0 else { return }
+        let requestedFrames = AVAudioFrameCount(max(0, endFrame - startFrame))
+        guard requestedFrames > 0 else {
+            isPlaying = false
+            return
+        }
+        
+        // 메모리 초과 방지를 위해 한 번에 최대 30초 분량만 버퍼링
+        let maxBufferFrames = AVAudioFrameCount(sr * 30.0)
+        let frameCount = min(requestedFrames, maxBufferFrames)
         
         guard let readBuf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: frameCount) else { return }
         af.framePosition = startFrame
@@ -2226,13 +2221,28 @@ class MultiChannelMediaController: ObservableObject {
         let node = AVAudioPlayerNode()
         engine.attach(node)
         engine.connect(node, to: engine.mainMixerNode, format: stereoFmt)
+        engine.mainMixerNode.outputVolume = previewVolume
         try? engine.start()
-        node.scheduleBuffer(outBuf, at: nil, options: []) { [weak self] in
-            DispatchQueue.main.async { self?.isPlaying = false }
-        }
+        
+        audioSegmentStartTime = clampedStart
+        node.scheduleBuffer(outBuf, at: nil, options: [])
         node.play()
+        
         self.audioEngine = engine
         self.audioPlayerNode = node
+        
+        let startedAt = Date()
+        audioPlayTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+            guard let self = self, self.isPlaying else { return }
+            let elapsed = Date().timeIntervalSince(startedAt)
+            let nowSec = self.audioSegmentStartTime + elapsed
+            if nowSec >= self.endTime {
+                self.pause()
+                self.seek(to: self.startTime)
+            } else {
+                self.currentTime = nowSec
+            }
+        }
     }
     
     func formatTimecode(_ sec: Double) -> String {
@@ -2263,8 +2273,7 @@ class MultiChannelMediaController: ObservableObject {
     
     deinit {
         if let obs = timeObserver { player.removeTimeObserver(obs) }
-        audioPlayerNode?.stop()
-        audioEngine?.stop()
+        stopAudioEngine()
     }
 }
 
@@ -2276,8 +2285,6 @@ struct ProMediaStudioView: View {
     @State private var volumePercent: Double = 100.0
     @State private var trimSilence: Bool = false
     @State private var enableBleep: Bool = false
-    @State private var bleepStartRatio: Double = 0.3
-    @State private var bleepEndRatio: Double = 0.45
     
     @State private var inH: Int = 0; @State private var inM: Int = 0; @State private var inS: Int = 0; @State private var inF: Int = 0
     @State private var outH: Int = 0; @State private var outM: Int = 0; @State private var outS: Int = 0; @State private var outF: Int = 0
@@ -2317,8 +2324,14 @@ struct ProMediaStudioView: View {
                 
                 VStack {
                     HStack {
+                        Text("🔒 트림 구간 내 재생 잠금 활성화됨 (트림 바깥 구간은 재생되지 않습니다)")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 5)
+                            .background(Color.orange.opacity(0.85), in: Capsule())
                         Spacer()
-                        Text("재생 위치: \(ctrl.formatTimecode(ctrl.currentTime))  (\(String(format: "%.2f", ctrl.fps)) fps)")
+                        Text("현재 위치: \(ctrl.formatTimecode(ctrl.currentTime))  (\(String(format: "%.2f", ctrl.fps)) fps)")
                             .font(.system(size: 12, weight: .bold, design: .monospaced))
                             .foregroundColor(.yellow)
                             .padding(.horizontal, 10)
@@ -2333,12 +2346,12 @@ struct ProMediaStudioView: View {
             
             VStack(alignment: .leading, spacing: 6) {
                 HStack {
-                    Text("QuickTime 타임라인 (타임라인 클릭/드래그: 장면 이동 | 양끝 노란색 바 드래그: 시작/끝점 조절)")
+                    Text("QuickTime 타임라인 (노란색 트림 구간 안에서만 재생 헤드가 이동하며 시작점과 끝점을 정확히 확인합니다)")
                         .font(.caption.bold())
                         .foregroundColor(.secondary)
                     Spacer()
                     let selDur = max(0, ctrl.endTime - ctrl.startTime)
-                    Text("선택 길이: \(ctrl.formatTimecode(selDur))")
+                    Text("트림 구간 길이: \(ctrl.formatTimecode(selDur))")
                         .font(.caption.monospacedDigit().bold())
                         .foregroundColor(.orange)
                 }
@@ -2359,18 +2372,19 @@ struct ProMediaStudioView: View {
                                 let t = (Double(idx) / Double(sampleBars.count)) * ctrl.duration
                                 let inTrim = (t >= ctrl.startTime && t <= ctrl.endTime)
                                 Capsule()
-                                    .fill(inTrim ? Color.orange.opacity(0.85) : Color.gray.opacity(0.28))
+                                    .fill(inTrim ? Color.orange.opacity(0.88) : Color.gray.opacity(0.22))
                                     .frame(width: max(2, (w / CGFloat(sampleBars.count)) * 0.65), height: (h - 16) * sampleBars[idx])
                             }
                         }
                         .padding(.horizontal, 6)
                         
+                        // 트림 제외 구간 어둡게 마스킹 (재생 불가 영역 표시)
                         Rectangle()
-                            .fill(Color.black.opacity(0.6))
+                            .fill(Color.black.opacity(0.72))
                             .frame(width: max(0, startX), height: h)
                         
                         Rectangle()
-                            .fill(Color.black.opacity(0.6))
+                            .fill(Color.black.opacity(0.72))
                             .frame(width: max(0, w - endX), height: h)
                             .offset(x: endX)
                         
@@ -2379,6 +2393,7 @@ struct ProMediaStudioView: View {
                             .frame(width: max(10, endX - startX), height: h - 2)
                             .offset(x: startX)
                         
+                        // 좌측 시작점(In) 노란색 핸들
                         ZStack {
                             RoundedRectangle(cornerRadius: 4).fill(Color.yellow).frame(width: 14, height: h)
                             Rectangle().fill(Color.black).frame(width: 2, height: 18)
@@ -2387,13 +2402,16 @@ struct ProMediaStudioView: View {
                         .gesture(
                             DragGesture()
                                 .onChanged { val in
+                                    ctrl.pause()
                                     let sec = Double(val.location.x / w) * ctrl.duration
                                     ctrl.startTime = max(0.0, min(ctrl.endTime - (1.0 / ctrl.fps), sec))
+                                    // 시작점을 조절할 때 즉시 시작점 장면을 보여줌
                                     ctrl.seek(to: ctrl.startTime)
                                     syncTimecodeFields()
                                 }
                         )
                         
+                        // 우측 종료점(Out) 노란색 핸들
                         ZStack {
                             RoundedRectangle(cornerRadius: 4).fill(Color.yellow).frame(width: 14, height: h)
                             Rectangle().fill(Color.black).frame(width: 2, height: 18)
@@ -2402,13 +2420,16 @@ struct ProMediaStudioView: View {
                         .gesture(
                             DragGesture()
                                 .onChanged { val in
+                                    ctrl.pause()
                                     let sec = Double(val.location.x / w) * ctrl.duration
                                     ctrl.endTime = min(ctrl.duration, max(ctrl.startTime + (1.0 / ctrl.fps), sec))
+                                    // 끝점을 조절할 때 즉시 끝점 장면을 보여줌
                                     ctrl.seek(to: ctrl.endTime)
                                     syncTimecodeFields()
                                 }
                         )
                         
+                        // 빨간색 재생 헤드(Playhead)
                         ZStack {
                             Rectangle().fill(Color.red).frame(width: 2.5, height: h + 6)
                             Circle().fill(Color.red).frame(width: 11, height: 11).offset(y: -h / 2)
@@ -2419,8 +2440,9 @@ struct ProMediaStudioView: View {
                     .gesture(
                         DragGesture(minimumDistance: 0)
                             .onChanged { val in
-                                let sec = Double(max(0, min(w, val.location.x)) / w) * ctrl.duration
-                                ctrl.seek(to: sec)
+                                let rawSec = Double(max(0, min(w, val.location.x)) / w) * ctrl.duration
+                                // 마우스를 트림 바깥으로 끌어도 무조건 [startTime ... endTime] 안에서만 이동!
+                                ctrl.seek(to: rawSec)
                             }
                     )
                 }
@@ -2430,24 +2452,24 @@ struct ProMediaStudioView: View {
             HStack(spacing: 14) {
                 HStack(spacing: 6) {
                     Button(action: { ctrl.stepFrames(-1) }) { Image(systemName: "backward.frame.fill") }
-                        .help("1프레임 뒤로")
+                        .help("1프레임 뒤로 (트림 구간 내)")
                     Button(action: { ctrl.togglePlay() }) {
                         Image(systemName: ctrl.isPlaying ? "pause.circle.fill" : "play.circle.fill")
-                            .font(.system(size: 26))
+                            .font(.system(size: 28))
                             .foregroundColor(.orange)
                     }
                     .buttonStyle(.plain)
                     Button(action: { ctrl.stepFrames(1) }) { Image(systemName: "forward.frame.fill") }
-                        .help("1프레임 앞으로")
+                        .help("1프레임 앞으로 (트림 구간 내)")
                     
-                    Button("[ 현재 위치를 시작점으로") {
-                        ctrl.startTime = min(ctrl.currentTime, ctrl.endTime - (1.0 / ctrl.fps))
-                        syncTimecodeFields()
+                    Button("시작점 보기") {
+                        ctrl.pause()
+                        ctrl.seek(to: ctrl.startTime)
                     }.font(.caption)
                     
-                    Button("현재 위치를 끝점으로 ]") {
-                        ctrl.endTime = max(ctrl.currentTime, ctrl.startTime + (1.0 / ctrl.fps))
-                        syncTimecodeFields()
+                    Button("끝점 보기") {
+                        ctrl.pause()
+                        ctrl.seek(to: ctrl.endTime)
                     }.font(.caption)
                 }
                 
@@ -2457,12 +2479,14 @@ struct ProMediaStudioView: View {
                     label: "시작(In)",
                     h: $inH, m: $inM, s: $inS, f: $inF,
                     onApply: {
+                        ctrl.pause()
                         let newSec = ctrl.composeSeconds(h: inH, m: inM, s: inS, f: inF)
                         ctrl.startTime = min(newSec, ctrl.endTime - (1.0 / ctrl.fps))
                         ctrl.seek(to: ctrl.startTime)
                         syncTimecodeFields()
                     },
                     onStepFrame: { df in
+                        ctrl.pause()
                         let frameDur = 1.0 / max(1.0, ctrl.fps)
                         ctrl.startTime = max(0, min(ctrl.endTime - frameDur, ctrl.startTime + Double(df) * frameDur))
                         ctrl.seek(to: ctrl.startTime)
@@ -2474,12 +2498,14 @@ struct ProMediaStudioView: View {
                     label: "종료(Out)",
                     h: $outH, m: $outM, s: $outS, f: $outF,
                     onApply: {
+                        ctrl.pause()
                         let newSec = ctrl.composeSeconds(h: outH, m: outM, s: outS, f: outF)
                         ctrl.endTime = max(newSec, ctrl.startTime + (1.0 / ctrl.fps))
                         ctrl.seek(to: ctrl.endTime)
                         syncTimecodeFields()
                     },
                     onStepFrame: { df in
+                        ctrl.pause()
                         let frameDur = 1.0 / max(1.0, ctrl.fps)
                         ctrl.endTime = min(ctrl.duration, max(ctrl.startTime + frameDur, ctrl.endTime + Double(df) * frameDur))
                         ctrl.seek(to: ctrl.endTime)
@@ -2555,8 +2581,14 @@ struct ProMediaStudioView: View {
             
             HStack(spacing: 18) {
                 HStack(spacing: 6) {
+                    Image(systemName: "speaker.wave.3.fill").foregroundColor(.orange)
                     Text("볼륨").font(.caption)
-                    Slider(value: $volumePercent, in: 20...200).frame(width: 110).tint(.orange)
+                    Slider(value: $volumePercent, in: 20...200)
+                        .frame(width: 110)
+                        .tint(.orange)
+                        .onChange(of: volumePercent) {
+                            ctrl.setPreviewVolume(Float(volumePercent / 100.0))
+                        }
                     Text("\(Int(volumePercent))%").font(.caption.monospacedDigit()).frame(width: 40)
                 }
                 
@@ -2972,7 +3004,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "🍊 MyTangerine 3.7 Pro", action: nil, keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "🍊 MyTangerine 3.8 Pro", action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         
         if jobs.isEmpty {
@@ -3023,8 +3055,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     
     func setupCGEventTapForOptionCancelFix() {
         let mask = (1 << CGEventType.leftMouseUp.rawValue) |
-                   (1 << CGEventType.leftMouseDragged.rawValue) |
-                   (1 << CGEventType.keyDown.rawValue)
+                   (1 << CGEventType.leftMouseDragged.rawValue)
         
         let callback: CGEventTapCallBack = { proxy, type, event, refcon in
             guard let refcon = refcon else { return Unmanaged.passUnretained(event) }
@@ -3036,16 +3067,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
             
             if AppState.shared.isDragging {
-                if type == .keyDown {
-                    let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
-                    if ShortcutSettings.shared.cycleKey.matches(keyCode: keyCode) {
-                        DispatchQueue.main.async {
-                            AppState.shared.cycleMode()
-                        }
-                        return nil
-                    }
-                }
-                
                 if type == .leftMouseDragged || type == .leftMouseUp {
                     event.flags.remove([.maskAlternate, .maskShift, .maskControl, .maskCommand])
                 }
