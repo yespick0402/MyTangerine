@@ -9,6 +9,131 @@ import Vision
 import UniformTypeIdentifiers
 import AudioToolbox
 
+// MARK: - 0. 사용자 단축키 설정 매니저 (UserDefaults 영구 저장)
+enumDragModifierPreset: String, CaseIterable, Identifiable {
+    case shift = "shift"
+    case control = "control"
+    case option = "option"
+    case command = "command"
+    case optionShift = "option_shift"
+    case controlShift = "control_shift"
+    case commandShift = "command_shift"
+    case controlOption = "control_option"
+    
+    var id: String { rawValue }
+    
+    var displayName: String {
+        switch self {
+        case .shift: return "⇧ Shift"
+        case .control: return "⌃ Control"
+        case .option: return "⌥ Option"
+        case .command: return "⌘ Command"
+        case .optionShift: return "⌥⇧ Option + Shift"
+        case .controlShift: return "⌃⇧ Control + Shift"
+        case .commandShift: return "⌘⇧ Command + Shift"
+        case .controlOption: return "⌃⌥ Control + Option"
+        }
+    }
+    
+    var requiredFlags: NSEvent.ModifierFlags {
+        switch self {
+        case .shift: return [.shift]
+        case .control: return [.control]
+        case .option: return [.option]
+        case .command: return [.command]
+        case .optionShift: return [.option, .shift]
+        case .controlShift: return [.control, .shift]
+        case .commandShift: return [.command, .shift]
+        case .controlOption: return [.control, .option]
+        }
+    }
+}
+
+enum CycleKeyPreset: String, CaseIterable, Identifiable {
+    case spaceAndTab = "space_tab"
+    case spaceOnly = "space"
+    case tabOnly = "tab"
+    case backtick = "backtick"
+    
+    var id: String { rawValue }
+    
+    var displayName: String {
+        switch self {
+        case .spaceAndTab: return "Space(스페이스바) 또는 Tab 키"
+        case .spaceOnly: return "Space(스페이스바)만 사용"
+        case .tabOnly: return "Tab 키만 사용"
+        case .backtick: return "` (백틱/물결) 키"
+        }
+    }
+    
+    func matches(keyCode: Int64) -> Bool {
+        switch self {
+        case .spaceAndTab: return keyCode == 49 || keyCode == 48
+        case .spaceOnly: return keyCode == 49
+        case .tabOnly: return keyCode == 48
+        case .backtick: return keyCode == 50
+        }
+    }
+}
+
+class ShortcutSettings: ObservableObject {
+    static let shared = ShortcutSettings()
+    
+    @Published var convertModifier: enumDragModifierPreset {
+        didSet { UserDefaults.standard.set(convertModifier.rawValue, forKey: "shortcut_convert") }
+    }
+    @Published var toolsModifier: enumDragModifierPreset {
+        didSet { UserDefaults.standard.set(toolsModifier.rawValue, forKey: "shortcut_tools") }
+    }
+    @Published var actionsModifier: enumDragModifierPreset {
+        didSet { UserDefaults.standard.set(actionsModifier.rawValue, forKey: "shortcut_actions") }
+    }
+    @Published var cycleKey: CycleKeyPreset {
+        didSet { UserDefaults.standard.set(cycleKey.rawValue, forKey: "shortcut_cycle") }
+    }
+    
+    init() {
+        let convRaw = UserDefaults.standard.string(forKey: "shortcut_convert") ?? enumDragModifierPreset.shift.rawValue
+        let toolRaw = UserDefaults.standard.string(forKey: "shortcut_tools") ?? enumDragModifierPreset.optionShift.rawValue
+        let actRaw = UserDefaults.standard.string(forKey: "shortcut_actions") ?? enumDragModifierPreset.control.rawValue
+        let cycRaw = UserDefaults.standard.string(forKey: "shortcut_cycle") ?? CycleKeyPreset.spaceAndTab.rawValue
+        
+        self.convertModifier = enumDragModifierPreset(rawValue: convRaw) ?? .shift
+        self.toolsModifier = enumDragModifierPreset(rawValue: toolRaw) ?? .optionShift
+        self.actionsModifier = enumDragModifierPreset(rawValue: actRaw) ?? .control
+        self.cycleKey = CycleKeyPreset(rawValue: cycRaw) ?? .spaceAndTab
+    }
+    
+    func resetToDefaults() {
+        convertModifier = .shift
+        toolsModifier = .optionShift
+        actionsModifier = .control
+        cycleKey = .spaceAndTab
+    }
+    
+    // 현재 눌린 보조키(ModifierFlags)가 어떤 휠 모드에 해당하는지 판별 (복합키 우선 매칭)
+    func matchWheelMode(for flags: NSEvent.ModifierFlags) -> WheelMode? {
+        let cleanFlags = flags.intersection([.shift, .control, .option, .command])
+        guard !cleanFlags.isEmpty else { return nil }
+        
+        let candidates: [(WheelMode, NSEvent.ModifierFlags)] = [
+            (.tools, toolsModifier.requiredFlags),
+            (.actions, actionsModifier.requiredFlags),
+            (.convert, convertModifier.requiredFlags)
+        ]
+        // 정확히 일치하는 조합을 최우선으로 찾음
+        for (mode, req) in candidates {
+            if cleanFlags == req { return mode }
+        }
+        // 복합키(2개 이상) 포함 여부 확인 후 단일키 확인
+        let sorted = candidates.sorted { $0.1.rawValue.nonzeroBitCount > $1.1.rawValue.nonzeroBitCount }
+        for (mode, req) in sorted {
+            if cleanFlags.isSuperset(of: req) { return mode }
+        }
+        return nil
+    }
+}
+
 // MARK: - 1. 작업 진행률(Progress) 매니저 (메뉴바 실시간 % 연동)
 struct ActiveJob: Identifiable {
     let id: UUID
@@ -53,7 +178,7 @@ class JobProgressManager: ObservableObject {
     }
 }
 
-// MARK: - 2. 글로벌 상태 및 휠 메뉴 모델 (예상 용량 표시 포함)
+// MARK: - 2. 글로벌 상태 및 휠 메뉴 모델
 enum WheelMode: String {
     case convert = "CONVERT"
     case tools = "TOOLS"
@@ -740,7 +865,7 @@ struct ScrollWheelCatcher: NSViewRepresentable {
     }
 }
 
-// MARK: - 6. 원형 다이얼 휠 UI (변환 포맷별 예상 용량 표시 포함)
+// MARK: - 6. 원형 다이얼 휠 UI
 struct PieSliceShape: Shape {
     var startAngle: Angle
     var endAngle: Angle
@@ -844,7 +969,7 @@ struct RadialWheelView: View {
                     .font(.system(size: 10, weight: .heavy, design: .monospaced))
                     .foregroundColor(.orange)
             } else {
-                Text("Space/Tab: 모드 전환")
+                Text("모드 전환 키 지원")
                     .font(.system(size: 8.5, weight: .medium))
                     .foregroundColor(.secondary)
             }
@@ -856,13 +981,13 @@ struct RadialWheelView: View {
     }
 }
 
-// MARK: - 7. 도구 창 매니저
+// MARK: - 7. 도구 창 매니저 (설명 및 단축키 설정 팝업 포함)
 class ToolWindowManager {
     static let shared = ToolWindowManager()
     var activeWindows: [NSWindow] = []
     var bannerWindow: NSPanel?
     
-    func openWindow<V: View>(title: String, view: V, size: NSSize, minSize: NSSize = NSSize(width: 720, height: 520)) {
+    func openWindow<V: View>(title: String, view: V, size: NSSize, minSize: NSSize = NSSize(width: 680, height: 500)) {
         let win = NSWindow(
             contentRect: NSRect(origin: .zero, size: size),
             styleMask: [.titled, .closable, .resizable, .miniaturizable, .fullSizeContentView],
@@ -910,6 +1035,15 @@ class ToolWindowManager {
         }
     }
     
+    func showHelpAndSettingsWindow() {
+        openWindow(
+            title: "🍊 MyTangerine — 설명 및 단축키 설정",
+            view: HelpAndSettingsView(),
+            size: NSSize(width: 780, height: 640),
+            minSize: NSSize(width: 700, height: 560)
+        )
+    }
+    
     func showEditPhotoWindow(url: URL) {
         openWindow(title: "Pro Photo Editor — \(url.lastPathComponent)", view: EditPhotoView(fileURL: url), size: NSSize(width: 1120, height: 780), minSize: NSSize(width: 860, height: 600))
     }
@@ -932,6 +1066,247 @@ class ToolWindowManager {
     
     func showMediaStudioWindow(url: URL, initialTab: String) {
         openWindow(title: "QuickTime & Multi-Channel Studio — \(url.lastPathComponent)", view: ProMediaStudioView(fileURL: url, initialMode: initialTab), size: NSSize(width: 1060, height: 800), minSize: NSSize(width: 900, height: 680))
+    }
+}
+
+// MARK: - 7-B. 사용법 안내 및 단축키 커스터마이징 창 (HelpAndSettingsView)
+struct HelpAndSettingsView: View {
+    @ObservedObject var settings = ShortcutSettings.shared
+    @State private var selectedTab: Int = 0
+    
+    var body: some View {
+        VStack(spacing: 0) {
+            // 상단 헤더
+            HStack(spacing: 14) {
+                Image(systemName: "circle.hexagongrid.fill")
+                    .font(.system(size: 36))
+                    .foregroundColor(.orange)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("MyTangerine 3.7 Pro")
+                        .font(.system(size: 20, weight: .heavy, design: .rounded))
+                    Text("어디서나 파일을 잡고 드래그하여 즉시 변환·편집하는 올인원 맥 유틸리티")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                Spacer()
+                Picker("", selection: $selectedTab) {
+                    Text("⌨️ 단축키 설정").tag(0)
+                    Text("📖 상세 사용 설명서").tag(1)
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 280)
+            }
+            .padding(18)
+            .background(.regularMaterial)
+            
+            Divider()
+            
+            if selectedTab == 0 {
+                shortcutSettingsTab
+            } else {
+                usageGuideTab
+            }
+            
+            Divider()
+            
+            // 하단 닫기 바
+            HStack {
+                Text("💡 변경한 단축키는 저장 버튼 없이 즉시 반영되며 앱을 껐다 켜도 유지됩니다.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Spacer()
+                Button("기본값으로 초기화") {
+                    settings.resetToDefaults()
+                    FileProcessor.showToast("단축키가 기본 설정으로 초기화되었습니다.")
+                }
+                Button("닫기") {
+                    NSApp.keyWindow?.close()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.orange)
+            }
+            .padding(14)
+            .background(.regularMaterial)
+        }
+    }
+    
+    // 탭 1: 단축키 커스터마이징
+    var shortcutSettingsTab: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("1. 드래그 중 원형 휠(Radial Wheel) 호출 단축키")
+                        .font(.headline)
+                        .foregroundColor(.orange)
+                    Text("Finder나 바탕화면에서 파일을 마우스로 잡고 드래그하는 상태에서 아래 보조키를 누르면 각 모드의 원형 휠이 마우스 주변에 나타납니다.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                
+                VStack(spacing: 12) {
+                    shortcutRow(
+                        title: "🔄 포맷 변환 휠 (CONVERT)",
+                        subtitle: "JPG, PNG, WEBP, HEIC, PDF, MP4, MOV, GIF, MP3, WAV, FLAC, ZIP 등 즉시 변환",
+                        selection: $settings.convertModifier
+                    )
+                    
+                    shortcutRow(
+                        title: "🛠️ 전용 편집 도구 휠 (TOOLS)",
+                        subtitle: "사진 보정(Edit), 8방향 크롭(Crop), 모자이크(Redact), 배경 합성(Add BG), 영상/오디오 트림, 압축 등",
+                        selection: $settings.toolsModifier
+                    )
+                    
+                    shortcutRow(
+                        title: "⚡ 빠른 액션 휠 (ACTIONS)",
+                        subtitle: "파일 경로 복사, 해당 폴더에서 터미널 열기, AirDrop 전송, 사본 생성 등",
+                        selection: $settings.actionsModifier
+                    )
+                }
+                
+                if settings.convertModifier == settings.toolsModifier ||
+                   settings.convertModifier == settings.actionsModifier ||
+                   settings.toolsModifier == settings.actionsModifier {
+                    HStack(spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill").foregroundColor(.yellow)
+                        Text("서로 다른 두 모드가 동일한 단축키로 설정되어 있습니다. 구분해서 설정하시는 것을 권장합니다.")
+                            .font(.caption.bold())
+                            .foregroundColor(.orange)
+                    }
+                    .padding(10)
+                    .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+                }
+                
+                Divider().padding(.vertical, 4)
+                
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("2. 휠이 떠 있을 때 모드 순환 전환 키")
+                        .font(.headline)
+                        .foregroundColor(.orange)
+                    Text("보조키 하나(예: Shift)만 누른 채로도 이 키를 톡톡 누르면 CONVERT ➔ TOOLS ➔ ACTIONS 순서로 휠이 즉시 바뀝니다.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    
+                    HStack {
+                        Text("모드 전환 키 선택").font(.subheadline.bold())
+                        Spacer()
+                        Picker("", selection: $settings.cycleKey) {
+                            ForEach(CycleKeyPreset.allCases) { preset in
+                                Text(preset.displayName).tag(preset)
+                            }
+                        }
+                        .frame(width: 260)
+                    }
+                    .padding(14)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
+                }
+                
+                Divider().padding(.vertical, 4)
+                
+                // 현재 설정된 단축키 요약 카드
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("✅ 현재 내 단축키 요약")
+                        .font(.subheadline.bold())
+                    HStack(spacing: 14) {
+                        summaryBadge(mode: "CONVERT (변환)", key: settings.convertModifier.displayName, color: .orange)
+                        summaryBadge(mode: "TOOLS (편집 도구)", key: settings.toolsModifier.displayName, color: .pink)
+                        summaryBadge(mode: "ACTIONS (빠른 액션)", key: settings.actionsModifier.displayName, color: .blue)
+                    }
+                }
+                .padding(14)
+                .background(Color.black.opacity(0.15), in: RoundedRectangle(cornerRadius: 12))
+            }
+            .padding(22)
+        }
+    }
+    
+    func shortcutRow(title: String, subtitle: String, selection: Binding<enumDragModifierPreset>) -> some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title).font(.system(size: 14, weight: .bold))
+                Text(subtitle).font(.caption).foregroundColor(.secondary)
+            }
+            Spacer()
+            Picker("", selection: selection) {
+                ForEach(enumDragModifierPreset.allCases) { preset in
+                    Text(preset.displayName).tag(preset)
+                }
+            }
+            .frame(width: 210)
+        }
+        .padding(14)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
+    }
+    
+    func summaryBadge(mode: String, key: String, color: Color) -> some View {
+        VStack(spacing: 4) {
+            Text(mode).font(.caption2.bold()).foregroundColor(.secondary)
+            Text("파일 드래그 + \(key)")
+                .font(.system(size: 12, weight: .heavy, design: .rounded))
+                .foregroundColor(color)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 10)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+    }
+    
+    // 탭 2: 상세 사용 설명서
+    var usageGuideTab: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                guideCard(
+                    icon: "hand.draw.fill",
+                    title: "1. 기본 작동법 (드래그 & 드롭 휠)",
+                    items: [
+                        "Finder나 바탕화면에서 파일(사진, 영상, 오디오, 문서 등 여러 개 동시 선택 가능)을 마우스로 잡고 드래그를 시작합니다.",
+                        "드래그한 채로 설정한 단축키(기본값: Shift)를 누르면 마우스 포인터 주위에 원형 휠이 펼쳐집니다.",
+                        "각 포맷 조각에는 변환 시 예상되는 파일 크기(예: ~1.2 MB)가 실시간으로 안내됩니다.",
+                        "원하는 기능 위에 마우스를 올리고 버튼을 놓으면 원본 파일 바로 옆에 결과물이 저장됩니다.",
+                        "취소하고 싶을 때는 휠의 가운데 원 안쪽이나 휠 바깥 허공에 마우스를 놓으면 안전하게 취소됩니다."
+                    ]
+                )
+                
+                guideCard(
+                    icon: "photo.on.rectangle.angled",
+                    title: "2. 이미지 편집 도구 (Edit Photo / Crop / Redact / Add BG)",
+                    items: [
+                        "EDIT PHOTO: 노출, 휘도, 하이라이트, 그림자, 대비, 채도, 색온도, 선명도 등 14가지 슬라이더로 원본 화질 손실 없이 보정합니다.",
+                        "CROP (8방향 자르기): 노란색 모서리 핸들 4곳을 끌면 가로·세로 두 변이 동시에 조절되고, 상·하·좌·우 흰색 바 4곳을 끌면 해당 변만 정밀하게 조절됩니다.",
+                        "REDACT (가리기): 원하는 영역을 마우스로 드래그하면 픽셀 모자이크, 블러(흐림), 검은 박스 중 선택한 스타일로 개인정보를 가려줍니다.",
+                        "확대/축소 및 이동: 모든 이미지 프리뷰 창에서 마우스 스크롤 휠로 정중앙 기준 확대/축소가 가능하며, '화면 이동(Pan)' 버튼이나 Option+드래그로 위치를 이동할 수 있습니다."
+                    ]
+                )
+                
+                guideCard(
+                    icon: "film.stack",
+                    title: "3. QuickTime 영상 트림 & 다중 채널 오디오 스튜디오",
+                    items: [
+                        "영상 화면을 직접 보면서 타임라인을 클릭/드래그해 원하는 장면을 탐색할 수 있습니다.",
+                        "타임라인 양끝의 노란색 트림 바를 움직이거나, 하단 입력칸에서 시:분:초:프레임(HH:MM:SS:FF) 단위 및 -1F / +1F 버튼으로 1프레임씩 정밀하게 시작·끝점을 지정합니다.",
+                        "다중 채널 오디오 믹서: 2채널 스테레오부터 4채널, 6채널, 8채널 이상의 오디오 트랙을 자동 감지하여 각 채널별로 켜기/끄기(ON/MUTE) 또는 단독 청취(SOLO)가 가능합니다.",
+                        "작업 진행률 확인: 대용량 영상 변환 및 편집 시 상단 메뉴바 아이콘 옆에 실시간 진행 퍼센트(%)가 표시됩니다."
+                    ]
+                )
+            }
+            .padding(22)
+        }
+    }
+    
+    func guideCard(icon: String, title: String, items: [String]) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: icon).foregroundColor(.orange).font(.title3)
+                Text(title).font(.headline)
+            }
+            ForEach(items, id: \.self) { line in
+                HStack(alignment: .top, spacing: 8) {
+                    Text("•").foregroundColor(.orange).bold()
+                    Text(line).font(.system(size: 13)).foregroundColor(.primary.opacity(0.9))
+                }
+            }
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
     }
 }
 
@@ -2575,7 +2950,7 @@ struct MetadataToolView: View {
     }
 }
 
-// MARK: - 14. 앱 델리게이트 & Finder Option-드래그 복제 방지 인터셉터 (CGEventTap)
+// MARK: - 14. 앱 델리게이트 & 메뉴바 설정 연동
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var wheelPanel: NSPanel!
@@ -2615,7 +2990,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "🍊 MyTangerine 3.6 Pro", action: nil, keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "🍊 MyTangerine 3.7 Pro", action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         
         if jobs.isEmpty {
@@ -2632,10 +3007,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         
         menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "Shift+드래그: 변환 | Shift+Option(또는 Space/Tab): 도구 | Control: 액션", action: nil, keyEquivalent: ""))
+        let helpItem = NSMenuItem(title: "📖 설명 및 단축키 설정...", action: #selector(openHelpAndSettings), keyEquivalent: ",")
+        helpItem.target = self
+        menu.addItem(helpItem)
+        
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "종료 (Quit)", action: #selector(quitApp), keyEquivalent: "q"))
         statusItem.menu = menu
+    }
+    
+    @objc func openHelpAndSettings() {
+        ToolWindowManager.shared.showHelpAndSettingsWindow()
     }
     
     @objc func quitApp() {
@@ -2657,7 +3039,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         wheelPanel.contentView = NSHostingView(rootView: RadialWheelView())
     }
     
-    // MARK: 핵심 해결 — MyTangerine 휠이 떠 있을 때 마우스를 놓으면 Option 플래그를 제거하고 ESC를 보내 Finder의 파일 복제를 원천 차단
     func setupCGEventTapForOptionCancelFix() {
         let mask = (1 << CGEventType.leftMouseUp.rawValue) |
                    (1 << CGEventType.leftMouseDragged.rawValue) |
@@ -2672,26 +3053,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 return Unmanaged.passUnretained(event)
             }
             
-            // 휠이 활성화된 상태일 때:
             if AppState.shared.isDragging {
-                // 1) Space(49) 또는 Tab(48) 키를 누르면 Option 키 없이도 모드를 즉시 전환 (CONVERT -> TOOLS -> ACTIONS)
                 if type == .keyDown {
                     let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
-                    if keyCode == 49 || keyCode == 48 {
+                    if ShortcutSettings.shared.cycleKey.matches(keyCode: keyCode) {
                         DispatchQueue.main.async {
                             AppState.shared.cycleMode()
                         }
-                        return nil // Finder로 키 입력이 넘어가지 않게 흡수
+                        return nil
                     }
                 }
                 
-                // 2) 드래그 중이거나 마우스 버튼을 놓는 순간(leftMouseUp):
-                //    Finder가 Option 키를 보고 '파일 복제(+)'를 실행하지 못하도록 이벤트에서 Option/Shift/Control 플래그를 제거!
                 if type == .leftMouseDragged || type == .leftMouseUp {
-                    event.flags.remove([.maskAlternate, .maskShift, .maskControl])
+                    event.flags.remove([.maskAlternate, .maskShift, .maskControl, .maskCommand])
                 }
                 
-                // 3) 마우스를 놓는 순간: 먼저 Finder의 드래그 세션을 ESC(KeyCode 53)로 안전하게 취소시킨 뒤 MyTangerine 동작 처리
                 if type == .leftMouseUp {
                     mySelf.sendEscapeToCancelFinderDrag()
                     DispatchQueue.main.async {
@@ -2718,7 +3094,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
     
-    // Finder에게 ESC 키 이벤트를 전송하여 마우스를 놓기 직전 파일 이동/복제 드래그를 즉시 무효화
     func sendEscapeToCancelFinderDrag() {
         let src = CGEventSource(stateID: .hidSystemState)
         if let escDown = CGEvent(keyboardEventSource: src, virtualKey: 53, keyDown: true),
@@ -2744,7 +3119,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self?.handleDragOrFlags(event: event)
         }
         
-        // 만약 CGEventTap 권한이 아직 없을 때를 대비한 폴백 모니터
         NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseUp]) { [weak self] _ in
             guard let self = self else { return }
             if AppState.shared.isDragging {
@@ -2754,15 +3128,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
     
     func handleDragOrFlags(event: NSEvent) {
-        let flags = NSEvent.modifierFlags
-        let shiftPressed = flags.contains(.shift)
-        let optionPressed = flags.contains(.option)
-        let controlPressed = flags.contains(.control)
-        
-        let wantsWheel = shiftPressed || controlPressed
         let mousePressed = (NSEvent.pressedMouseButtons & 1) != 0
+        guard mousePressed else {
+            if AppState.shared.isDragging { hideWheel() }
+            return
+        }
         
-        guard mousePressed && wantsWheel else {
+        // 사용자가 설정한 커스텀 단축키와 현재 눌린 보조키를 대조
+        guard let matchedMode = ShortcutSettings.shared.matchWheelMode(for: NSEvent.modifierFlags) else {
             if AppState.shared.isDragging { hideWheel() }
             return
         }
@@ -2786,17 +3159,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             AppState.shared.totalSizeText = ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
         }
         
-        let newMode: WheelMode = controlPressed ? .actions : (optionPressed && shiftPressed ? .tools : AppState.shared.wheelMode)
-        
         if !AppState.shared.isDragging {
             guard isCurrentMouseStrokeValidFileDrag, !AppState.shared.draggedFiles.isEmpty else { return }
-            AppState.shared.wheelMode = controlPressed ? .actions : (optionPressed && shiftPressed ? .tools : .convert)
+            AppState.shared.wheelMode = matchedMode
             AppState.shared.updateItems()
             showWheel(at: NSEvent.mouseLocation)
-        } else if (optionPressed && shiftPressed && AppState.shared.wheelMode != .tools) ||
-                  (controlPressed && AppState.shared.wheelMode != .actions) ||
-                  (!optionPressed && !controlPressed && shiftPressed && event.type == .flagsChanged && AppState.shared.wheelMode != .convert) {
-            AppState.shared.wheelMode = newMode
+        } else if event.type == .flagsChanged && AppState.shared.wheelMode != matchedMode {
+            AppState.shared.wheelMode = matchedMode
             AppState.shared.updateItems()
         }
         
