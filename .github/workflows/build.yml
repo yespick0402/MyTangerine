@@ -12,11 +12,29 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Create App Bundle & Bundle Standalone ARM64 FFmpeg
+      - name: Create App Bundle, Icon (.icns) & Bundle Standalone ARM64 FFmpeg
         run: |
           mkdir -p MyTangerine.app/Contents/MacOS
           mkdir -p MyTangerine.app/Contents/Resources
 
+          # 업로드된 icon.png로 맥용 공식 AppIcon.icns 생성 및 리소스 복사
+          if [ -f icon.png ]; then
+            cp icon.png MyTangerine.app/Contents/Resources/icon.png
+            mkdir -p AppIcon.iconset
+            sips -z 16 16     -s format png icon.png --out AppIcon.iconset/icon_16x16.png
+            sips -z 32 32     -s format png icon.png --out AppIcon.iconset/icon_16x16@2x.png
+            sips -z 32 32     -s format png icon.png --out AppIcon.iconset/icon_32x32.png
+            sips -z 64 64     -s format png icon.png --out AppIcon.iconset/icon_32x32@2x.png
+            sips -z 128 128   -s format png icon.png --out AppIcon.iconset/icon_128x128.png
+            sips -z 256 256   -s format png icon.png --out AppIcon.iconset/icon_128x128@2x.png
+            sips -z 256 256   -s format png icon.png --out AppIcon.iconset/icon_256x256.png
+            sips -z 512 512   -s format png icon.png --out AppIcon.iconset/icon_256x256@2x.png
+            sips -z 512 512   -s format png icon.png --out AppIcon.iconset/icon_512x512.png
+            sips -z 1024 1024 -s format png icon.png --out AppIcon.iconset/icon_512x512@2x.png
+            iconutil -c icns AppIcon.iconset -o MyTangerine.app/Contents/Resources/AppIcon.icns || true
+          fi
+
+          # 독립 실행형 ARM64 FFmpeg 내장
           curl -L -s "https://www.osxexperts.net/ffmpeg7arm.zip" -o ffmpeg.zip || true
           unzip -q -o ffmpeg.zip -d MyTangerine.app/Contents/Resources/ || true
 
@@ -40,10 +58,12 @@ jobs:
               <string>com.custom.mytangerine</string>
               <key>CFBundleName</key>
               <string>MyTangerine</string>
+              <key>CFBundleIconFile</key>
+              <string>AppIcon</string>
               <key>CFBundlePackageType</key>
               <string>APPL</string>
               <key>CFBundleShortVersionString</key>
-              <string>3.9</string>
+              <string>4.0</string>
               <key>LSMinimumSystemVersion</key>
               <string>14.0</string>
               <key>LSArchitecturePriority</key>
