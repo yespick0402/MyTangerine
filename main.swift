@@ -13,30 +13,30 @@ import AudioToolbox
 class ShortcutSettings: ObservableObject {
     static let shared = ShortcutSettings()
     
-    // CGEventFlags rawValue를 저장 (기본값: Convert = Shift, Tools = Option + Shift)
-    @Published var convertFlagsRaw: UInt64 {
-        didSet { UserDefaults.standard.set(convertFlagsRaw, forKey: "tangerine_sc_convert_v38") }
+    // NSEvent.ModifierFlags.rawValue (UInt) 저장 (기본값: Convert = Shift, Tools = Option + Shift)
+    @Published var convertFlagsRaw: UInt {
+        didSet { UserDefaults.standard.set(Int(convertFlagsRaw), forKey: "tangerine_sc_convert_v38") }
     }
-    @Published var toolsFlagsRaw: UInt64 {
-        didSet { UserDefaults.standard.set(toolsFlagsRaw, forKey: "tangerine_sc_tools_v38") }
+    @Published var toolsFlagsRaw: UInt {
+        didSet { UserDefaults.standard.set(Int(toolsFlagsRaw), forKey: "tangerine_sc_tools_v38") }
     }
     
-    static let defaultConvertRaw: UInt64 = NSEvent.ModifierFlags.shift.rawValue
-    static let defaultToolsRaw: UInt64 = NSEvent.ModifierFlags([.option, .shift]).rawValue
+    static let defaultConvertRaw: UInt = NSEvent.ModifierFlags.shift.rawValue
+    static let defaultToolsRaw: UInt = NSEvent.ModifierFlags([.option, .shift]).rawValue
     
     init() {
-        let savedConv = UserDefaults.standard.object(forKey: "tangerine_sc_convert_v38") as? UInt64
-        let savedTools = UserDefaults.standard.object(forKey: "tangerine_sc_tools_v38") as? UInt64
-        self.convertFlagsRaw = (savedConv != nil && savedConv != 0) ? savedConv! : Self.defaultConvertRaw
-        self.toolsFlagsRaw = (savedTools != nil && savedTools != 0) ? savedTools! : Self.defaultToolsRaw
+        let savedConv = UserDefaults.standard.integer(forKey: "tangerine_sc_convert_v38")
+        let savedTools = UserDefaults.standard.integer(forKey: "tangerine_sc_tools_v38")
+        self.convertFlagsRaw = (savedConv != 0) ? UInt(savedConv) : Self.defaultConvertRaw
+        self.toolsFlagsRaw = (savedTools != 0) ? UInt(savedTools) : Self.defaultToolsRaw
     }
     
     var convertFlags: NSEvent.ModifierFlags {
-        NSEvent.ModifierFlags(rawValue: UInt(convertFlagsRaw)).intersection([.shift, .option, .control, .command])
+        NSEvent.ModifierFlags(rawValue: convertFlagsRaw).intersection([.shift, .option, .control, .command])
     }
     
     var toolsFlags: NSEvent.ModifierFlags {
-        NSEvent.ModifierFlags(rawValue: UInt(toolsFlagsRaw)).intersection([.shift, .option, .control, .command])
+        NSEvent.ModifierFlags(rawValue: toolsFlagsRaw).intersection([.shift, .option, .control, .command])
     }
     
     func resetToTangerineDefaults() {
@@ -61,11 +61,9 @@ class ShortcutSettings: ObservableObject {
         let tFlags = toolsFlags
         let cFlags = convertFlags
         
-        // 정확히 일치하는 키 조합 우선 판정
         if clean == tFlags { return .tools }
         if clean == cFlags { return .convert }
         
-        // 복합키(예: Option+Shift)가 단일키(예: Shift)보다 먼저 매칭되도록 비트 수 정렬
         let candidates: [(WheelMode, NSEvent.ModifierFlags)] = [
             (.tools, tFlags),
             (.convert, cFlags)
@@ -967,7 +965,6 @@ struct HelpAndSettingsView: View {
     @ObservedObject var settings = ShortcutSettings.shared
     @State private var selectedTab: Int = 0
     
-    // 현재 녹음 중인 대상 ("convert" 또는 "tools" 또는 nil)
     @State private var recordingTarget: String? = nil
     @State private var tempRecordedFlags: NSEvent.ModifierFlags = []
     @State private var localMonitor: Any? = nil
@@ -1050,7 +1047,7 @@ struct HelpAndSettingsView: View {
                         subtitle: "파일을 드래그하면서 이 키를 누르면 JPG, PNG, WEBP, HEIC, PDF, MP4, MOV, GIF, MP3, WAV 등으로 즉시 변환합니다.",
                         currentFlags: settings.convertFlags,
                         onSave: { newFlags in
-                            settings.convertFlagsRaw = UInt64(newFlags.rawValue)
+                            settings.convertFlagsRaw = newFlags.rawValue
                             FileProcessor.showToast("변환(CONVERT) 단축키가 저장되었습니다.")
                         }
                     )
@@ -1061,7 +1058,7 @@ struct HelpAndSettingsView: View {
                         subtitle: "파일을 드래그하면서 이 키를 누르면 사진 보정(Edit), 크롭(Crop), 모자이크(Redact), 배경 추가(Add BG), 영상/오디오 트림, 압축 도구가 열립니다.",
                         currentFlags: settings.toolsFlags,
                         onSave: { newFlags in
-                            settings.toolsFlagsRaw = UInt64(newFlags.rawValue)
+                            settings.toolsFlagsRaw = newFlags.rawValue
                             FileProcessor.showToast("도구(TOOLS) 단축키가 저장되었습니다.")
                         }
                     )
@@ -1102,7 +1099,6 @@ struct HelpAndSettingsView: View {
             }
             
             HStack(spacing: 12) {
-                // 현재 키 또는 입력 중인 키 표시창
                 HStack {
                     Image(systemName: isRecordingThis ? "keyboard.badge.ellipsis" : "keyboard")
                         .foregroundColor(isRecordingThis ? .orange : .secondary)
@@ -1161,7 +1157,6 @@ struct HelpAndSettingsView: View {
         localMonitor = NSEvent.addLocalMonitorForEvents(matching: [.flagsChanged, .keyDown]) { event in
             let flags = event.modifierFlags.intersection([.control, .option, .shift, .command])
             if !flags.isEmpty {
-                // 사용자가 누른 키 조합을 기록하여 키를 떼고 마우스로 [완료]를 눌러도 유지되도록 함
                 self.tempRecordedFlags = flags
             }
             return nil
@@ -1982,7 +1977,6 @@ class MultiChannelMediaController: ObservableObject {
         setupMedia()
     }
     
-    // 모든 채널이 기본 ON 상태인지 확인 (기본 상태에서는 AVPlayer 순정 오디오를 사용하여 100% 소리 출력 보장)
     var isCustomChannelFilterActive: Bool {
         if soloChannel != nil { return true }
         return channelEnabled.contains(false)
@@ -2030,7 +2024,6 @@ class MultiChannelMediaController: ObservableObject {
             }
         }
         
-        // 60fps 주기로 현재 재생 위치를 감시하며 트림 구간(startTime ~ endTime)을 절대 벗어나지 못하게 강제 고정
         timeObserver = player.addPeriodicTimeObserver(
             forInterval: CMTime(seconds: 1.0 / 60.0, preferredTimescale: 600),
             queue: .main
@@ -2061,7 +2054,6 @@ class MultiChannelMediaController: ObservableObject {
         if isPlaying {
             pause()
         } else {
-            // 재생 시작 시 현재 위치가 트림 시작점 이전이거나 끝점 이후면 무조건 트림 시작점(startTime)에서 출발!
             if currentTime < startTime || currentTime >= endTime - 0.02 {
                 seek(to: startTime)
             }
@@ -2071,14 +2063,12 @@ class MultiChannelMediaController: ObservableObject {
     
     func play() {
         isPlaying = true
-        // 오디오 전용 파일에서 특정 채널을 끄거나 솔로(Solo)를 켠 경우에만 커스텀 멀티채널 엔진 구동
         if !isVideo && isCustomChannelFilterActive && audioFile != nil {
             player.pause()
             playCustomMultiChannelAudio(from: currentTime)
         } else {
             stopAudioEngine()
             applyPlayerAudioState()
-            // 재생할 구간의 끝점(forwardPlaybackEndTime)을 AVPlayerItem에도 지정하여 트림 밖 재생 원천 차단
             player.currentItem?.forwardPlaybackEndTime = CMTime(seconds: endTime, preferredTimescale: 6000)
             player.play()
         }
@@ -2099,7 +2089,6 @@ class MultiChannelMediaController: ObservableObject {
         audioPlayerNode = nil
     }
     
-    // 재생 위치를 이동할 때 무조건 [startTime ... endTime] 트림 구간 안으로만 제한(Clamp)!
     func seek(to sec: Double) {
         let clampedToTrim = max(startTime, min(endTime, sec))
         currentTime = clampedToTrim
@@ -2158,7 +2147,6 @@ class MultiChannelMediaController: ObservableObject {
         }
     }
     
-    // 최대 15초 단위 청크로 안전하게 멀티채널을 라우팅하여 대용량 파일에서도 소리가 끊기지 않도록 보장
     private func playCustomMultiChannelAudio(from startSec: Double) {
         guard let af = audioFile else { return }
         stopAudioEngine()
@@ -2175,7 +2163,6 @@ class MultiChannelMediaController: ObservableObject {
             return
         }
         
-        // 메모리 초과 방지를 위해 한 번에 최대 30초 분량만 버퍼링
         let maxBufferFrames = AVAudioFrameCount(sr * 30.0)
         let frameCount = min(requestedFrames, maxBufferFrames)
         
@@ -2378,7 +2365,6 @@ struct ProMediaStudioView: View {
                         }
                         .padding(.horizontal, 6)
                         
-                        // 트림 제외 구간 어둡게 마스킹 (재생 불가 영역 표시)
                         Rectangle()
                             .fill(Color.black.opacity(0.72))
                             .frame(width: max(0, startX), height: h)
@@ -2393,7 +2379,6 @@ struct ProMediaStudioView: View {
                             .frame(width: max(10, endX - startX), height: h - 2)
                             .offset(x: startX)
                         
-                        // 좌측 시작점(In) 노란색 핸들
                         ZStack {
                             RoundedRectangle(cornerRadius: 4).fill(Color.yellow).frame(width: 14, height: h)
                             Rectangle().fill(Color.black).frame(width: 2, height: 18)
@@ -2405,13 +2390,11 @@ struct ProMediaStudioView: View {
                                     ctrl.pause()
                                     let sec = Double(val.location.x / w) * ctrl.duration
                                     ctrl.startTime = max(0.0, min(ctrl.endTime - (1.0 / ctrl.fps), sec))
-                                    // 시작점을 조절할 때 즉시 시작점 장면을 보여줌
                                     ctrl.seek(to: ctrl.startTime)
                                     syncTimecodeFields()
                                 }
                         )
                         
-                        // 우측 종료점(Out) 노란색 핸들
                         ZStack {
                             RoundedRectangle(cornerRadius: 4).fill(Color.yellow).frame(width: 14, height: h)
                             Rectangle().fill(Color.black).frame(width: 2, height: 18)
@@ -2423,13 +2406,11 @@ struct ProMediaStudioView: View {
                                     ctrl.pause()
                                     let sec = Double(val.location.x / w) * ctrl.duration
                                     ctrl.endTime = min(ctrl.duration, max(ctrl.startTime + (1.0 / ctrl.fps), sec))
-                                    // 끝점을 조절할 때 즉시 끝점 장면을 보여줌
                                     ctrl.seek(to: ctrl.endTime)
                                     syncTimecodeFields()
                                 }
                         )
                         
-                        // 빨간색 재생 헤드(Playhead)
                         ZStack {
                             Rectangle().fill(Color.red).frame(width: 2.5, height: h + 6)
                             Circle().fill(Color.red).frame(width: 11, height: 11).offset(y: -h / 2)
@@ -2441,7 +2422,6 @@ struct ProMediaStudioView: View {
                         DragGesture(minimumDistance: 0)
                             .onChanged { val in
                                 let rawSec = Double(max(0, min(w, val.location.x)) / w) * ctrl.duration
-                                // 마우스를 트림 바깥으로 끌어도 무조건 [startTime ... endTime] 안에서만 이동!
                                 ctrl.seek(to: rawSec)
                             }
                     )
