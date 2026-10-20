@@ -17,55 +17,7 @@ jobs:
           mkdir -p MyTangerine.app/Contents/MacOS
           mkdir -p MyTangerine.app/Contents/Resources
 
-          # icon.png의 투명도(Alpha)를 100% 유지하고 macOS가 회색 박스를 씌우지 않도록 여백을 맞춰 icns 생성
-          if [ -f icon.png ]; then
-            cp icon.png MyTangerine.app/Contents/Resources/icon.png
-            mkdir -p AppIcon.iconset
-            swift -e '
-            import Cocoa
-            guard let src = NSImage(contentsOfFile: "icon.png") else { exit(1) }
-            let sizes: [(String, Int)] = [
-                ("icon_16x16.png", 16), ("icon_16x16@2x.png", 32),
-                ("icon_32x32.png", 32), ("icon_32x32@2x.png", 64),
-                ("icon_128x128.png", 128), ("icon_128x128@2x.png", 256),
-                ("icon_256x256.png", 256), ("icon_256x256@2x.png", 512),
-                ("icon_512x512.png", 512), ("icon_512x512@2x.png", 1024)
-            ]
-            for (name, px) in sizes {
-                let rep = NSBitmapImageRep(
-                    bitmapDataPlanes: nil, pixelsWide: px, pixelsHigh: px,
-                    bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
-                    colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
-                )!
-                NSGraphicsContext.saveGraphicsState()
-                NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
-                NSColor.clear.set()
-                NSRect(x: 0, y: 0, width: px, height: px).fill()
-                let pad = CGFloat(px) * 0.09
-                let drawRect = NSRect(x: pad, y: pad, width: CGFloat(px) - pad * 2, height: CGFloat(px) - pad * 2)
-                src.draw(in: drawRect, from: .zero, operation: .sourceOver, fraction: 1.0)
-                NSGraphicsContext.restoreGraphicsState()
-                if let data = rep.representation(using: .png, properties: [:]) {
-                    try? data.write(to: URL(fileURLWithPath: "AppIcon.iconset/\(name)"))
-                }
-            }
-            '
-            iconutil -c icns AppIcon.iconset -o MyTangerine.app/Contents/Resources/AppIcon.icns || true
-          fi
-
-          # 독립 실행형 ARM64 FFmpeg 내장
-          curl -L -s "https://www.osxexperts.net/ffmpeg7arm.zip" -o ffmpeg.zip || true
-          unzip -q -o ffmpeg.zip -d MyTangerine.app/Contents/Resources/ || true
-
-          if [ ! -f MyTangerine.app/Contents/Resources/ffmpeg ]; then
-            curl -L -s "https://evermeet.cx/ffmpeg/getrelease/zip" -A "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0)" -o ffmpeg.zip || true
-            unzip -q -o ffmpeg.zip -d MyTangerine.app/Contents/Resources/ || true
-          fi
-
-          if [ -f MyTangerine.app/Contents/Resources/ffmpeg ]; then
-            chmod +x MyTangerine.app/Contents/Resources/ffmpeg
-          fi
-
+          # 1. Info.plist를 먼저 정확하게 생성 (XML 문법 오류 완벽 수정)
           cat << 'EOF' > MyTangerine.app/Contents/Info.plist
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -75,14 +27,18 @@ jobs:
               <string>MyTangerine</string>
               <key>CFBundleIdentifier</key>
               <string>com.custom.mytangerine</string>
-              <key>CFBundleName</string>
+              <key>CFBundleName</key>
+              <string>MyTangerine</string>
+              <key>CFBundleDisplayName</key>
               <string>MyTangerine</string>
               <key>CFBundleIconFile</key>
               <string>AppIcon</string>
               <key>CFBundlePackageType</key>
               <string>APPL</string>
               <key>CFBundleShortVersionString</key>
-              <string>4.1</string>
+              <string>4.2</string>
+              <key>CFBundleVersion</key>
+              <string>4.2</string>
               <key>LSMinimumSystemVersion</key>
               <string>14.0</string>
               <key>LSArchitecturePriority</key>
@@ -97,7 +53,39 @@ jobs:
           </plist>
           EOF
 
-      - name: Combine Parts & Compile Pure Native Apple Silicon (arm64) App
+          # 2. 업로드된 icon.png로 투명 알파 채널이 살아있는 AppIcon.icns 생성
+          if [ -f icon.png ]; then
+            cp icon.png MyTangerine.app/Contents/Resources/icon.png
+            mkdir -p AppIcon.iconset
+            sips -z 16 16     -s format png icon.png --out AppIcon.iconset/icon_16x16.png
+            sips -z 32 32     -s format png icon.png --out AppIcon.iconset/icon_16x16@2x.png
+            sips -z 32 32     -s format png icon.png --out AppIcon.iconset/icon_32x32.png
+            sips -z 64 64     -s format png icon.png --out AppIcon.iconset/icon_32x32@2x.png
+            sips -z 128 128   -s format png icon.png --out AppIcon.iconset/icon_128x128.png
+            sips -z 256 256   -s format png icon.png --out AppIcon.iconset/icon_128x128@2x.png
+            sips -z 256 256   -s format png icon.png --out AppIcon.iconset/icon_256x256.png
+            sips -z 512 512   -s format png icon.png --out AppIcon.iconset/icon_256x256@2x.png
+            sips -z 512 512   -s format png icon.png --out AppIcon.iconset/icon_512x512.png
+            sips -z 1024 1024 -s format png icon.png --out AppIcon.iconset/icon_512x512@2x.png
+            iconutil -c icns AppIcon.iconset -o MyTangerine.app/Contents/Resources/AppIcon.icns || true
+          fi
+
+          # 3. 독립 실행형 ARM64 FFmpeg 내장 및 실행 권한/서명 정리
+          curl -L -s "https://www.osxexperts.net/ffmpeg7arm.zip" -o ffmpeg.zip || true
+          unzip -q -o ffmpeg.zip -d MyTangerine.app/Contents/Resources/ || true
+
+          if [ ! -f MyTangerine.app/Contents/Resources/ffmpeg ]; then
+            curl -L -s "https://evermeet.cx/ffmpeg/getrelease/zip" -A "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0)" -o ffmpeg.zip || true
+            unzip -q -o ffmpeg.zip -d MyTangerine.app/Contents/Resources/ || true
+          fi
+
+          if [ -f MyTangerine.app/Contents/Resources/ffmpeg ]; then
+            chmod +x MyTangerine.app/Contents/Resources/ffmpeg
+            xattr -cr MyTangerine.app/Contents/Resources/ffmpeg || true
+            codesign --force --sign - MyTangerine.app/Contents/Resources/ffmpeg || true
+          fi
+
+      - name: Combine Parts, Compile & Sign Pure Native App
         run: |
           if [ -f Part1.swift ] && [ -f Part2.swift ]; then
             cat Part1.swift Part2.swift > combined_main.swift
@@ -106,8 +94,26 @@ jobs:
           fi
           swiftc combined_main.swift -o MyTangerine.app/Contents/MacOS/MyTangerine -target arm64-apple-macos14.0 -Osize
           strip -x MyTangerine.app/Contents/MacOS/MyTangerine
+
+          # Info.plist 문법 검증 (오류 시 즉시 감지)
+          plutil -lint MyTangerine.app/Contents/Info.plist
+
+          # 불필요한 확장 속성 제거 후 내부 바이너리부터 전체 앱 번들까지 순서대로 깔끔하게 서명
+          xattr -cr MyTangerine.app
           codesign --force --deep --sign - MyTangerine.app
-          zip -r -y MyTangerine.zip MyTangerine.app
+
+          # macOS가 회색 네모 박스(Squircle)를 씌우지 못하도록 투명 PNG를 Finder 커스텀 아이콘으로 각인
+          if [ -f icon.png ]; then
+            swift -e '
+            import Cocoa
+            if let img = NSImage(contentsOfFile: "icon.png") {
+                NSWorkspace.shared.setIcon(img, forFile: "MyTangerine.app", options: [])
+            }
+            ' || true
+          fi
+
+          # 커스텀 투명 아이콘 리소스 포크(--sequesterRsrc)를 보존하여 압축
+          ditto -c -k --sequesterRsrc --keepParent MyTangerine.app MyTangerine.zip
 
       - name: Upload Finished Mac App
         uses: actions/upload-artifact@v4
