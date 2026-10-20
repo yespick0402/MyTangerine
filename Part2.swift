@@ -1,4 +1,4 @@
-// MARK: - 8. 전문가 사진 보정 창 (Part 2)
+// MARK: - 8. 전문가 사진 보정 창 (Part 2 — 저장 시 원본 EXIF 메타데이터 100% 보존)
 struct EditPhotoView: View {
     let fileURL: URL
     @State private var exposure: Double = 0.0
@@ -103,7 +103,7 @@ struct EditPhotoView: View {
                 HStack {
                     Button("전체 초기화") { resetAll() }
                     Spacer()
-                    Button("원본 화질 저장") { saveFullRes() }.buttonStyle(.borderedProminent).tint(.orange)
+                    Button("원본 화질 저장 (메타데이터 유지)") { saveFullRes() }.buttonStyle(.borderedProminent).tint(.orange)
                 }.padding(14).background(.regularMaterial)
             }.frame(width: 340)
         }
@@ -202,14 +202,14 @@ struct EditPhotoView: View {
         let ext = fileURL.pathExtension.isEmpty ? "jpg" : fileURL.pathExtension
         let outURL = FileProcessor.uniqueOutputURL(for: fileURL, newExt: ext, suffix: "_edited")
         if let cgImg = ciContext.createCGImage(output, from: output.extent) {
-            FileProcessor.saveCGImage(cgImg, to: outURL, formatExt: ext, quality: 0.95)
-            FileProcessor.showToast("원본 화질 보정 완료: \(outURL.lastPathComponent)")
+            FileProcessor.saveCGImage(cgImg, to: outURL, formatExt: ext, quality: 0.95, sourceURLForMetadata: fileURL)
+            FileProcessor.showToast("보정 완료 (EXIF 메타데이터 보존됨): \(outURL.lastPathComponent)")
             NSApp.keyWindow?.close()
         }
     }
 }
 
-// MARK: - 9. Redact & 8방향 핸들 Crop 스튜디오
+// MARK: - 9. Redact & 8방향 핸들 Crop 스튜디오 (저장 시 메타데이터 보존)
 enum RedactStyle: String, CaseIterable {
     case pixelate = "픽셀 모자이크"
     case blur = "블러 (흐림)"
@@ -524,8 +524,8 @@ struct RedactCropStudioView: View {
         let ext = fileURL.pathExtension.isEmpty ? "png" : fileURL.pathExtension
         let outURL = FileProcessor.uniqueOutputURL(for: fileURL, newExt: ext, suffix: mode == 1 ? "_cropped" : "_redacted")
         if let outCG = ciContext.createCGImage(ciImage, from: ciImage.extent) {
-            FileProcessor.saveCGImage(outCG, to: outURL, formatExt: ext, quality: 0.96)
-            FileProcessor.showToast("원본 화질 저장 완료: \(outURL.lastPathComponent)")
+            FileProcessor.saveCGImage(outCG, to: outURL, formatExt: ext, quality: 0.96, sourceURLForMetadata: fileURL)
+            FileProcessor.showToast("원본 화질 저장 완료 (메타데이터 유지됨): \(outURL.lastPathComponent)")
             NSApp.keyWindow?.close()
         }
     }
@@ -881,7 +881,7 @@ struct ProMediaStudioView: View {
                     ctrl.seek(to: ctrl.endTime); syncTimecodeFields()
                 }, onStepFrame: { df in
                     ctrl.pause(); let fd = 1.0 / max(1.0, ctrl.fps)
-                    ctrl.endTime = min(ctrl.duration, max(ctrl.startTime + fd, ctrl.endTime + Double(df) * fd))
+                    ctrl.endTime = min(ctrl.duration, max(ctrl.startTime + frameDur(fd), ctrl.endTime + Double(df) * fd))
                     ctrl.seek(to: ctrl.endTime); syncTimecodeFields()
                 })
             }.padding(10).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
@@ -944,6 +944,7 @@ struct ProMediaStudioView: View {
         .onDisappear { ctrl.pause() }
     }
     
+    func frameDur(_ fd: Double) -> Double { fd }
     func syncTimecodeFields() {
         let s = ctrl.splitTimecode(ctrl.startTime); inH = s.h; inM = s.m; inS = s.s; inF = s.f
         let e = ctrl.splitTimecode(ctrl.endTime); outH = e.h; outM = e.m; outS = e.s; outF = e.f
@@ -984,13 +985,14 @@ struct ProMediaStudioView: View {
                 }
             } else if activeChannels.isEmpty { filters.append("volume=0") }
             if trimSilence { filters.append("silenceremove=start_periods=1:start_silence=0.2:start_threshold=-45dB") }
-            var args = ["-y", "-ss", String(format: "%.4f", startSec), "-to", String(format: "%.4f", endSec), "-i", fileURL.path]
-            if ctrl.isVideo { args += ["-c:v", "libx264", "-preset", "fast", "-crf", "20"] }
+            var args = ["-y", "-ss", String(format: "%.4f", startSec), "-to", String(format: "%.4f", endSec), "-i", fileURL.path, "-map_metadata", "0"]
+            if ctrl.isVideo { args += ["-movflags", "use_metadata_tags", "-c:v", "libx264", "-preset", "fast", "-crf", "20"] }
             args += ["-af", filters.joined(separator: ","), outURL.path]
             
             FileProcessor.runFFmpegWithProgress(args: args, totalDuration: clipDur, jobTitle: jobTitle) { ok in
                 if ok && FileManager.default.fileExists(atPath: outURL.path) {
-                    FileProcessor.showToast("편집 완료: \(outURL.lastPathComponent)")
+                    FileProcessor.preserveFileDates(from: fileURL, to: outURL)
+                    FileProcessor.showToast("편집 완료 (메타데이터 유지됨): \(outURL.lastPathComponent)")
                     NSApp.keyWindow?.close()
                 } else {
                     nativeExportFallback(startSec: startSec, duration: clipDur, outURL: outURL, jobTitle: jobTitle)
@@ -1014,6 +1016,7 @@ struct ProMediaStudioView: View {
         exporter.exportAsynchronously {
             DispatchQueue.main.async {
                 timer.invalidate(); JobProgressManager.shared.finishJob(id: jobID)
+                FileProcessor.preserveFileDates(from: fileURL, to: finalURL)
                 FileProcessor.showToast("트림 저장 완료: \(finalURL.lastPathComponent)")
                 NSApp.keyWindow?.close()
             }
@@ -1021,7 +1024,7 @@ struct ProMediaStudioView: View {
     }
 }
 
-// MARK: - 11. 배경 추가 창 / 압축 창 / 메타데이터 창 / 앱 델리게이트
+// MARK: - 11. 배경 추가 창 / 압축 창(메타데이터 보존) / 메타데이터 창 / 앱 델리게이트
 struct AddBGView: View {
     let fileURL: URL
     @State private var selectedPreset = 0
@@ -1069,11 +1072,10 @@ struct AddBGView: View {
             }
         }.frame(width: baseSize, height: baseSize * 0.8)
         let renderer = ImageRenderer(content: renderView)
-        if let nsImg = renderer.nsImage, let tiff = nsImg.tiffRepresentation,
-           let rep = NSBitmapImageRep(data: tiff), let png = rep.representation(using: .png, properties: [:]) {
+        if let cg = renderer.cgImage {
             let out = FileProcessor.uniqueOutputURL(for: fileURL, newExt: "png", suffix: "_bg")
-            try? png.write(to: out)
-            FileProcessor.showToast("배경 합성 저장 완료: \(out.lastPathComponent)")
+            FileProcessor.saveCGImage(cg, to: out, formatExt: "png", quality: 0.98, sourceURLForMetadata: fileURL)
+            FileProcessor.showToast("배경 합성 저장 완료 (메타데이터 유지됨): \(out.lastPathComponent)")
             NSApp.keyWindow?.close()
         }
     }
@@ -1086,7 +1088,7 @@ struct CompressToolView: View {
     @State private var estBytes: Int64 = 0
     var body: some View {
         VStack(spacing: 16) {
-            Text("Compress \(files.count) File(s)").font(.headline)
+            Text("Compress \(files.count) File(s) (메타데이터 보존)").font(.headline)
             HStack(spacing: 18) {
                 VStack(spacing: 4) {
                     Text("원본 크기").font(.caption).foregroundColor(.secondary)
@@ -1107,7 +1109,7 @@ struct CompressToolView: View {
                 HStack {
                     Text("압축 품질 설정: \(Int(quality))%").font(.caption.bold())
                     Spacer()
-                    Text("낮을수록 파일 크기가 더 많이 줄어듭니다").font(.caption2).foregroundColor(.secondary)
+                    Text("EXIF 촬영정보 및 메타데이터는 삭제되지 않고 그대로 보존됩니다").font(.caption2).foregroundColor(.orange)
                 }
                 Slider(value: $quality, in: 10...95).tint(.orange).onChange(of: quality) { recalculateEstimate() }
             }.padding(.horizontal, 8)
@@ -1130,14 +1132,15 @@ struct CompressToolView: View {
             let ext = f.pathExtension.lowercased()
             if ["jpg", "jpeg", "png", "heic", "tiff", "bmp", "webp"].contains(ext), let cg = FileProcessor.loadRawCGImage(from: f) {
                 let out = FileProcessor.uniqueOutputURL(for: f, newExt: "jpg", suffix: "_compressed")
-                FileProcessor.saveCGImage(cg, to: out, formatExt: "jpg", quality: quality / 100.0)
-                FileProcessor.showToast("이미지 압축 완료: \(out.lastPathComponent)")
+                FileProcessor.saveCGImage(cg, to: out, formatExt: "jpg", quality: quality / 100.0, sourceURLForMetadata: f)
+                FileProcessor.showToast("이미지 압축 완료 (메타데이터 유지됨): \(out.lastPathComponent)")
             } else if FileProcessor.ffmpegPath != nil {
                 let out = FileProcessor.uniqueOutputURL(for: f, newExt: ext, suffix: "_compressed")
                 let crf = Int(40.0 - (quality / 100.0) * 20.0)
                 let dur = FileProcessor.mediaDurationSeconds(for: f)
-                FileProcessor.runFFmpegWithProgress(args: ["-y", "-i", f.path, "-vcodec", "libx264", "-crf", "\(crf)", out.path], totalDuration: dur, jobTitle: "압축: \(f.lastPathComponent)") { _ in
-                    FileProcessor.showToast("미디어 압축 완료: \(out.lastPathComponent)")
+                FileProcessor.runFFmpegWithProgress(args: ["-y", "-i", f.path, "-map_metadata", "0", "-movflags", "use_metadata_tags", "-vcodec", "libx264", "-crf", "\(crf)", out.path], totalDuration: dur, jobTitle: "압축: \(f.lastPathComponent)") { _ in
+                    FileProcessor.preserveFileDates(from: f, to: out)
+                    FileProcessor.showToast("미디어 압축 완료 (메타데이터 유지됨): \(out.lastPathComponent)")
                 }
             } else {
                 let out = FileProcessor.uniqueOutputURL(for: f, newExt: "mp4", suffix: "_compressed")
@@ -1163,6 +1166,11 @@ struct MetadataToolView: View {
                 }
             }
             HStack {
+                Button("촬영일자로 이 파일 이름 바꾸기") {
+                    FileProcessor.batchRenameFilesWithCaptureDate(files: [fileURL])
+                    NSApp.keyWindow?.close()
+                }
+                .buttonStyle(.borderedProminent).tint(.orange)
                 Spacer()
                 Button("메타데이터 완전 삭제본 저장") {
                     FileProcessor.stripMetadata(file: fileURL); NSApp.keyWindow?.close()
@@ -1171,13 +1179,14 @@ struct MetadataToolView: View {
         }.padding().onAppear { loadMeta() }
     }
     func loadMeta() {
+        let info = FileProcessor.extractCaptureDateAndCamera(for: fileURL)
+        let df = DateFormatter(); df.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        metaDict["📌 감지된 촬영일시"] = df.string(from: info.date)
+        if !info.camera.isEmpty { metaDict["📷 감지된 카메라"] = info.camera }
+        
         if let src = CGImageSourceCreateWithURL(fileURL as CFURL, nil),
            let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [String: Any] {
             for (k, v) in props { metaDict[k] = "\(v)" }
-        }
-        if metaDict.isEmpty {
-            metaDict["File Path"] = fileURL.path
-            metaDict["Info"] = "표시할 EXIF 정보가 없거나 일반 문서/미디어 파일입니다."
         }
     }
 }
@@ -1213,7 +1222,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "🍊 MyTangerine 3.9 Pro", action: nil, keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "🍊 MyTangerine 4.0 Pro", action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         if jobs.isEmpty {
             menu.addItem(NSMenuItem(title: "대기 중 (현재 진행 중인 변환 작업 없음)", action: nil, keyEquivalent: ""))
@@ -1227,7 +1236,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         menu.addItem(NSMenuItem.separator())
-        let helpItem = NSMenuItem(title: "📖 설명 및 단축키 설정...", action: #selector(openHelpAndSettings), keyEquivalent: ",")
+        let helpItem = NSMenuItem(title: "📖 설명 및 설정 (단축키 / 이름 변환 양식)...", action: #selector(openHelpAndSettings), keyEquivalent: ",")
         helpItem.target = self
         menu.addItem(helpItem)
         menu.addItem(NSMenuItem.separator())
