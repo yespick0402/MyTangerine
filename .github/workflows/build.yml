@@ -17,7 +17,6 @@ jobs:
           mkdir -p MyTangerine.app/Contents/MacOS
           mkdir -p MyTangerine.app/Contents/Resources
 
-          # 외부 라이브러리 의존성이 전혀 없는 순수 ARM64 독립 실행형 FFmpeg 다운로드
           curl -L -s "https://www.osxexperts.net/ffmpeg7arm.zip" -o ffmpeg.zip || true
           unzip -q -o ffmpeg.zip -d MyTangerine.app/Contents/Resources/ || true
 
@@ -44,7 +43,7 @@ jobs:
               <key>CFBundlePackageType</key>
               <string>APPL</string>
               <key>CFBundleShortVersionString</key>
-              <string>2.0</string>
+              <string>3.9</string>
               <key>LSMinimumSystemVersion</key>
               <string>14.0</string>
               <key>LSArchitecturePriority</key>
@@ -59,10 +58,14 @@ jobs:
           </plist>
           EOF
 
-      - name: Compile Pure Native Apple Silicon (arm64) App
+      - name: Combine Parts & Compile Pure Native Apple Silicon (arm64) App
         run: |
-          # x86_64를 완전히 배제하고 순수 arm64 네이티브로만 최적화 컴파일 (macOS 28 완벽 호환)
-          swiftc main.swift -o MyTangerine.app/Contents/MacOS/MyTangerine -target arm64-apple-macos14.0 -Osize
+          if [ -f Part1.swift ] && [ -f Part2.swift ]; then
+            cat Part1.swift Part2.swift > combined_main.swift
+          else
+            cp main.swift combined_main.swift
+          fi
+          swiftc combined_main.swift -o MyTangerine.app/Contents/MacOS/MyTangerine -target arm64-apple-macos14.0 -Osize
           strip -x MyTangerine.app/Contents/MacOS/MyTangerine
           codesign --force --deep --sign - MyTangerine.app
           zip -r -y MyTangerine.zip MyTangerine.app
