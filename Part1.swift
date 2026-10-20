@@ -88,7 +88,6 @@ class ShortcutSettings: ObservableObject {
         return nil
     }
     
-    // 촬영일자 및 파일 정보를 바탕으로 변환된 파일명 생성
     static func formatFileName(pattern: String, originalName: String, captureDate: Date, cameraModel: String, sequenceIndex: Int) -> String {
         let cal = Calendar.current
         let y = cal.component(.year, from: captureDate)
@@ -416,6 +415,19 @@ class FileSizeEstimator {
 
 // MARK: - 4. 파일 처리, 메타데이터 100% 보존 및 촬영일자 이름 일괄변환 엔진
 class FileProcessor {
+    // 번들에 내장된 커스텀 아이콘(icon.png 또는 AppIcon.icns) 로드
+    static func customAppIconImage() -> NSImage? {
+        if let path = Bundle.main.path(forResource: "icon", ofType: "png"),
+           let img = NSImage(contentsOfFile: path) {
+            return img
+        }
+        if let path = Bundle.main.path(forResource: "AppIcon", ofType: "icns"),
+           let img = NSImage(contentsOfFile: path) {
+            return img
+        }
+        return nil
+    }
+    
     static var ffmpegPath: String? {
         let candidates = [
             Bundle.main.path(forResource: "ffmpeg", ofType: nil),
@@ -437,7 +449,6 @@ class FileProcessor {
         return outURL
     }
     
-    // 원본 파일의 생성일/수정일 등 파일 시스템 속성까지 새 파일에 그대로 복사
     static func preserveFileDates(from src: URL, to dst: URL) {
         guard let attrs = try? FileManager.default.attributesOfItem(atPath: src.path) else { return }
         var newAttrs: [FileAttributeKey: Any] = [:]
@@ -448,14 +459,12 @@ class FileProcessor {
         }
     }
     
-    // 사진(EXIF/TIFF), 영상(QuickTime), 일반 파일에서 실제 촬영일자(Capture Date)와 카메라 모델 추출
     static func extractCaptureDateAndCamera(for url: URL) -> (date: Date, camera: String) {
         var cameraModel = ""
-        let exirDateFormatter = DateFormatter()
-        exirDateFormatter.locale = Locale(identifier: "en_US_POSIX")
-        exirDateFormatter.dateFormat = "yyyy:MM:dd HH:mm:ss"
+        let exifDateFormatter = DateFormatter()
+        exifDateFormatter.locale = Locale(identifier: "en_US_POSIX")
+        exifDateFormatter.dateFormat = "yyyy:MM:dd HH:mm:ss"
         
-        // 1) 이미지/RAW 파일의 EXIF 및 TIFF 메타데이터에서 촬영일자 추출
         if let src = CGImageSourceCreateWithURL(url as CFURL, nil),
            let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any] {
             if let tiff = props[kCGImagePropertyTIFFDictionary] as? [CFString: Any],
@@ -464,29 +473,27 @@ class FileProcessor {
             }
             if let exif = props[kCGImagePropertyExifDictionary] as? [CFString: Any] {
                 if let dtOrig = exif[kCGImagePropertyExifDateTimeOriginal] as? String,
-                   let d = exirDateFormatter.date(from: dtOrig) {
+                   let d = exifDateFormatter.date(from: dtOrig) {
                     return (d, cameraModel)
                 }
                 if let dtDig = exif[kCGImagePropertyExifDateTimeDigitized] as? String,
-                   let d = exirDateFormatter.date(from: dtDig) {
+                   let d = exifDateFormatter.date(from: dtDig) {
                     return (d, cameraModel)
                 }
             }
             if let tiff = props[kCGImagePropertyTIFFDictionary] as? [CFString: Any],
                let dtTiff = tiff[kCGImagePropertyTIFFDateTime] as? String,
-               let d = exirDateFormatter.date(from: dtTiff) {
+               let d = exifDateFormatter.date(from: dtTiff) {
                 return (d, cameraModel)
             }
         }
         
-        // 2) Spotlight / MDItem 메타데이터(영상 촬영일 kMDItemContentCreationDate) 확인
         if let mdItem = MDItemCreateWithURL(kCFAllocatorDefault, url as CFURL) {
             if let contentDate = MDItemCopyAttribute(mdItem, kMDItemContentCreationDate) as? Date {
                 return (contentDate, cameraModel)
             }
         }
         
-        // 3) 파일 생성일(Creation Date) 또는 수정일 폴백
         if let attrs = try? FileManager.default.attributesOfItem(atPath: url.path) {
             if let cDate = attrs[.creationDate] as? Date { return (cDate, cameraModel) }
             if let mDate = attrs[.modificationDate] as? Date { return (mDate, cameraModel) }
@@ -494,7 +501,6 @@ class FileProcessor {
         return (Date(), cameraModel)
     }
     
-    // 설정된 패턴(예: {YYYYMMDD}_{hhmmss}_{Originalname})으로 파일 이름 일괄 변경 실행
     static func batchRenameFilesWithCaptureDate(files: [URL]) {
         let pattern = ShortcutSettings.shared.renamePattern
         var renamedCount = 0
@@ -530,7 +536,6 @@ class FileProcessor {
                 renamedCount += 1
                 lastNewName = targetURL.lastPathComponent
                 
-                // 만약 같은 이름의 .xmp 사이드카 파일이 존재하면 함께 이름 변경
                 let xmpSource = fileURL.deletingPathExtension().appendingPathExtension("xmp")
                 if FileManager.default.fileExists(atPath: xmpSource.path) {
                     let xmpTarget = targetURL.deletingPathExtension().appendingPathExtension("xmp")
@@ -555,19 +560,18 @@ class FileProcessor {
         }
     }
     
+    // 동시성 캡처 에러 없이 즉시 미디어 재생 길이(초)를 추출
     static func mediaDurationSeconds(for url: URL) -> Double {
-        var result: Double = 0
-        let sem = DispatchSemaphore(value: 0)
-        let asset = AVURLAsset(url: url)
-        Task {
-            if let dur = try? await asset.load(.duration) {
-                let sec = CMTimeGetSeconds(dur)
-                if sec.isFinite && sec > 0 { result = sec }
-            }
-            sem.signal()
+        if let mdItem = MDItemCreateWithURL(kCFAllocatorDefault, url as CFURL),
+           let sec = MDItemCopyAttribute(mdItem, kMDItemDurationSeconds) as? Double,
+           sec.isFinite && sec > 0 {
+            return sec
         }
-        _ = sem.wait(timeout: .now() + 1.5)
-        return result
+        if let af = try? AVAudioFile(forReading: url) {
+            let sr = af.processingFormat.sampleRate
+            if sr > 0 { return Double(af.length) / sr }
+        }
+        return 15.0
     }
     
     static func runFFmpegWithProgress(args: [String], totalDuration: Double, jobTitle: String, completion: @escaping (Bool) -> Void) {
@@ -700,7 +704,6 @@ class FileProcessor {
             return
         }
         
-        // 이미지 포맷 변환 시 원본 EXIF/GPS/TIFF 메타데이터를 100% 보존하여 변환
         let cgSupportedExts = ["jpg", "jpeg", "png", "heic", "tiff", "bmp"]
         if cgSupportedExts.contains(ext), let cgImg = loadRawCGImage(from: file) {
             let out = uniqueOutputURL(for: file, newExt: ext)
@@ -742,7 +745,6 @@ class FileProcessor {
         let duration = mediaDurationSeconds(for: file)
         let jobTitle = "\(file.lastPathComponent) → \(ext.uppercased())"
         if ffmpegPath != nil {
-            // -map_metadata 0 옵션을 통해 원본 영상/오디오의 촬영일·태그 메타데이터를 그대로 보존
             var args = ["-y", "-i", file.path, "-map_metadata", "0"]
             if ext == "mp4" { args += ["-movflags", "use_metadata_tags", "-c:v", "libx264", "-preset", "fast", "-crf", "22", "-c:a", "aac", "-pix_fmt", "yuv420p", out.path] }
             else if ext == "mov" { args += ["-movflags", "use_metadata_tags", "-c:v", "libx264", "-c:a", "aac", out.path] }
@@ -808,7 +810,6 @@ class FileProcessor {
         }
     }
     
-    // 사용자가 명시적으로 '메타데이터 삭제'를 눌렀을 때만 메타데이터를 제거함
     static func stripMetadata(file: URL) {
         let out = uniqueOutputURL(for: file, newExt: file.pathExtension, suffix: "_clean")
         if let cgImg = loadRawCGImage(from: file) {
@@ -827,7 +828,6 @@ class FileProcessor {
         return CGImageSourceCreateImageAtIndex(src, 0, nil)
     }
     
-    // MARK: 핵심 — CGImageDestination을 사용하여 원본 사진의 EXIF/GPS/TIFF/IPTC 메타데이터를 손실 없이 그대로 복사하여 저장
     @discardableResult
     static func saveCGImage(_ cgImage: CGImage, to url: URL, formatExt: String, quality: Double = 0.95, sourceURLForMetadata: URL? = nil) -> Bool {
         let ext = formatExt.lowercased()
@@ -846,7 +846,6 @@ class FileProcessor {
            let src = CGImageSourceCreateWithURL(srcURL as CFURL, nil),
            let origProps = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any] {
             metadataProps = origProps
-            // 회전 방향은 이미 CGImage 픽셀에 반영되었거나 동일하므로 정상 방향(1)으로 유지 및 해상도 갱신
             metadataProps[kCGImagePropertyPixelWidth] = cgImage.width
             metadataProps[kCGImagePropertyPixelHeight] = cgImage.height
         }
@@ -862,7 +861,6 @@ class FileProcessor {
             }
         }
         
-        // 폴백 저장
         let rep = NSBitmapImageRep(cgImage: cgImage)
         let data: Data?
         if ext == "png" { data = rep.representation(using: .png, properties: [:]) }
@@ -1032,7 +1030,11 @@ class ToolWindowManager {
         if let screen = NSScreen.main { panel.setFrameOrigin(NSPoint(x: screen.frame.midX - 210, y: screen.frame.maxY - 90)) }
         panel.contentView = NSHostingView(rootView:
             HStack(spacing: 10) {
-                Image(systemName: "checkmark.circle.fill").foregroundColor(.orange).font(.title2)
+                if let customIcon = FileProcessor.customAppIconImage() {
+                    Image(nsImage: customIcon).resizable().scaledToFit().frame(width: 24, height: 24)
+                } else {
+                    Image(systemName: "checkmark.circle.fill").foregroundColor(.orange).font(.title2)
+                }
                 Text(message).font(.system(size: 13, weight: .semibold)).foregroundColor(.primary)
             }
             .padding(.horizontal, 18).padding(.vertical, 12).background(.regularMaterial, in: Capsule()).shadow(radius: 10)
@@ -1081,7 +1083,14 @@ struct HelpAndSettingsView: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 14) {
-                Image(systemName: "circle.hexagongrid.fill").font(.system(size: 36)).foregroundColor(.orange)
+                if let customIcon = FileProcessor.customAppIconImage() {
+                    Image(nsImage: customIcon)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: 44, height: 44)
+                } else {
+                    Image(systemName: "circle.hexagongrid.fill").font(.system(size: 36)).foregroundColor(.orange)
+                }
                 VStack(alignment: .leading, spacing: 2) {
                     Text("MyTangerine 4.0 Pro").font(.system(size: 20, weight: .heavy, design: .rounded))
                     Text("메타데이터 보존 변환 · 촬영일자 이름 일괄변환 · 전문가 미디어 스튜디오").font(.caption).foregroundColor(.secondary)
@@ -1122,7 +1131,6 @@ struct HelpAndSettingsView: View {
         }.onDisappear { stopRecording() }
     }
     
-    // MARK: 탭 2 — 촬영일자 기반 파일명 일괄변환 양식 설정 탭
     var renamePatternTab: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
@@ -1132,7 +1140,6 @@ struct HelpAndSettingsView: View {
                         .font(.caption).foregroundColor(.secondary)
                 }
                 
-                // 양식 입력 텍스트박스 및 실시간 미리보기 카드
                 VStack(alignment: .leading, spacing: 12) {
                     Text("파일명 변환 양식 입력").font(.subheadline.bold())
                     HStack(spacing: 10) {
@@ -1148,7 +1155,6 @@ struct HelpAndSettingsView: View {
                         }
                     }
                     
-                    // 실시간 변환 예시 미리보기
                     let previewResult = ShortcutSettings.formatFileName(
                         pattern: settings.renamePattern,
                         originalName: "_DSC3015",
@@ -1171,7 +1177,6 @@ struct HelpAndSettingsView: View {
                 .padding(16)
                 .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
                 
-                // 사용 가능한 코드(토큰) 안내 표
                 VStack(alignment: .leading, spacing: 10) {
                     Text("📌 텍스트박스에 넣을 수 있는 치환 코드 안내 (클릭하면 양식 끝에 추가됩니다)")
                         .font(.subheadline.bold()).foregroundColor(.orange)
