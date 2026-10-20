@@ -10,7 +10,7 @@ import UniformTypeIdentifiers
 import AudioToolbox
 
 // MARK: - 0. 사용자 단축키 설정 매니저 (UserDefaults 영구 저장)
-enumDragModifierPreset: String, CaseIterable, Identifiable {
+enum DragModifierPreset: String, CaseIterable, Identifiable {
     case shift = "shift"
     case control = "control"
     case option = "option"
@@ -79,13 +79,13 @@ enum CycleKeyPreset: String, CaseIterable, Identifiable {
 class ShortcutSettings: ObservableObject {
     static let shared = ShortcutSettings()
     
-    @Published var convertModifier: enumDragModifierPreset {
+    @Published var convertModifier: DragModifierPreset {
         didSet { UserDefaults.standard.set(convertModifier.rawValue, forKey: "shortcut_convert") }
     }
-    @Published var toolsModifier: enumDragModifierPreset {
+    @Published var toolsModifier: DragModifierPreset {
         didSet { UserDefaults.standard.set(toolsModifier.rawValue, forKey: "shortcut_tools") }
     }
-    @Published var actionsModifier: enumDragModifierPreset {
+    @Published var actionsModifier: DragModifierPreset {
         didSet { UserDefaults.standard.set(actionsModifier.rawValue, forKey: "shortcut_actions") }
     }
     @Published var cycleKey: CycleKeyPreset {
@@ -93,14 +93,14 @@ class ShortcutSettings: ObservableObject {
     }
     
     init() {
-        let convRaw = UserDefaults.standard.string(forKey: "shortcut_convert") ?? enumDragModifierPreset.shift.rawValue
-        let toolRaw = UserDefaults.standard.string(forKey: "shortcut_tools") ?? enumDragModifierPreset.optionShift.rawValue
-        let actRaw = UserDefaults.standard.string(forKey: "shortcut_actions") ?? enumDragModifierPreset.control.rawValue
+        let convRaw = UserDefaults.standard.string(forKey: "shortcut_convert") ?? DragModifierPreset.shift.rawValue
+        let toolRaw = UserDefaults.standard.string(forKey: "shortcut_tools") ?? DragModifierPreset.optionShift.rawValue
+        let actRaw = UserDefaults.standard.string(forKey: "shortcut_actions") ?? DragModifierPreset.control.rawValue
         let cycRaw = UserDefaults.standard.string(forKey: "shortcut_cycle") ?? CycleKeyPreset.spaceAndTab.rawValue
         
-        self.convertModifier = enumDragModifierPreset(rawValue: convRaw) ?? .shift
-        self.toolsModifier = enumDragModifierPreset(rawValue: toolRaw) ?? .optionShift
-        self.actionsModifier = enumDragModifierPreset(rawValue: actRaw) ?? .control
+        self.convertModifier = DragModifierPreset(rawValue: convRaw) ?? .shift
+        self.toolsModifier = DragModifierPreset(rawValue: toolRaw) ?? .optionShift
+        self.actionsModifier = DragModifierPreset(rawValue: actRaw) ?? .control
         self.cycleKey = CycleKeyPreset(rawValue: cycRaw) ?? .spaceAndTab
     }
     
@@ -111,7 +111,6 @@ class ShortcutSettings: ObservableObject {
         cycleKey = .spaceAndTab
     }
     
-    // 현재 눌린 보조키(ModifierFlags)가 어떤 휠 모드에 해당하는지 판별 (복합키 우선 매칭)
     func matchWheelMode(for flags: NSEvent.ModifierFlags) -> WheelMode? {
         let cleanFlags = flags.intersection([.shift, .control, .option, .command])
         guard !cleanFlags.isEmpty else { return nil }
@@ -121,11 +120,9 @@ class ShortcutSettings: ObservableObject {
             (.actions, actionsModifier.requiredFlags),
             (.convert, convertModifier.requiredFlags)
         ]
-        // 정확히 일치하는 조합을 최우선으로 찾음
         for (mode, req) in candidates {
             if cleanFlags == req { return mode }
         }
-        // 복합키(2개 이상) 포함 여부 확인 후 단일키 확인
         let sorted = candidates.sorted { $0.1.rawValue.nonzeroBitCount > $1.1.rawValue.nonzeroBitCount }
         for (mode, req) in sorted {
             if cleanFlags.isSuperset(of: req) { return mode }
@@ -138,7 +135,7 @@ class ShortcutSettings: ObservableObject {
 struct ActiveJob: Identifiable {
     let id: UUID
     let title: String
-    var progress: Double // 0.0 ~ 1.0
+    var progress: Double
 }
 
 class JobProgressManager: ObservableObject {
@@ -328,7 +325,7 @@ class AppState: ObservableObject {
     }
 }
 
-// MARK: - 3. 변환 및 압축 파일 예상 크기 계산 엔진 (FileSizeEstimator)
+// MARK: - 3. 변환 및 압축 파일 예상 크기 계산 엔진
 class FileSizeEstimator {
     static func estimateConversionBytes(files: [URL], originalTotalBytes: Int64, targetExt: String) -> Int64 {
         guard let first = files.first, originalTotalBytes > 0 else { return 0 }
@@ -347,9 +344,7 @@ class FileSizeEstimator {
             }
             if totalDuration > 0 {
                 switch tgt {
-                case "mp3":
-                    return max(4096, Int64(totalDuration * 24_000))
-                case "m4a", "aac", "caf", "ogg":
+                case "mp3", "m4a", "aac", "caf", "ogg":
                     return max(4096, Int64(totalDuration * 24_000))
                 case "wav", "aiff":
                     return max(8192, Int64(totalDuration * 176_400))
@@ -367,17 +362,9 @@ class FileSizeEstimator {
         }
         
         let weights: [String: Double] = [
-            "bmp": 3.2,
-            "tiff": 2.4,
-            "png": 1.0,
-            "pdf": 0.95,
-            "jpg": 0.36,
-            "jpeg": 0.36,
-            "heic": 0.22,
-            "webp": 0.25,
-            "icns": 0.45,
-            "zip": 0.72,
-            "targz": 0.68
+            "bmp": 3.2, "tiff": 2.4, "png": 1.0, "pdf": 0.95,
+            "jpg": 0.36, "jpeg": 0.36, "heic": 0.22, "webp": 0.25,
+            "icns": 0.45, "zip": 0.72, "targz": 0.68
         ]
         
         let srcW = weights[srcExt] ?? 1.0
@@ -1069,14 +1056,13 @@ class ToolWindowManager {
     }
 }
 
-// MARK: - 7-B. 사용법 안내 및 단축키 커스터마이징 창 (HelpAndSettingsView)
+// MARK: - 7-B. 사용법 안내 및 단축키 커스터마이징 창
 struct HelpAndSettingsView: View {
     @ObservedObject var settings = ShortcutSettings.shared
     @State private var selectedTab: Int = 0
     
     var body: some View {
         VStack(spacing: 0) {
-            // 상단 헤더
             HStack(spacing: 14) {
                 Image(systemName: "circle.hexagongrid.fill")
                     .font(.system(size: 36))
@@ -1109,7 +1095,6 @@ struct HelpAndSettingsView: View {
             
             Divider()
             
-            // 하단 닫기 바
             HStack {
                 Text("💡 변경한 단축키는 저장 버튼 없이 즉시 반영되며 앱을 껐다 켜도 유지됩니다.")
                     .font(.caption)
@@ -1130,7 +1115,6 @@ struct HelpAndSettingsView: View {
         }
     }
     
-    // 탭 1: 단축키 커스터마이징
     var shortcutSettingsTab: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
@@ -1202,7 +1186,6 @@ struct HelpAndSettingsView: View {
                 
                 Divider().padding(.vertical, 4)
                 
-                // 현재 설정된 단축키 요약 카드
                 VStack(alignment: .leading, spacing: 8) {
                     Text("✅ 현재 내 단축키 요약")
                         .font(.subheadline.bold())
@@ -1219,7 +1202,7 @@ struct HelpAndSettingsView: View {
         }
     }
     
-    func shortcutRow(title: String, subtitle: String, selection: Binding<enumDragModifierPreset>) -> some View {
+    func shortcutRow(title: String, subtitle: String, selection: Binding<DragModifierPreset>) -> some View {
         HStack {
             VStack(alignment: .leading, spacing: 3) {
                 Text(title).font(.system(size: 14, weight: .bold))
@@ -1227,7 +1210,7 @@ struct HelpAndSettingsView: View {
             }
             Spacer()
             Picker("", selection: selection) {
-                ForEach(enumDragModifierPreset.allCases) { preset in
+                ForEach(DragModifierPreset.allCases) { preset in
                     Text(preset.displayName).tag(preset)
                 }
             }
@@ -1249,7 +1232,6 @@ struct HelpAndSettingsView: View {
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
     }
     
-    // 탭 2: 상세 사용 설명서
     var usageGuideTab: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
@@ -1310,7 +1292,7 @@ struct HelpAndSettingsView: View {
     }
 }
 
-// MARK: - 8. 전문가 사진 보정 창 (정중앙 배치 + 마우스 휠 확대/축소 + 드래그 이동)
+// MARK: - 8. 전문가 사진 보정 창
 struct EditPhotoView: View {
     let fileURL: URL
     
@@ -1490,7 +1472,7 @@ struct EditPhotoView: View {
                     Image(systemName: "arrow.counterclockwise").font(.caption2)
                 }.buttonStyle(.plain)
             }
-            Slider(value: val, in: range).tint(.orange).onChange(of: val.wrappedValue) { _ in updatePreview() }
+            Slider(value: val, in: range).tint(.orange).onChange(of: val.wrappedValue) { updatePreview() }
         }
     }
     
@@ -2800,7 +2782,7 @@ struct AddBGView: View {
     }
 }
 
-// MARK: - 12. 압축 도구 창 (실시간 예상 저장 용량 & 절감률 % 안내 포함)
+// MARK: - 12. 압축 도구 창
 struct CompressToolView: View {
     let files: [URL]
     @State private var quality: Double = 65.0
@@ -2853,7 +2835,7 @@ struct CompressToolView: View {
                 }
                 Slider(value: $quality, in: 10...95)
                     .tint(.orange)
-                    .onChange(of: quality) { _ in recalculateEstimate() }
+                    .onChange(of: quality) { recalculateEstimate() }
             }
             .padding(.horizontal, 8)
             
@@ -3134,7 +3116,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         
-        // 사용자가 설정한 커스텀 단축키와 현재 눌린 보조키를 대조
         guard let matchedMode = ShortcutSettings.shared.matchWheelMode(for: NSEvent.modifierFlags) else {
             if AppState.shared.isDragging { hideWheel() }
             return
