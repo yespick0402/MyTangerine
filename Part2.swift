@@ -1023,7 +1023,7 @@ struct ProMediaStudioView: View {
     }
 }
 
-// MARK: - 11. 배경 추가 창 / 압축 창 / 메타데이터 창 / 앱 델리게이트
+// MARK: - 11. 배경 추가 창 / 압축 창 / 메타데이터 창
 struct AddBGView: View {
     let fileURL: URL
     @State private var selectedPreset = 0
@@ -1190,6 +1190,46 @@ struct MetadataToolView: View {
     }
 }
 
+// MARK: - 12. 파인더의 드래그&드롭을 직접 흡수하여 Option+드래그 시 파일이 복제되는 현상을 100% 차단하는 컨테이너 뷰
+class WheelDropAbsorberView: NSView {
+    var onUpdateHover: ((NSPoint) -> Void)?
+    var onPerformDrop: (() -> Void)?
+    
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        registerForDraggedTypes([.fileURL, NSPasteboard.PasteboardType("NSFilenamesPboardType")])
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        if let win = self.window {
+            let screenPt = win.convertPoint(toScreen: sender.draggingLocation)
+            onUpdateHover?(screenPt)
+        }
+        // .copy가 아닌 .generic을 반환하여 파인더가 절대 자체 파일 복제를 수행하지 않도록 함
+        return .generic
+    }
+    
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+        if let win = self.window {
+            let screenPt = win.convertPoint(toScreen: sender.draggingLocation)
+            onUpdateHover?(screenPt)
+        }
+        return .generic
+    }
+    
+    override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        return true
+    }
+    
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        // 휠 위에서 마우스를 놓으면 MyTangerine이 드롭을 삼키고(true), 파인더에는 파일이 생성되지 않음!
+        onPerformDrop?()
+        return true
+    }
+}
+
+// MARK: - 13. 앱 델리게이트 & 투명 아이콘 각인 & 드롭 인터셉터
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var wheelPanel: NSPanel!
@@ -1201,9 +1241,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
-        if let customIcon = FileProcessor.customAppIconImage() {
-            NSApp.applicationIconImage = customIcon
-        }
+        applyPureTransparentCustomIconToAppBundle()
+        
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         updateStatusBarMenu()
         JobProgressManager.shared.onUpdate = { [weak self] in self?.updateStatusBarMenu() }
@@ -1211,6 +1250,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         startGlobalMonitors()
         setupCGEventTapForOptionCancelFix()
     }
+    
+    // MARK: 핵심 1 — macOS가 회색 네모 박스(Squircle)를 씌우지 못하도록 투명 PNG 아이콘을 앱 번들에 직접 각인
+    func applyPureTransparentCustomIconToAppBundle() {
+        guard let rawIcon = FileProcessor.customAppIconImage() else { return }
+        NSApp.applicationIconImage = rawIcon
+        let bundlePath = Bundle.main.bundlePath
+        DispatchQueue.global(qos: .utility).async {
+            NSWorkspace.shared.setIcon(rawIcon, forFile: bundlePath, options: [])
+        }
+    }
+    
     func updateStatusBarMenu() {
         let jobs = JobProgressManager.shared.jobs
         if let btn = statusItem.button {
@@ -1231,7 +1281,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "🍊 MyTangerine 4.0 Pro", action: nil, keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "🍊 MyTangerine 4.1 Pro", action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         if jobs.isEmpty {
             menu.addItem(NSMenuItem(title: "대기 중 (현재 진행 중인 변환 작업 없음)", action: nil, keyEquivalent: ""))
@@ -1255,15 +1305,37 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func openHelpAndSettings() { ToolWindowManager.shared.showHelpAndSettingsWindow() }
     @objc func quitApp() { NSApp.terminate(nil) }
     
+    // MARK: 핵심 2 — 휠 패널이 마우스 드롭을 직접 흡수(ignoresMouseEvents = false)하여 뒤쪽 파인더에 파일이 복제되지 않게 함
     func setupWheelPanel() {
-        wheelPanel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 356, height: 356), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
-        wheelPanel.isOpaque = false; wheelPanel.backgroundColor = .clear; wheelPanel.level = .screenSaver
+        let size = NSRect(x: 0, y: 0, width: 356, height: 356)
+        wheelPanel = NSPanel(contentRect: size, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        wheelPanel.isOpaque = false
+        wheelPanel.backgroundColor = .clear
+        wheelPanel.level = .screenSaver
         wheelPanel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        wheelPanel.ignoresMouseEvents = true
-        wheelPanel.contentView = NSHostingView(rootView: RadialWheelView())
+        wheelPanel.ignoresMouseEvents = false
+        
+        let absorber = WheelDropAbsorberView(frame: size)
+        absorber.onUpdateHover = { [weak self] screenPt in
+            self?.updateHoveredSlice(mouseLocation: screenPt)
+        }
+        absorber.onPerformDrop = { [weak self] in
+            self?.handleMouseUp()
+        }
+        
+        let hostView = NSHostingView(rootView: RadialWheelView())
+        hostView.frame = size
+        hostView.autoresizingMask = [.width, .height]
+        absorber.addSubview(hostView)
+        wheelPanel.contentView = absorber
     }
+    
+    // MARK: 핵심 3 — 드래그 중 Option 키 신호(flagsChanged)까지 가로채서 파인더가 '복제 모드(+)'로 들어가는 것을 원천 차단
     func setupCGEventTapForOptionCancelFix() {
-        let mask = (1 << CGEventType.leftMouseUp.rawValue) | (1 << CGEventType.leftMouseDragged.rawValue)
+        let mask = (1 << CGEventType.leftMouseUp.rawValue) |
+                   (1 << CGEventType.leftMouseDragged.rawValue) |
+                   (1 << CGEventType.flagsChanged.rawValue)
+        
         let callback: CGEventTapCallBack = { proxy, type, event, refcon in
             guard let refcon = refcon else { return Unmanaged.passUnretained(event) }
             let mySelf = Unmanaged<AppDelegate>.fromOpaque(refcon).takeUnretainedValue()
@@ -1271,17 +1343,32 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 if let tap = mySelf.eventTap { CGEvent.tapEnable(tap: tap, enable: true) }
                 return Unmanaged.passUnretained(event)
             }
-            if AppState.shared.isDragging {
-                if type == .leftMouseDragged || type == .leftMouseUp {
+            
+            let mousePressed = (NSEvent.pressedMouseButtons & 1) != 0
+            if mousePressed {
+                let rawFlags = NSEvent.ModifierFlags(rawValue: UInt(event.flags.rawValue))
+                if let matched = ShortcutSettings.shared.matchWheelMode(for: rawFlags) {
+                    DispatchQueue.main.async {
+                        mySelf.activateOrSwitchWheelFromTap(mode: matched, mouseLocation: NSEvent.mouseLocation)
+                    }
+                    // 파인더가 Option 키를 보고 파일 복제(+)를 켜지 못하도록 이벤트에서 Option/Shift/Control 플래그 제거!
                     event.flags.remove([.maskAlternate, .maskShift, .maskControl, .maskCommand])
+                } else if AppState.shared.isDragging && type == .flagsChanged {
+                    DispatchQueue.main.async {
+                        mySelf.hideWheel()
+                    }
                 }
+            }
+            
+            if AppState.shared.isDragging {
+                event.flags.remove([.maskAlternate, .maskShift, .maskControl, .maskCommand])
                 if type == .leftMouseUp {
-                    mySelf.sendEscapeToCancelFinderDrag()
                     DispatchQueue.main.async { mySelf.handleMouseUp() }
                 }
             }
             return Unmanaged.passUnretained(event)
         }
+        
         let selfPtr = Unmanaged.passUnretained(self).toOpaque()
         if let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap, eventsOfInterest: CGEventMask(mask), callback: callback, userInfo: selfPtr) {
             self.eventTap = tap
@@ -1290,35 +1377,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             CGEvent.tapEnable(tap: tap, enable: true)
         }
     }
-    func sendEscapeToCancelFinderDrag() {
-        let src = CGEventSource(stateID: .hidSystemState)
-        if let escDown = CGEvent(keyboardEventSource: src, virtualKey: 53, keyDown: true),
-           let escUp = CGEvent(keyboardEventSource: src, virtualKey: 53, keyDown: false) {
-            escDown.flags = []; escUp.flags = []
-            escDown.post(tap: .cghidEventTap); escUp.post(tap: .cghidEventTap)
-        }
-    }
-    func startGlobalMonitors() {
-        dragCountAtMouseDown = NSPasteboard(name: .drag).changeCount
-        NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown]) { [weak self] _ in
-            guard let self = self else { return }
-            self.dragCountAtMouseDown = NSPasteboard(name: .drag).changeCount
-            self.isCurrentMouseStrokeValidFileDrag = false
-        }
-        NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDragged, .flagsChanged]) { [weak self] event in
-            self?.handleDragOrFlags(event: event)
-        }
-        NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseUp]) { [weak self] _ in
-            guard let self = self else { return }
-            if AppState.shared.isDragging { self.handleMouseUp() }
-        }
-    }
-    func handleDragOrFlags(event: NSEvent) {
-        let mousePressed = (NSEvent.pressedMouseButtons & 1) != 0
-        guard mousePressed else { if AppState.shared.isDragging { hideWheel() }; return }
-        guard let matchedMode = ShortcutSettings.shared.matchWheelMode(for: NSEvent.modifierFlags) else {
-            if AppState.shared.isDragging { hideWheel() }; return
-        }
+    
+    func activateOrSwitchWheelFromTap(mode: WheelMode, mouseLocation: NSPoint) {
         let dragPboard = NSPasteboard(name: .drag)
         let currentChangeCount = dragPboard.changeCount
         if !isCurrentMouseStrokeValidFileDrag {
@@ -1334,15 +1394,43 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if !AppState.shared.isDragging {
             guard isCurrentMouseStrokeValidFileDrag, !AppState.shared.draggedFiles.isEmpty else { return }
-            AppState.shared.wheelMode = matchedMode
+            AppState.shared.wheelMode = mode
             AppState.shared.updateItems()
-            showWheel(at: NSEvent.mouseLocation)
-        } else if event.type == .flagsChanged && AppState.shared.wheelMode != matchedMode {
-            AppState.shared.wheelMode = matchedMode
+            showWheel(at: mouseLocation)
+        } else if AppState.shared.wheelMode != mode {
+            AppState.shared.wheelMode = mode
             AppState.shared.updateItems()
         }
-        updateHoveredSlice(mouseLocation: NSEvent.mouseLocation)
+        updateHoveredSlice(mouseLocation: mouseLocation)
     }
+    
+    func startGlobalMonitors() {
+        dragCountAtMouseDown = NSPasteboard(name: .drag).changeCount
+        NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown]) { [weak self] _ in
+            guard let self = self else { return }
+            self.dragCountAtMouseDown = NSPasteboard(name: .drag).changeCount
+            self.isCurrentMouseStrokeValidFileDrag = false
+        }
+        NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDragged, .flagsChanged]) { [weak self] event in
+            self?.handleDragOrFlags(event: event)
+        }
+        NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseUp]) { [weak self] _ in
+            guard let self = self else { return }
+            if AppState.shared.isDragging { self.handleMouseUp() }
+        }
+    }
+    
+    func handleDragOrFlags(event: NSEvent) {
+        let mousePressed = (NSEvent.pressedMouseButtons & 1) != 0
+        guard mousePressed else { if AppState.shared.isDragging { hideWheel() }; return }
+        if AppState.shared.isDragging {
+            updateHoveredSlice(mouseLocation: NSEvent.mouseLocation)
+            return
+        }
+        guard let matchedMode = ShortcutSettings.shared.matchWheelMode(for: NSEvent.modifierFlags) else { return }
+        activateOrSwitchWheelFromTap(mode: matchedMode, mouseLocation: NSEvent.mouseLocation)
+    }
+    
     func readValidDraggedFiles(from pboard: NSPasteboard) -> [URL] {
         guard let types = pboard.types,
               types.contains(.fileURL) || types.contains(NSPasteboard.PasteboardType("NSFilenamesPboardType")) else { return [] }
