@@ -82,6 +82,15 @@ class AppState: ObservableObject {
         draggedFiles.first?.pathExtension.lowercased() ?? ""
     }
     
+    func cycleMode() {
+        switch wheelMode {
+        case .convert: wheelMode = .tools
+        case .tools: wheelMode = .actions
+        case .actions: wheelMode = .convert
+        }
+        updateItems()
+    }
+    
     func updateItems() {
         let ext = firstFileExtension
         let imageExts = ["png", "jpg", "jpeg", "heic", "webp", "tiff", "bmp", "gif", "avif"]
@@ -130,7 +139,6 @@ class AppState: ObservableObject {
                 ]
             }
             
-            // 변환 모드일 때 각 포맷의 예상 용량 계산
             let files = draggedFiles
             let origTotal = totalBytes
             for i in 0..<baseItems.count {
@@ -140,7 +148,6 @@ class AppState: ObservableObject {
             }
             items = baseItems
             
-            // 이미지 파일인 경우 백그라운드에서 실제 인코딩 샘플링으로 더 정밀한 용량 업데이트
             if imageExts.contains(ext) {
                 DispatchQueue.global(qos: .userInteractive).async {
                     var updated = baseItems
@@ -198,7 +205,6 @@ class AppState: ObservableObject {
 
 // MARK: - 3. 변환 및 압축 파일 예상 크기 계산 엔진 (FileSizeEstimator)
 class FileSizeEstimator {
-    // 1) 즉시 반환용 휴리스틱 + 미디어 길이 기반 예상 크기 계산
     static func estimateConversionBytes(files: [URL], originalTotalBytes: Int64, targetExt: String) -> Int64 {
         guard let first = files.first, originalTotalBytes > 0 else { return 0 }
         let srcExt = first.pathExtension.lowercased()
@@ -206,7 +212,6 @@ class FileSizeEstimator {
         
         if srcExt == tgt { return originalTotalBytes }
         
-        // 비디오/오디오 파일인 경우 재생 시간(초) * 목표 비트레이트로 정밀 추정
         let videoExts = ["mp4", "mov", "mkv", "avi", "webm", "m4v"]
         let audioExts = ["mp3", "m4a", "wav", "flac", "ogg", "aac", "aiff", "caf"]
         
@@ -218,22 +223,16 @@ class FileSizeEstimator {
             if totalDuration > 0 {
                 switch tgt {
                 case "mp3":
-                    // ~192 kbps = 24 KB/s
                     return max(4096, Int64(totalDuration * 24_000))
                 case "m4a", "aac", "caf", "ogg":
-                    // ~192 kbps = 24 KB/s
                     return max(4096, Int64(totalDuration * 24_000))
                 case "wav", "aiff":
-                    // 44.1kHz 16-bit Stereo PCM = ~176.4 KB/s
                     return max(8192, Int64(totalDuration * 176_400))
                 case "flac":
-                    // 무손실 압축 (WAV 대비 약 55%)
                     return max(8192, Int64(totalDuration * 96_000))
                 case "gif":
-                    // 640p 12fps GIF 평균 ~380 KB/s
                     return max(10_240, Int64(totalDuration * 380_000))
                 case "mp4", "mov", "mkv":
-                    // H.264 CRF 22 변환 시 원본 코덱에 따른 비율 추정
                     let ratio: Double = (srcExt == "mov") ? 0.68 : 0.88
                     return max(16_384, Int64(Double(originalTotalBytes) * ratio))
                 default:
@@ -242,7 +241,6 @@ class FileSizeEstimator {
             }
         }
         
-        // 이미지 및 압축 아카이브의 포맷별 상대 용량 가중치 계산
         let weights: [String: Double] = [
             "bmp": 3.2,
             "tiff": 2.4,
@@ -263,7 +261,6 @@ class FileSizeEstimator {
         return max(1024, Int64(estimated))
     }
     
-    // 2) 이미지 파일의 경우 실제 첫 번째 이미지를 메모리에서 변환하여 정확한 바이트 크기 산출
     static func exactImageConversionBytes(files: [URL], originalTotalBytes: Int64, targetExt: String) -> Int64 {
         guard let first = files.first,
               let attrs = try? FileManager.default.attributesOfItem(atPath: first.path),
@@ -286,7 +283,6 @@ class FileSizeEstimator {
         case "bmp":
             sampleDataSize = Int64(rep.representation(using: .bmp, properties: [:])?.count ?? 0)
         case "heic", "webp":
-            // HEIC/WEBP는 JPEG 85% 대비 평균 약 62% 크기
             if let jpgCount = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.85])?.count {
                 sampleDataSize = Int64(Double(jpgCount) * 0.62)
             }
@@ -305,7 +301,6 @@ class FileSizeEstimator {
         return estimateConversionBytes(files: files, originalTotalBytes: originalTotalBytes, targetExt: targetExt)
     }
     
-    // 3) 압축(Compress) 도구에서 품질(Quality 10~95%)에 따른 예상 저장 크기 계산
     static func estimateCompressedBytes(files: [URL], quality: Double) -> (original: Int64, estimated: Int64) {
         var origTotal: Int64 = 0
         var estTotal: Int64 = 0
@@ -316,7 +311,6 @@ class FileSizeEstimator {
             let ext = f.pathExtension.lowercased()
             
             if ["jpg", "jpeg", "png", "heic", "tiff", "bmp", "webp"].contains(ext) {
-                // 첫 번째 이미지는 실제 JPEG 메모리 압축으로 정확한 바이트 측정
                 if index == 0, let cg = FileProcessor.loadRawCGImage(from: f) {
                     let rep = NSBitmapImageRep(cgImage: cg)
                     if let data = rep.representation(using: .jpeg, properties: [.compressionFactor: quality / 100.0]) {
@@ -327,9 +321,7 @@ class FileSizeEstimator {
                 let ratio = pow(quality / 100.0, 1.35) * (ext == "png" || ext == "tiff" || ext == "bmp" ? 0.45 : 0.85)
                 estTotal += max(1024, Int64(Double(fSize) * ratio))
             } else {
-                // 비디오/오디오 CRF 압축 시 예상 용량 (CRF = 40 - (quality/100)*20)
                 let crf = 40.0 - (quality / 100.0) * 20.0
-                // CRF가 6 증가할 때마다 비트레이트 약 절반 감소 (기준 CRF 23)
                 let ratio = min(0.95, max(0.08, pow(2.0, (23.0 - crf) / 6.0) * 0.78))
                 estTotal += max(4096, Int64(Double(fSize) * ratio))
             }
@@ -852,8 +844,8 @@ struct RadialWheelView: View {
                     .font(.system(size: 10, weight: .heavy, design: .monospaced))
                     .foregroundColor(.orange)
             } else {
-                Text("\(state.draggedFiles.count)개 파일")
-                    .font(.system(size: 10))
+                Text("Space/Tab: 모드 전환")
+                    .font(.system(size: 8.5, weight: .medium))
                     .foregroundColor(.secondary)
             }
         }
@@ -2444,7 +2436,6 @@ struct CompressToolView: View {
         VStack(spacing: 16) {
             Text("Compress \(files.count) File(s)").font(.headline)
             
-            // 원본 용량 vs 예상 저장 용량 비교 카드
             HStack(spacing: 18) {
                 VStack(spacing: 4) {
                     Text("원본 크기").font(.caption).foregroundColor(.secondary)
@@ -2584,16 +2575,16 @@ struct MetadataToolView: View {
     }
 }
 
-// MARK: - 14. 앱 델리게이트 & 실제 파일 드래그 세션 정밀 판별기 (빈 화면 드래그 오작동 완벽 차단)
+// MARK: - 14. 앱 델리게이트 & Finder Option-드래그 복제 방지 인터셉터 (CGEventTap)
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var wheelPanel: NSPanel!
     var wheelCenterPoint: NSPoint = .zero
     
-    // 마우스 클릭 시점의 드래그 보드 카운트를 추적하여 실제 파일 드래그만 통과시킴
     var dragCountAtMouseDown: Int = -1
     var activeSessionDragCount: Int = -1
     var isCurrentMouseStrokeValidFileDrag: Bool = false
+    var eventTap: CFMachPort?
     
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -2607,6 +2598,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         
         setupWheelPanel()
         startGlobalMonitors()
+        setupCGEventTapForOptionCancelFix()
     }
     
     func updateStatusBarMenu() {
@@ -2623,7 +2615,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "🍊 MyTangerine 3.5 Pro", action: nil, keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "🍊 MyTangerine 3.6 Pro", action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         
         if jobs.isEmpty {
@@ -2640,7 +2632,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         
         menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "Shift+드래그: 변환 | Option+Shift+드래그: 도구 | Control+드래그: 액션", action: nil, keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Shift+드래그: 변환 | Shift+Option(또는 Space/Tab): 도구 | Control: 액션", action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "종료 (Quit)", action: #selector(quitApp), keyEquivalent: "q"))
         statusItem.menu = menu
@@ -2665,25 +2657,99 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         wheelPanel.contentView = NSHostingView(rootView: RadialWheelView())
     }
     
+    // MARK: 핵심 해결 — MyTangerine 휠이 떠 있을 때 마우스를 놓으면 Option 플래그를 제거하고 ESC를 보내 Finder의 파일 복제를 원천 차단
+    func setupCGEventTapForOptionCancelFix() {
+        let mask = (1 << CGEventType.leftMouseUp.rawValue) |
+                   (1 << CGEventType.leftMouseDragged.rawValue) |
+                   (1 << CGEventType.keyDown.rawValue)
+        
+        let callback: CGEventTapCallBack = { proxy, type, event, refcon in
+            guard let refcon = refcon else { return Unmanaged.passUnretained(event) }
+            let mySelf = Unmanaged<AppDelegate>.fromOpaque(refcon).takeUnretainedValue()
+            
+            if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                if let tap = mySelf.eventTap { CGEvent.tapEnable(tap: tap, enable: true) }
+                return Unmanaged.passUnretained(event)
+            }
+            
+            // 휠이 활성화된 상태일 때:
+            if AppState.shared.isDragging {
+                // 1) Space(49) 또는 Tab(48) 키를 누르면 Option 키 없이도 모드를 즉시 전환 (CONVERT -> TOOLS -> ACTIONS)
+                if type == .keyDown {
+                    let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
+                    if keyCode == 49 || keyCode == 48 {
+                        DispatchQueue.main.async {
+                            AppState.shared.cycleMode()
+                        }
+                        return nil // Finder로 키 입력이 넘어가지 않게 흡수
+                    }
+                }
+                
+                // 2) 드래그 중이거나 마우스 버튼을 놓는 순간(leftMouseUp):
+                //    Finder가 Option 키를 보고 '파일 복제(+)'를 실행하지 못하도록 이벤트에서 Option/Shift/Control 플래그를 제거!
+                if type == .leftMouseDragged || type == .leftMouseUp {
+                    event.flags.remove([.maskAlternate, .maskShift, .maskControl])
+                }
+                
+                // 3) 마우스를 놓는 순간: 먼저 Finder의 드래그 세션을 ESC(KeyCode 53)로 안전하게 취소시킨 뒤 MyTangerine 동작 처리
+                if type == .leftMouseUp {
+                    mySelf.sendEscapeToCancelFinderDrag()
+                    DispatchQueue.main.async {
+                        mySelf.handleMouseUp()
+                    }
+                }
+            }
+            return Unmanaged.passUnretained(event)
+        }
+        
+        let selfPtr = Unmanaged.passUnretained(self).toOpaque()
+        if let tap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .headInsertEventTap,
+            options: .defaultTap,
+            eventsOfInterest: CGEventMask(mask),
+            callback: callback,
+            userInfo: selfPtr
+        ) {
+            self.eventTap = tap
+            let runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+            CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, .commonModes)
+            CGEvent.tapEnable(tap: tap, enable: true)
+        }
+    }
+    
+    // Finder에게 ESC 키 이벤트를 전송하여 마우스를 놓기 직전 파일 이동/복제 드래그를 즉시 무효화
+    func sendEscapeToCancelFinderDrag() {
+        let src = CGEventSource(stateID: .hidSystemState)
+        if let escDown = CGEvent(keyboardEventSource: src, virtualKey: 53, keyDown: true),
+           let escUp = CGEvent(keyboardEventSource: src, virtualKey: 53, keyDown: false) {
+            escDown.flags = []
+            escUp.flags = []
+            escDown.post(tap: .cghidEventTap)
+            escUp.post(tap: .cghidEventTap)
+        }
+    }
+    
     func startGlobalMonitors() {
         let dragPboard = NSPasteboard(name: .drag)
         dragCountAtMouseDown = dragPboard.changeCount
         
-        // 1. 마우스 버튼을 누르는 순간의 드래그 보드 번호를 기록 (이전 잔여 데이터와 구분)
         NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown]) { [weak self] _ in
             guard let self = self else { return }
             self.dragCountAtMouseDown = NSPasteboard(name: .drag).changeCount
             self.isCurrentMouseStrokeValidFileDrag = false
         }
         
-        // 2. 드래그 이동 및 보조키(Shift/Option/Control) 감지
         NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDragged, .flagsChanged]) { [weak self] event in
             self?.handleDragOrFlags(event: event)
         }
         
-        // 3. 마우스 버튼을 뗄 때 처리
+        // 만약 CGEventTap 권한이 아직 없을 때를 대비한 폴백 모니터
         NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseUp]) { [weak self] _ in
-            self?.handleMouseUp()
+            guard let self = self else { return }
+            if AppState.shared.isDragging {
+                self.handleMouseUp()
+            }
         }
     }
     
@@ -2701,12 +2767,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         
-        // 현재 마우스 스트로크에서 실제로 '새로운 파일 드래그 세션'이 발생했는지 검증
         let dragPboard = NSPasteboard(name: .drag)
         let currentChangeCount = dragPboard.changeCount
         
         if !isCurrentMouseStrokeValidFileDrag {
-            // 마우스를 누른 이후 NSPasteboard.Name.drag의 changeCount가 증가했을 때만 실제 드래그로 인정!
             guard currentChangeCount != dragCountAtMouseDown,
                   currentChangeCount != activeSessionDragCount else {
                 return
@@ -2722,14 +2786,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             AppState.shared.totalSizeText = ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
         }
         
-        let newMode: WheelMode = controlPressed ? .actions : (optionPressed && shiftPressed ? .tools : .convert)
+        let newMode: WheelMode = controlPressed ? .actions : (optionPressed && shiftPressed ? .tools : AppState.shared.wheelMode)
         
         if !AppState.shared.isDragging {
             guard isCurrentMouseStrokeValidFileDrag, !AppState.shared.draggedFiles.isEmpty else { return }
-            AppState.shared.wheelMode = newMode
+            AppState.shared.wheelMode = controlPressed ? .actions : (optionPressed && shiftPressed ? .tools : .convert)
             AppState.shared.updateItems()
             showWheel(at: NSEvent.mouseLocation)
-        } else if AppState.shared.wheelMode != newMode {
+        } else if (optionPressed && shiftPressed && AppState.shared.wheelMode != .tools) ||
+                  (controlPressed && AppState.shared.wheelMode != .actions) ||
+                  (!optionPressed && !controlPressed && shiftPressed && event.type == .flagsChanged && AppState.shared.wheelMode != .convert) {
             AppState.shared.wheelMode = newMode
             AppState.shared.updateItems()
         }
@@ -2737,7 +2803,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         updateHoveredSlice(mouseLocation: NSEvent.mouseLocation)
     }
     
-    // 드래그 보드에서 실제 디스크에 존재하는 로컬 파일 URL만 엄격하게 필터링
     func readValidDraggedFiles(from pboard: NSPasteboard) -> [URL] {
         guard let types = pboard.types,
               types.contains(.fileURL) || types.contains(NSPasteboard.PasteboardType("NSFilenamesPboardType")) else {
