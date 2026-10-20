@@ -9,26 +9,33 @@ import Vision
 import UniformTypeIdentifiers
 import AudioToolbox
 
-// MARK: - 0. 직접 키보드를 눌러 설정하는 단축키 매니저 (오리지널 Tangerine 기본값)
+// MARK: - 0. 직접 키보드를 눌러 설정하는 3종 단축키 매니저 (오리지널 Tangerine 기본값)
 class ShortcutSettings: ObservableObject {
     static let shared = ShortcutSettings()
     
-    // NSEvent.ModifierFlags.rawValue (UInt) 저장 (기본값: Convert = Shift, Tools = Option + Shift)
+    // 기본값: Convert = Shift, Tools = Option + Shift, Actions = Control
     @Published var convertFlagsRaw: UInt {
-        didSet { UserDefaults.standard.set(Int(convertFlagsRaw), forKey: "tangerine_sc_convert_v38") }
+        didSet { UserDefaults.standard.set(Int(convertFlagsRaw), forKey: "tangerine_sc_convert_v39") }
     }
     @Published var toolsFlagsRaw: UInt {
-        didSet { UserDefaults.standard.set(Int(toolsFlagsRaw), forKey: "tangerine_sc_tools_v38") }
+        didSet { UserDefaults.standard.set(Int(toolsFlagsRaw), forKey: "tangerine_sc_tools_v39") }
+    }
+    @Published var actionsFlagsRaw: UInt {
+        didSet { UserDefaults.standard.set(Int(actionsFlagsRaw), forKey: "tangerine_sc_actions_v39") }
     }
     
     static let defaultConvertRaw: UInt = NSEvent.ModifierFlags.shift.rawValue
     static let defaultToolsRaw: UInt = NSEvent.ModifierFlags([.option, .shift]).rawValue
+    static let defaultActionsRaw: UInt = NSEvent.ModifierFlags.control.rawValue
     
     init() {
-        let savedConv = UserDefaults.standard.integer(forKey: "tangerine_sc_convert_v38")
-        let savedTools = UserDefaults.standard.integer(forKey: "tangerine_sc_tools_v38")
+        let savedConv = UserDefaults.standard.integer(forKey: "tangerine_sc_convert_v39")
+        let savedTools = UserDefaults.standard.integer(forKey: "tangerine_sc_tools_v39")
+        let savedActions = UserDefaults.standard.integer(forKey: "tangerine_sc_actions_v39")
+        
         self.convertFlagsRaw = (savedConv != 0) ? UInt(savedConv) : Self.defaultConvertRaw
         self.toolsFlagsRaw = (savedTools != 0) ? UInt(savedTools) : Self.defaultToolsRaw
+        self.actionsFlagsRaw = (savedActions != 0) ? UInt(savedActions) : Self.defaultActionsRaw
     }
     
     var convertFlags: NSEvent.ModifierFlags {
@@ -39,9 +46,14 @@ class ShortcutSettings: ObservableObject {
         NSEvent.ModifierFlags(rawValue: toolsFlagsRaw).intersection([.shift, .option, .control, .command])
     }
     
+    var actionsFlags: NSEvent.ModifierFlags {
+        NSEvent.ModifierFlags(rawValue: actionsFlagsRaw).intersection([.shift, .option, .control, .command])
+    }
+    
     func resetToTangerineDefaults() {
         convertFlagsRaw = Self.defaultConvertRaw
         toolsFlagsRaw = Self.defaultToolsRaw
+        actionsFlagsRaw = Self.defaultActionsRaw
     }
     
     static func formatFlags(_ flags: NSEvent.ModifierFlags) -> String {
@@ -59,13 +71,18 @@ class ShortcutSettings: ObservableObject {
         guard !clean.isEmpty else { return nil }
         
         let tFlags = toolsFlags
+        let aFlags = actionsFlags
         let cFlags = convertFlags
         
+        // 1) 정확히 일치하는 조합 최우선 판정
         if clean == tFlags { return .tools }
+        if clean == aFlags { return .actions }
         if clean == cFlags { return .convert }
         
+        // 2) 복합키(2개 이상 조합)가 단일키보다 먼저 매칭되도록 비트 수 기준 정렬
         let candidates: [(WheelMode, NSEvent.ModifierFlags)] = [
             (.tools, tFlags),
+            (.actions, aFlags),
             (.convert, cFlags)
         ].sorted { $0.1.rawValue.nonzeroBitCount > $1.1.rawValue.nonzeroBitCount }
         
@@ -120,10 +137,11 @@ class JobProgressManager: ObservableObject {
     }
 }
 
-// MARK: - 2. 글로벌 상태 및 휠 메뉴 모델
+// MARK: - 2. 글로벌 상태 및 3종 휠 메뉴 모델 (CONVERT / TOOLS / ACTIONS)
 enum WheelMode: String {
     case convert = "CONVERT"
     case tools = "TOOLS"
+    case actions = "ACTIONS"
 }
 
 struct WheelItem: Identifiable {
@@ -246,9 +264,18 @@ class AppState: ObservableObject {
                     WheelItem(title: "ZIP 압축", icon: "doc.zipper", actionKey: "conv_zip"),
                     WheelItem(title: "PDF 병합", icon: "doc.on.doc.fill", actionKey: "tool_merge_pdf"),
                     WheelItem(title: "용량 압축", icon: "arrow.down.right.and.arrow.up.left", actionKey: "tool_compress"),
-                    WheelItem(title: "경로 복사", icon: "doc.on.clipboard", actionKey: "act_copy_path")
+                    WheelItem(title: "메타데이터 삭제", icon: "tag.slash", actionKey: "tool_strip_meta")
                 ]
             }
+            
+        case .actions:
+            items = [
+                WheelItem(title: "경로 복사", icon: "doc.on.clipboard", actionKey: "act_copy_path"),
+                WheelItem(title: "터미널 열기", icon: "terminal", actionKey: "act_terminal"),
+                WheelItem(title: "AirDrop", icon: "airplayaudio", actionKey: "act_airdrop"),
+                WheelItem(title: "Finder 표시", icon: "folder", actionKey: "act_finder"),
+                WheelItem(title: "사본 만들기", icon: "plus.square.on.square", actionKey: "act_duplicate")
+            ]
         }
     }
 }
@@ -508,11 +535,36 @@ class FileProcessor {
             mergeToPDF(files: files)
             return
         }
+        
+        // ACTIONS (Control 휠 액션 처리)
         if actionKey == "act_copy_path" {
             let paths = files.map { $0.path }.joined(separator: "\n")
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(paths, forType: .string)
             showToast("파일 경로가 클립보드에 복사되었습니다.")
+            return
+        }
+        if actionKey == "act_terminal", let first = files.first {
+            let folder = first.hasDirectoryPath ? first.path : first.deletingLastPathComponent().path
+            runShell("/usr/bin/open", args: ["-a", "Terminal", folder]) { _ in }
+            return
+        }
+        if actionKey == "act_finder" {
+            NSWorkspace.shared.activateFileViewerSelecting(files)
+            return
+        }
+        if actionKey == "act_airdrop" {
+            if let service = NSSharingService(named: .sendViaAirDrop) {
+                service.perform(withItems: files)
+            }
+            return
+        }
+        if actionKey == "act_duplicate" {
+            for f in files {
+                let out = uniqueOutputURL(for: f, newExt: f.pathExtension, suffix: "_copy")
+                try? FileManager.default.copyItem(at: f, to: out)
+            }
+            showToast("사본 생성 완료!")
             return
         }
         
@@ -930,8 +982,8 @@ class ToolWindowManager {
         openWindow(
             title: "🍊 MyTangerine — 설명 및 단축키 설정",
             view: HelpAndSettingsView(),
-            size: NSSize(width: 760, height: 600),
-            minSize: NSSize(width: 680, height: 520)
+            size: NSSize(width: 780, height: 660),
+            minSize: NSSize(width: 700, height: 560)
         )
     }
     
@@ -960,7 +1012,7 @@ class ToolWindowManager {
     }
 }
 
-// MARK: - 7-B. 직접 키보드를 눌러 입력하고 [완료]를 누르는 단축키 설정 & 사용 설명서 창
+// MARK: - 7-B. 3종 휠(CONVERT / TOOLS / ACTIONS) 키보드 직접 입력 단축키 설정 & 사용 설명서 창
 struct HelpAndSettingsView: View {
     @ObservedObject var settings = ShortcutSettings.shared
     @State private var selectedTab: Int = 0
@@ -976,9 +1028,9 @@ struct HelpAndSettingsView: View {
                     .font(.system(size: 36))
                     .foregroundColor(.orange)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("MyTangerine 3.8 Pro")
+                    Text("MyTangerine 3.9 Pro")
                         .font(.system(size: 20, weight: .heavy, design: .rounded))
-                    Text("파인더에서 파일을 드래그하며 단축키를 눌러 즉시 변환·편집하는 맥 유틸리티")
+                    Text("파인더에서 파일을 드래그하며 단축키를 눌러 즉시 변환·편집·액션을 실행하는 맥 유틸리티")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
@@ -1004,14 +1056,14 @@ struct HelpAndSettingsView: View {
             Divider()
             
             HStack {
-                Text("💡 오리지널 Tangerine 기본값: 변환 = ⇧ Shift  |  도구 = ⌥⇧ Option + Shift")
+                Text("💡 Tangerine 기본값: 변환 = ⇧ Shift  |  도구 = ⌥⇧ Option + Shift  |  액션 = ⌃ Control")
                     .font(.caption)
                     .foregroundColor(.secondary)
                 Spacer()
                 Button("Tangerine 기본 단축키로 복원") {
                     stopRecording()
                     settings.resetToTangerineDefaults()
-                    FileProcessor.showToast("Tangerine 기본 단축키(Shift / Option+Shift)로 복원되었습니다.")
+                    FileProcessor.showToast("Tangerine 기본 단축키(Shift / Option+Shift / Control)로 복원되었습니다.")
                 }
                 Button("닫기") {
                     stopRecording()
@@ -1030,17 +1082,17 @@ struct HelpAndSettingsView: View {
     
     var shortcutRecorderTab: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 20) {
+            VStack(alignment: .leading, spacing: 16) {
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("단축키 직접 입력 설정")
+                    Text("3가지 원형 휠 단축키 직접 입력 설정")
                         .font(.headline)
                         .foregroundColor(.orange)
-                    Text("바꾸고 싶은 기능의 [단축키 입력하기] 버튼을 누른 뒤, 키보드에서 원하는 조합(예: Shift, Option+Shift, Control+Shift 등)을 누르고 마우스로 [완료] 버튼을 클릭하면 적용됩니다.")
+                    Text("바꾸고 싶은 기능의 [단축키 입력하기] 버튼을 누른 뒤, 키보드에서 원하는 조합(예: Shift, Option+Shift, Control 등)을 누르고 마우스로 [완료] 버튼을 클릭하면 적용됩니다.")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
                 
-                VStack(spacing: 16) {
+                VStack(spacing: 14) {
                     recorderCard(
                         targetID: "convert",
                         title: "🔄 포맷 변환 휠 (CONVERT)",
@@ -1062,12 +1114,25 @@ struct HelpAndSettingsView: View {
                             FileProcessor.showToast("도구(TOOLS) 단축키가 저장되었습니다.")
                         }
                     )
+                    
+                    recorderCard(
+                        targetID: "actions",
+                        title: "⚡ 빠른 액션 휠 (ACTIONS)",
+                        subtitle: "파일을 드래그하면서 이 키를 누르면 경로 복사, 터미널 열기, AirDrop 전송, Finder 표시, 사본 만들기 휠이 열립니다.",
+                        currentFlags: settings.actionsFlags,
+                        onSave: { newFlags in
+                            settings.actionsFlagsRaw = newFlags.rawValue
+                            FileProcessor.showToast("빠른 액션(ACTIONS) 단축키가 저장되었습니다.")
+                        }
+                    )
                 }
                 
-                if settings.convertFlags == settings.toolsFlags {
+                if settings.convertFlags == settings.toolsFlags ||
+                   settings.convertFlags == settings.actionsFlags ||
+                   settings.toolsFlags == settings.actionsFlags {
                     HStack(spacing: 8) {
                         Image(systemName: "exclamationmark.triangle.fill").foregroundColor(.yellow)
-                        Text("변환 휠과 도구 휠의 단축키가 똑같습니다. 서로 다른 키 조합으로 설정해 주세요.")
+                        Text("서로 다른 두 휠의 단축키가 똑같습니다. 3가지 휠이 각각 구분되도록 서로 다른 키 조합을 입력해 주세요.")
                             .font(.caption.bold())
                             .foregroundColor(.orange)
                     }
@@ -1075,7 +1140,7 @@ struct HelpAndSettingsView: View {
                     .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
                 }
             }
-            .padding(24)
+            .padding(22)
         }
     }
     
@@ -1089,13 +1154,10 @@ struct HelpAndSettingsView: View {
     ) -> some View {
         let isRecordingThis = (recordingTarget == targetID)
         
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(alignment: .top) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(title).font(.system(size: 15, weight: .bold))
-                    Text(subtitle).font(.caption).foregroundColor(.secondary)
-                }
-                Spacer()
+        VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title).font(.system(size: 15, weight: .bold))
+                Text(subtitle).font(.caption).foregroundColor(.secondary)
             }
             
             HStack(spacing: 12) {
@@ -1115,7 +1177,7 @@ struct HelpAndSettingsView: View {
                     Spacer()
                 }
                 .padding(.horizontal, 14)
-                .padding(.vertical, 10)
+                .padding(.vertical, 9)
                 .background(Color.black.opacity(isRecordingThis ? 0.28 : 0.14), in: RoundedRectangle(cornerRadius: 8))
                 .overlay(
                     RoundedRectangle(cornerRadius: 8)
@@ -1145,7 +1207,7 @@ struct HelpAndSettingsView: View {
                 }
             }
         }
-        .padding(16)
+        .padding(14)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
     }
     
@@ -1177,12 +1239,12 @@ struct HelpAndSettingsView: View {
             VStack(alignment: .leading, spacing: 16) {
                 guideCard(
                     icon: "hand.draw.fill",
-                    title: "1. 기본 작동법 (오리지널 Tangerine 방식)",
+                    title: "1. 3가지 원형 휠 작동법 (Tangerine 방식)",
                     items: [
                         "Finder나 바탕화면에서 변환·편집할 파일을 마우스로 잡고 드래그를 시작합니다.",
-                        "드래그 중 Shift 키를 누르면 변환(CONVERT) 휠이 나타나며, 각 포맷 조각에 예상 파일 크기가 함께 표시됩니다.",
-                        "드래그 중 Option + Shift 키를 누르면 해당 파일 종류에 맞는 전용 편집 도구(TOOLS) 휠이 나타납니다.",
-                        "원하는 조각 위에 마우스를 놓으면 작업이 실행되며, 아무것도 선택하지 않고 취소해도 파일이 복제되지 않습니다."
+                        "🔄 Shift + 드래그 (CONVERT): 각 포맷 조각에 예상 파일 크기(~1.2 MB)가 표시되며, 드롭 즉시 원본 옆에 변환 저장됩니다.",
+                        "🛠️ Option + Shift + 드래그 (TOOLS): 해당 파일 종류에 맞는 전용 편집 도구(Edit, Crop, Redact, Add BG, Trim, Compress 등)가 열립니다.",
+                        "⚡ Control + 드래그 (ACTIONS): 파일 경로 복사, 해당 폴더에서 터미널 열기, AirDrop 공유, 사본 생성 등 빠른 액션이 실행됩니다."
                     ]
                 )
                 
@@ -2624,608 +2686,4 @@ struct ProMediaStudioView: View {
             }
             .textFieldStyle(.roundedBorder)
             .font(.system(size: 11, weight: .semibold, design: .monospaced))
-            .onSubmit { onApply() }
-            
-            Button("-1F") { onStepFrame(-1) }.font(.caption2)
-            Button("+1F") { onStepFrame(1) }.font(.caption2)
-        }
-    }
-    
-    func exportEditedMedia() {
-        ctrl.pause()
-        let startSec = min(ctrl.startTime, ctrl.endTime)
-        let endSec = max(ctrl.startTime, ctrl.endTime)
-        let clipDur = max(0.1, endSec - startSec)
-        let outURL = FileProcessor.uniqueOutputURL(for: fileURL, newExt: fileURL.pathExtension, suffix: "_trimmed")
-        let jobTitle = "트림 편집: \(fileURL.lastPathComponent)"
-        
-        var activeChannels: [Int] = []
-        for idx in 0..<ctrl.channelCount {
-            if ctrl.isChannelActive(idx) { activeChannels.append(idx) }
-        }
-        
-        if FileProcessor.ffmpegPath != nil {
-            var filters: [String] = ["volume=\(volumePercent / 100.0)"]
-            
-            if activeChannels.count > 0 && activeChannels.count < ctrl.channelCount {
-                if activeChannels.count == 1 {
-                    let ch = activeChannels[0]
-                    filters.append("pan=mono|c0=c\(ch)")
-                } else {
-                    let exprs = activeChannels.enumerated().map { "c\($0.offset)=c\($0.element)" }.joined(separator: "|")
-                    filters.append("pan=\(activeChannels.count)c|\(exprs)")
-                }
-            } else if activeChannels.isEmpty {
-                filters.append("volume=0")
-            }
-            
-            if trimSilence {
-                filters.append("silenceremove=start_periods=1:start_silence=0.2:start_threshold=-45dB")
-            }
-            
-            var args = ["-y", "-ss", String(format: "%.4f", startSec), "-to", String(format: "%.4f", endSec), "-i", fileURL.path]
-            if ctrl.isVideo {
-                args += ["-c:v", "libx264", "-preset", "fast", "-crf", "20"]
-            }
-            args += ["-af", filters.joined(separator: ","), outURL.path]
-            
-            FileProcessor.runFFmpegWithProgress(args: args, totalDuration: clipDur, jobTitle: jobTitle) { ok in
-                if ok && FileManager.default.fileExists(atPath: outURL.path) {
-                    FileProcessor.showToast("편집 완료: \(outURL.lastPathComponent)")
-                    NSApp.keyWindow?.close()
-                } else {
-                    nativeExportFallback(startSec: startSec, duration: clipDur, outURL: outURL, jobTitle: jobTitle)
-                }
-            }
-        } else {
-            nativeExportFallback(startSec: startSec, duration: clipDur, outURL: outURL, jobTitle: jobTitle)
-        }
-    }
-    
-    func nativeExportFallback(startSec: Double, duration: Double, outURL: URL, jobTitle: String) {
-        let asset = AVURLAsset(url: fileURL)
-        let preset = ctrl.isVideo ? AVAssetExportPresetHighestQuality : AVAssetExportPresetAppleM4A
-        guard let exporter = AVAssetExportSession(asset: asset, presetName: preset) else { return }
-        
-        let finalURL = ctrl.isVideo ? outURL : FileProcessor.uniqueOutputURL(for: fileURL, newExt: "m4a", suffix: "_trimmed")
-        exporter.outputURL = finalURL
-        exporter.outputFileType = ctrl.isVideo ? .mp4 : .m4a
-        exporter.timeRange = CMTimeRange(
-            start: CMTime(seconds: startSec, preferredTimescale: 6000),
-            duration: CMTime(seconds: duration, preferredTimescale: 6000)
-        )
-        
-        let jobID = JobProgressManager.shared.startJob(title: jobTitle)
-        let timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
-            JobProgressManager.shared.updateJob(id: jobID, progress: Double(exporter.progress))
-        }
-        
-        exporter.exportAsynchronously {
-            DispatchQueue.main.async {
-                timer.invalidate()
-                JobProgressManager.shared.finishJob(id: jobID)
-                FileProcessor.showToast("트림 저장 완료: \(finalURL.lastPathComponent)")
-                NSApp.keyWindow?.close()
-            }
-        }
-    }
-}
-
-// MARK: - 11. 배경 추가 창 (Add BG)
-struct AddBGView: View {
-    let fileURL: URL
-    @State private var selectedPreset = 0
-    @State private var paddingRatio: CGFloat = 0.12
-    
-    let gradients: [[Color]] = [
-        [Color.cyan, Color.blue],
-        [Color.orange, Color.pink, Color.purple],
-        [Color.mint, Color.teal],
-        [Color(white: 0.95), Color(white: 0.82)],
-        [Color.pink, Color.orange],
-        [Color.indigo, Color.black],
-        [Color.green, Color.blue]
-    ]
-    
-    var body: some View {
-        VStack(spacing: 16) {
-            ZStack {
-                LinearGradient(colors: gradients[selectedPreset], startPoint: .topLeading, endPoint: .bottomTrailing)
-                    .cornerRadius(16)
-                if let img = NSImage(contentsOf: fileURL) {
-                    Image(nsImage: img)
-                        .resizable()
-                        .scaledToFit()
-                        .cornerRadius(10)
-                        .shadow(color: .black.opacity(0.32), radius: 18, x: 0, y: 10)
-                        .padding(450 * paddingRatio)
-                }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            
-            HStack(spacing: 12) {
-                Text("배경 스타일").font(.caption.bold())
-                ForEach(0..<gradients.count, id: \.self) { idx in
-                    RoundedRectangle(cornerRadius: 6)
-                        .fill(LinearGradient(colors: gradients[idx], startPoint: .topLeading, endPoint: .bottomTrailing))
-                        .frame(width: 38, height: 30)
-                        .overlay(RoundedRectangle(cornerRadius: 6).stroke(selectedPreset == idx ? Color.orange : Color.white, lineWidth: 2.5))
-                        .onTapGesture { selectedPreset = idx }
-                }
-            }
-            
-            HStack(spacing: 16) {
-                Text("여백 비율").font(.caption)
-                Slider(value: $paddingRatio, in: 0.04...0.28).tint(.orange).frame(width: 220)
-                Spacer()
-                Button("고화질 배경 합성 저장") { saveImageWithBG() }
-                    .buttonStyle(.borderedProminent)
-                    .tint(.orange)
-            }
-        }
-        .padding(20)
-    }
-    
-    @MainActor
-    func saveImageWithBG() {
-        let baseSize: CGFloat = 1800
-        let renderView = ZStack {
-            LinearGradient(colors: gradients[selectedPreset], startPoint: .topLeading, endPoint: .bottomTrailing)
-            if let img = NSImage(contentsOf: fileURL) {
-                Image(nsImage: img)
-                    .resizable()
-                    .scaledToFit()
-                    .cornerRadius(20)
-                    .shadow(color: .black.opacity(0.35), radius: 30, x: 0, y: 16)
-                    .padding(baseSize * paddingRatio)
-            }
-        }.frame(width: baseSize, height: baseSize * 0.8)
-        
-        let renderer = ImageRenderer(content: renderView)
-        if let nsImg = renderer.nsImage,
-           let tiff = nsImg.tiffRepresentation,
-           let rep = NSBitmapImageRep(data: tiff),
-           let png = rep.representation(using: .png, properties: [:]) {
-            let out = FileProcessor.uniqueOutputURL(for: fileURL, newExt: "png", suffix: "_bg")
-            try? png.write(to: out)
-            FileProcessor.showToast("배경 합성 저장 완료: \(out.lastPathComponent)")
-            NSApp.keyWindow?.close()
-        }
-    }
-}
-
-// MARK: - 12. 압축 도구 창
-struct CompressToolView: View {
-    let files: [URL]
-    @State private var quality: Double = 65.0
-    @State private var origBytes: Int64 = 0
-    @State private var estBytes: Int64 = 0
-    
-    var body: some View {
-        VStack(spacing: 16) {
-            Text("Compress \(files.count) File(s)").font(.headline)
-            
-            HStack(spacing: 18) {
-                VStack(spacing: 4) {
-                    Text("원본 크기").font(.caption).foregroundColor(.secondary)
-                    Text(ByteCountFormatter.string(fromByteCount: origBytes, countStyle: .file))
-                        .font(.system(size: 16, weight: .bold, design: .rounded))
-                }
-                
-                Image(systemName: "arrow.right.circle.fill")
-                    .font(.title2)
-                    .foregroundColor(.orange)
-                
-                VStack(spacing: 4) {
-                    Text("예상 저장 크기").font(.caption).foregroundColor(.orange)
-                    Text("~" + ByteCountFormatter.string(fromByteCount: estBytes, countStyle: .file))
-                        .font(.system(size: 18, weight: .heavy, design: .rounded))
-                        .foregroundColor(.orange)
-                }
-                
-                if origBytes > 0 {
-                    let savedRatio = max(0, Int(((1.0 - Double(estBytes) / Double(origBytes)) * 100.0).rounded()))
-                    Text("-\(savedRatio)% 절감")
-                        .font(.system(size: 12, weight: .bold, design: .rounded))
-                        .foregroundColor(.white)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 5)
-                        .background(Color.green, in: Capsule())
-                }
-            }
-            .padding(14)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
-            
-            VStack(spacing: 6) {
-                HStack {
-                    Text("압축 품질 설정: \(Int(quality))%")
-                        .font(.caption.bold())
-                    Spacer()
-                    Text("낮을수록 파일 크기가 더 많이 줄어듭니다")
-                        .font(.caption2)
-                        .foregroundColor(.secondary)
-                }
-                Slider(value: $quality, in: 10...95)
-                    .tint(.orange)
-                    .onChange(of: quality) { recalculateEstimate() }
-            }
-            .padding(.horizontal, 8)
-            
-            HStack {
-                Button("취소") { NSApp.keyWindow?.close() }
-                Spacer()
-                Button("압축 실행 및 저장") {
-                    runCompression()
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.orange)
-            }
-            .padding(.horizontal, 8)
-        }
-        .padding(22)
-        .onAppear { recalculateEstimate() }
-    }
-    
-    func recalculateEstimate() {
-        let q = quality
-        let targetFiles = files
-        DispatchQueue.global(qos: .userInteractive).async {
-            let res = FileSizeEstimator.estimateCompressedBytes(files: targetFiles, quality: q)
-            DispatchQueue.main.async {
-                self.origBytes = res.original
-                self.estBytes = res.estimated
-            }
-        }
-    }
-    
-    func runCompression() {
-        for f in files {
-            let ext = f.pathExtension.lowercased()
-            if ["jpg", "jpeg", "png", "heic", "tiff", "bmp", "webp"].contains(ext),
-               let cg = FileProcessor.loadRawCGImage(from: f) {
-                let out = FileProcessor.uniqueOutputURL(for: f, newExt: "jpg", suffix: "_compressed")
-                FileProcessor.saveCGImage(cg, to: out, formatExt: "jpg", quality: quality / 100.0)
-                FileProcessor.showToast("이미지 압축 완료: \(out.lastPathComponent)")
-            } else if FileProcessor.ffmpegPath != nil {
-                let out = FileProcessor.uniqueOutputURL(for: f, newExt: ext, suffix: "_compressed")
-                let crf = Int(40.0 - (quality / 100.0) * 20.0)
-                let dur = FileProcessor.mediaDurationSeconds(for: f)
-                FileProcessor.runFFmpegWithProgress(args: ["-y", "-i", f.path, "-vcodec", "libx264", "-crf", "\(crf)", out.path], totalDuration: dur, jobTitle: "압축: \(f.lastPathComponent)") { _ in
-                    FileProcessor.showToast("미디어 압축 완료: \(out.lastPathComponent)")
-                }
-            } else {
-                let out = FileProcessor.uniqueOutputURL(for: f, newExt: "mp4", suffix: "_compressed")
-                FileProcessor.avAssetConvertWithProgress(file: f, to: "mp4", outURL: out, jobTitle: "압축: \(f.lastPathComponent)")
-            }
-        }
-        NSApp.keyWindow?.close()
-    }
-}
-
-// MARK: - 13. 메타데이터 확인 및 삭제 창
-struct MetadataToolView: View {
-    let fileURL: URL
-    @State private var metaDict: [String: String] = [:]
-    
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text(fileURL.lastPathComponent).font(.headline)
-            List {
-                ForEach(metaDict.keys.sorted(), id: \.self) { k in
-                    HStack {
-                        Text(k).font(.caption.bold()).frame(width: 140, alignment: .leading)
-                        Text(metaDict[k] ?? "").font(.caption).foregroundColor(.secondary)
-                    }
-                }
-            }
-            HStack {
-                Spacer()
-                Button("메타데이터 완전 삭제본 저장") {
-                    FileProcessor.stripMetadata(file: fileURL)
-                    NSApp.keyWindow?.close()
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.red)
-            }
-        }
-        .padding()
-        .onAppear { loadMeta() }
-    }
-    
-    func loadMeta() {
-        if let src = CGImageSourceCreateWithURL(fileURL as CFURL, nil),
-           let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [String: Any] {
-            for (k, v) in props { metaDict[k] = "\(v)" }
-        }
-        if metaDict.isEmpty {
-            metaDict["File Path"] = fileURL.path
-            metaDict["Info"] = "표시할 EXIF 정보가 없거나 일반 문서/미디어 파일입니다."
-        }
-    }
-}
-
-// MARK: - 14. 앱 델리게이트 & 메뉴바 설정 연동
-class AppDelegate: NSObject, NSApplicationDelegate {
-    var statusItem: NSStatusItem!
-    var wheelPanel: NSPanel!
-    var wheelCenterPoint: NSPoint = .zero
-    
-    var dragCountAtMouseDown: Int = -1
-    var activeSessionDragCount: Int = -1
-    var isCurrentMouseStrokeValidFileDrag: Bool = false
-    var eventTap: CFMachPort?
-    
-    func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.setActivationPolicy(.accessory)
-        
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        updateStatusBarMenu()
-        
-        JobProgressManager.shared.onUpdate = { [weak self] in
-            self?.updateStatusBarMenu()
-        }
-        
-        setupWheelPanel()
-        startGlobalMonitors()
-        setupCGEventTapForOptionCancelFix()
-    }
-    
-    func updateStatusBarMenu() {
-        let jobs = JobProgressManager.shared.jobs
-        if let btn = statusItem.button {
-            if let overall = JobProgressManager.shared.overallProgress {
-                let pct = Int((overall * 100.0).rounded())
-                btn.image = NSImage(systemSymbolName: "gearshape.arrow.triangle.2.circlepath", accessibilityDescription: "Processing")
-                btn.title = " \(pct)%"
-            } else {
-                btn.image = NSImage(systemSymbolName: "circle.hexagongrid.fill", accessibilityDescription: "MyTangerine")
-                btn.title = ""
-            }
-        }
-        
-        let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "🍊 MyTangerine 3.8 Pro", action: nil, keyEquivalent: ""))
-        menu.addItem(NSMenuItem.separator())
-        
-        if jobs.isEmpty {
-            menu.addItem(NSMenuItem(title: "대기 중 (현재 진행 중인 변환 작업 없음)", action: nil, keyEquivalent: ""))
-        } else {
-            menu.addItem(NSMenuItem(title: "⚡ 진행 중인 작업 (\(jobs.count)건):", action: nil, keyEquivalent: ""))
-            for job in jobs {
-                let pct = Int((job.progress * 100.0).rounded())
-                let barCount = max(1, min(10, pct / 10))
-                let bar = String(repeating: "█", count: barCount) + String(repeating: "░", count: 10 - barCount)
-                let item = NSMenuItem(title: "[\(bar)] \(pct)% — \(job.title)", action: nil, keyEquivalent: "")
-                menu.addItem(item)
-            }
-        }
-        
-        menu.addItem(NSMenuItem.separator())
-        let helpItem = NSMenuItem(title: "📖 설명 및 단축키 설정...", action: #selector(openHelpAndSettings), keyEquivalent: ",")
-        helpItem.target = self
-        menu.addItem(helpItem)
-        
-        menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "종료 (Quit)", action: #selector(quitApp), keyEquivalent: "q"))
-        statusItem.menu = menu
-    }
-    
-    @objc func openHelpAndSettings() {
-        ToolWindowManager.shared.showHelpAndSettingsWindow()
-    }
-    
-    @objc func quitApp() {
-        NSApp.terminate(nil)
-    }
-    
-    func setupWheelPanel() {
-        wheelPanel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 356, height: 356),
-            styleMask: [.borderless, .nonactivatingPanel],
-            backing: .buffered,
-            defer: false
-        )
-        wheelPanel.isOpaque = false
-        wheelPanel.backgroundColor = .clear
-        wheelPanel.level = .screenSaver
-        wheelPanel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        wheelPanel.ignoresMouseEvents = true
-        wheelPanel.contentView = NSHostingView(rootView: RadialWheelView())
-    }
-    
-    func setupCGEventTapForOptionCancelFix() {
-        let mask = (1 << CGEventType.leftMouseUp.rawValue) |
-                   (1 << CGEventType.leftMouseDragged.rawValue)
-        
-        let callback: CGEventTapCallBack = { proxy, type, event, refcon in
-            guard let refcon = refcon else { return Unmanaged.passUnretained(event) }
-            let mySelf = Unmanaged<AppDelegate>.fromOpaque(refcon).takeUnretainedValue()
-            
-            if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-                if let tap = mySelf.eventTap { CGEvent.tapEnable(tap: tap, enable: true) }
-                return Unmanaged.passUnretained(event)
-            }
-            
-            if AppState.shared.isDragging {
-                if type == .leftMouseDragged || type == .leftMouseUp {
-                    event.flags.remove([.maskAlternate, .maskShift, .maskControl, .maskCommand])
-                }
-                
-                if type == .leftMouseUp {
-                    mySelf.sendEscapeToCancelFinderDrag()
-                    DispatchQueue.main.async {
-                        mySelf.handleMouseUp()
-                    }
-                }
-            }
-            return Unmanaged.passUnretained(event)
-        }
-        
-        let selfPtr = Unmanaged.passUnretained(self).toOpaque()
-        if let tap = CGEvent.tapCreate(
-            tap: .cgSessionEventTap,
-            place: .headInsertEventTap,
-            options: .defaultTap,
-            eventsOfInterest: CGEventMask(mask),
-            callback: callback,
-            userInfo: selfPtr
-        ) {
-            self.eventTap = tap
-            let runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
-            CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, .commonModes)
-            CGEvent.tapEnable(tap: tap, enable: true)
-        }
-    }
-    
-    func sendEscapeToCancelFinderDrag() {
-        let src = CGEventSource(stateID: .hidSystemState)
-        if let escDown = CGEvent(keyboardEventSource: src, virtualKey: 53, keyDown: true),
-           let escUp = CGEvent(keyboardEventSource: src, virtualKey: 53, keyDown: false) {
-            escDown.flags = []
-            escUp.flags = []
-            escDown.post(tap: .cghidEventTap)
-            escUp.post(tap: .cghidEventTap)
-        }
-    }
-    
-    func startGlobalMonitors() {
-        let dragPboard = NSPasteboard(name: .drag)
-        dragCountAtMouseDown = dragPboard.changeCount
-        
-        NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown]) { [weak self] _ in
-            guard let self = self else { return }
-            self.dragCountAtMouseDown = NSPasteboard(name: .drag).changeCount
-            self.isCurrentMouseStrokeValidFileDrag = false
-        }
-        
-        NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDragged, .flagsChanged]) { [weak self] event in
-            self?.handleDragOrFlags(event: event)
-        }
-        
-        NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseUp]) { [weak self] _ in
-            guard let self = self else { return }
-            if AppState.shared.isDragging {
-                self.handleMouseUp()
-            }
-        }
-    }
-    
-    func handleDragOrFlags(event: NSEvent) {
-        let mousePressed = (NSEvent.pressedMouseButtons & 1) != 0
-        guard mousePressed else {
-            if AppState.shared.isDragging { hideWheel() }
-            return
-        }
-        
-        guard let matchedMode = ShortcutSettings.shared.matchWheelMode(for: NSEvent.modifierFlags) else {
-            if AppState.shared.isDragging { hideWheel() }
-            return
-        }
-        
-        let dragPboard = NSPasteboard(name: .drag)
-        let currentChangeCount = dragPboard.changeCount
-        
-        if !isCurrentMouseStrokeValidFileDrag {
-            guard currentChangeCount != dragCountAtMouseDown,
-                  currentChangeCount != activeSessionDragCount else {
-                return
-            }
-            let files = readValidDraggedFiles(from: dragPboard)
-            guard !files.isEmpty else { return }
-            
-            isCurrentMouseStrokeValidFileDrag = true
-            activeSessionDragCount = currentChangeCount
-            AppState.shared.draggedFiles = files
-            let bytes = calculateTotalBytes(files: files)
-            AppState.shared.totalBytes = bytes
-            AppState.shared.totalSizeText = ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
-        }
-        
-        if !AppState.shared.isDragging {
-            guard isCurrentMouseStrokeValidFileDrag, !AppState.shared.draggedFiles.isEmpty else { return }
-            AppState.shared.wheelMode = matchedMode
-            AppState.shared.updateItems()
-            showWheel(at: NSEvent.mouseLocation)
-        } else if event.type == .flagsChanged && AppState.shared.wheelMode != matchedMode {
-            AppState.shared.wheelMode = matchedMode
-            AppState.shared.updateItems()
-        }
-        
-        updateHoveredSlice(mouseLocation: NSEvent.mouseLocation)
-    }
-    
-    func readValidDraggedFiles(from pboard: NSPasteboard) -> [URL] {
-        guard let types = pboard.types,
-              types.contains(.fileURL) || types.contains(NSPasteboard.PasteboardType("NSFilenamesPboardType")) else {
-            return []
-        }
-        guard let urls = pboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] else {
-            return []
-        }
-        return urls.filter { $0.isFileURL && FileManager.default.fileExists(atPath: $0.path) }
-    }
-    
-    func calculateTotalBytes(files: [URL]) -> Int64 {
-        var total: Int64 = 0
-        for f in files {
-            if let attrs = try? FileManager.default.attributesOfItem(atPath: f.path),
-               let sz = attrs[.size] as? Int64 {
-                total += sz
-            }
-        }
-        return total
-    }
-    
-    func showWheel(at point: NSPoint) {
-        wheelCenterPoint = point
-        AppState.shared.isDragging = true
-        AppState.shared.hoveredIndex = nil
-        wheelPanel.setFrameOrigin(NSPoint(x: point.x - 178, y: point.y - 178))
-        wheelPanel.orderFrontRegardless()
-    }
-    
-    func hideWheel() {
-        AppState.shared.isDragging = false
-        AppState.shared.hoveredIndex = nil
-        wheelPanel.orderOut(nil)
-    }
-    
-    func updateHoveredSlice(mouseLocation: NSPoint) {
-        let dx = mouseLocation.x - wheelCenterPoint.x
-        let dy = mouseLocation.y - wheelCenterPoint.y
-        let dist = hypot(dx, dy)
-        
-        guard dist > 48 && dist < 195 else {
-            AppState.shared.hoveredIndex = nil
-            return
-        }
-        
-        var degrees = atan2(dx, dy) * 180.0 / .pi
-        if degrees < 0 { degrees += 360.0 }
-        
-        let count = max(AppState.shared.items.count, 1)
-        let step = 360.0 / Double(count)
-        let shifted = (degrees + step / 2.0).truncatingRemainder(dividingBy: 360.0)
-        let idx = Int(shifted / step) % count
-        AppState.shared.hoveredIndex = idx
-    }
-    
-    func handleMouseUp() {
-        isCurrentMouseStrokeValidFileDrag = false
-        guard AppState.shared.isDragging else { return }
-        let selectedIdx = AppState.shared.hoveredIndex
-        let files = AppState.shared.draggedFiles
-        let items = AppState.shared.items
-        hideWheel()
-        
-        if let idx = selectedIdx, idx < items.count {
-            let item = items[idx]
-            FileProcessor.execute(actionKey: item.actionKey, files: files)
-        }
-    }
-}
-
-let app = NSApplication.shared
-let delegate = AppDelegate()
-app.delegate = delegate
-app.run()
+            .onSubmit
