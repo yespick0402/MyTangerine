@@ -1190,46 +1190,7 @@ struct MetadataToolView: View {
     }
 }
 
-// MARK: - 12. 파인더의 드래그&드롭을 직접 흡수하여 Option+드래그 시 파일이 복제되는 현상을 100% 차단하는 컨테이너 뷰
-class WheelDropAbsorberView: NSView {
-    var onUpdateHover: ((NSPoint) -> Void)?
-    var onPerformDrop: (() -> Void)?
-    
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        registerForDraggedTypes([.fileURL, NSPasteboard.PasteboardType("NSFilenamesPboardType")])
-    }
-    required init?(coder: NSCoder) { fatalError() }
-    
-    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-        if let win = self.window {
-            let screenPt = win.convertPoint(toScreen: sender.draggingLocation)
-            onUpdateHover?(screenPt)
-        }
-        // .copy가 아닌 .generic을 반환하여 파인더가 절대 자체 파일 복제를 수행하지 않도록 함
-        return .generic
-    }
-    
-    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
-        if let win = self.window {
-            let screenPt = win.convertPoint(toScreen: sender.draggingLocation)
-            onUpdateHover?(screenPt)
-        }
-        return .generic
-    }
-    
-    override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        return true
-    }
-    
-    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        // 휠 위에서 마우스를 놓으면 MyTangerine이 드롭을 삼키고(true), 파인더에는 파일이 생성되지 않음!
-        onPerformDrop?()
-        return true
-    }
-}
-
-// MARK: - 13. 앱 델리게이트 & 투명 아이콘 각인 & 드롭 인터셉터
+// MARK: - 12. 앱 델리게이트 & HID 레벨 Option 복제 원천 차단 엔진 (cghidEventTap)
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var wheelPanel: NSPanel!
@@ -1238,20 +1199,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var activeSessionDragCount: Int = -1
     var isCurrentMouseStrokeValidFileDrag: Bool = false
     var eventTap: CFMachPort?
+    var isSyntheticMouseUp: Bool = false
     
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         applyPureTransparentCustomIconToAppBundle()
+        
+        // 손쉬운 사용(Accessibility) 권한 확인 및 자동 프롬프트
+        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        _ = AXIsProcessTrustedWithOptions(options)
         
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         updateStatusBarMenu()
         JobProgressManager.shared.onUpdate = { [weak self] in self?.updateStatusBarMenu() }
         setupWheelPanel()
         startGlobalMonitors()
-        setupCGEventTapForOptionCancelFix()
+        setupHIDEventTapToBlockFinderOptionCopy()
     }
     
-    // MARK: 핵심 1 — macOS가 회색 네모 박스(Squircle)를 씌우지 못하도록 투명 PNG 아이콘을 앱 번들에 직접 각인
     func applyPureTransparentCustomIconToAppBundle() {
         guard let rawIcon = FileProcessor.customAppIconImage() else { return }
         NSApp.applicationIconImage = rawIcon
@@ -1281,7 +1246,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "🍊 MyTangerine 4.1 Pro", action: nil, keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "🍊 MyTangerine 4.3 Pro", action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         if jobs.isEmpty {
             menu.addItem(NSMenuItem(title: "대기 중 (현재 진행 중인 변환 작업 없음)", action: nil, keyEquivalent: ""))
@@ -1298,14 +1263,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let helpItem = NSMenuItem(title: "📖 설명 및 설정 (단축키 / 이름 변환 양식)...", action: #selector(openHelpAndSettings), keyEquivalent: ",")
         helpItem.target = self
         menu.addItem(helpItem)
-        menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "종료 (Quit)", action: #selector(quitApp), keyEquivalent: "q"))
         statusItem.menu = menu
     }
     @objc func openHelpAndSettings() { ToolWindowManager.shared.showHelpAndSettingsWindow() }
     @objc func quitApp() { NSApp.terminate(nil) }
     
-    // MARK: 핵심 2 — 휠 패널이 마우스 드롭을 직접 흡수(ignoresMouseEvents = false)하여 뒤쪽 파인더에 파일이 복제되지 않게 함
     func setupWheelPanel() {
         let size = NSRect(x: 0, y: 0, width: 356, height: 356)
         wheelPanel = NSPanel(contentRect: size, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
@@ -1313,68 +1276,122 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         wheelPanel.backgroundColor = .clear
         wheelPanel.level = .screenSaver
         wheelPanel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        wheelPanel.ignoresMouseEvents = false
-        
-        let absorber = WheelDropAbsorberView(frame: size)
-        absorber.onUpdateHover = { [weak self] screenPt in
-            self?.updateHoveredSlice(mouseLocation: screenPt)
-        }
-        absorber.onPerformDrop = { [weak self] in
-            self?.handleMouseUp()
-        }
-        
-        let hostView = NSHostingView(rootView: RadialWheelView())
-        hostView.frame = size
-        hostView.autoresizingMask = [.width, .height]
-        absorber.addSubview(hostView)
-        wheelPanel.contentView = absorber
+        wheelPanel.ignoresMouseEvents = true
+        wheelPanel.contentView = NSHostingView(rootView: RadialWheelView())
     }
     
-    // MARK: 핵심 3 — 드래그 중 Option 키 신호(flagsChanged)까지 가로채서 파인더가 '복제 모드(+)'로 들어가는 것을 원천 차단
-    func setupCGEventTapForOptionCancelFix() {
-        let mask = (1 << CGEventType.leftMouseUp.rawValue) |
+    // MARK: 핵심 해결 — 하드웨어 최상단(.cghidEventTap)에서 드래그 중 Option 키 이벤트와 MouseUp 드롭 이벤트를 완전히 삼켜 파인더의 초록색 '+' 복제를 원천 봉쇄
+    func setupHIDEventTapToBlockFinderOptionCopy() {
+        let mask = (1 << CGEventType.leftMouseDown.rawValue) |
+                   (1 << CGEventType.leftMouseUp.rawValue) |
                    (1 << CGEventType.leftMouseDragged.rawValue) |
                    (1 << CGEventType.flagsChanged.rawValue)
         
         let callback: CGEventTapCallBack = { proxy, type, event, refcon in
             guard let refcon = refcon else { return Unmanaged.passUnretained(event) }
             let mySelf = Unmanaged<AppDelegate>.fromOpaque(refcon).takeUnretainedValue()
+            
             if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
                 if let tap = mySelf.eventTap { CGEvent.tapEnable(tap: tap, enable: true) }
                 return Unmanaged.passUnretained(event)
             }
             
+            if type == .leftMouseDown {
+                mySelf.dragCountAtMouseDown = NSPasteboard(name: .drag).changeCount
+                mySelf.isCurrentMouseStrokeValidFileDrag = false
+                return Unmanaged.passUnretained(event)
+            }
+            
             let mousePressed = (NSEvent.pressedMouseButtons & 1) != 0
-            if mousePressed {
+            
+            // 1) 마우스를 잡고 드래그하는 도중 보조키(Shift / Option+Shift / Control)를 누른 경우:
+            if mousePressed && (type == .flagsChanged || type == .leftMouseDragged) {
                 let rawFlags = NSEvent.ModifierFlags(rawValue: UInt(event.flags.rawValue))
                 if let matched = ShortcutSettings.shared.matchWheelMode(for: rawFlags) {
                     DispatchQueue.main.async {
                         mySelf.activateOrSwitchWheelFromTap(mode: matched, mouseLocation: NSEvent.mouseLocation)
                     }
-                    // 파인더가 Option 키를 보고 파일 복제(+)를 켜지 못하도록 이벤트에서 Option/Shift/Control 플래그 제거!
+                    // 파인더가 Option 키를 감지하여 초록색 '+' 복제 커서를 띄우지 못하도록
+                    // flagsChanged 이벤트는 아예 삼켜버리고(return nil), 드래그 이벤트에서는 보조키 플래그를 완전히 지움!
                     event.flags.remove([.maskAlternate, .maskShift, .maskControl, .maskCommand])
-                } else if AppState.shared.isDragging && type == .flagsChanged {
-                    DispatchQueue.main.async {
-                        mySelf.hideWheel()
+                    if type == .flagsChanged {
+                        return nil
                     }
+                    return Unmanaged.passUnretained(event)
+                } else if AppState.shared.isDragging && type == .flagsChanged {
+                    DispatchQueue.main.async { mySelf.hideWheel() }
+                    event.flags.remove([.maskAlternate, .maskShift, .maskControl, .maskCommand])
+                    return nil
                 }
             }
             
-            if AppState.shared.isDragging {
-                event.flags.remove([.maskAlternate, .maskShift, .maskControl, .maskCommand])
-                if type == .leftMouseUp {
-                    DispatchQueue.main.async { mySelf.handleMouseUp() }
+            // 2) 동그란 휠이 떠 있는 상태에서 마우스 버튼을 놓는 순간(leftMouseUp):
+            //    파인더에 드롭(복제/이동) 신호가 전달되지 않도록 원래의 MouseUp을 삼키고(return nil),
+            //    먼저 ESC로 파인더 드래그 세션을 취소시킨 뒤 실행!
+            if type == .leftMouseUp {
+                if mySelf.isSyntheticMouseUp {
+                    mySelf.isSyntheticMouseUp = false
+                    event.flags = []
+                    return Unmanaged.passUnretained(event)
+                }
+                if AppState.shared.isDragging {
+                    let dropLocation = event.location
+                    DispatchQueue.main.async {
+                        mySelf.handleMouseUp()
+                    }
+                    mySelf.cancelFinderDragAndReleaseMouseCleanly(at: dropLocation)
+                    return nil // 원래의 MouseUp을 차단하여 파인더가 파일을 복제하지 못하게 함!
                 }
             }
+            
             return Unmanaged.passUnretained(event)
         }
         
         let selfPtr = Unmanaged.passUnretained(self).toOpaque()
-        if let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap, eventsOfInterest: CGEventMask(mask), callback: callback, userInfo: selfPtr) {
+        if let tap = CGEvent.tapCreate(
+            tap: .cghidEventTap,
+            place: .headInsertEventTap,
+            options: .defaultTap,
+            eventsOfInterest: CGEventMask(mask),
+            callback: callback,
+            userInfo: selfPtr
+        ) {
             self.eventTap = tap
             let runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
             CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, .commonModes)
             CGEvent.tapEnable(tap: tap, enable: true)
+        } else if let sessionTap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .headInsertEventTap,
+            options: .defaultTap,
+            eventsOfInterest: CGEventMask(mask),
+            callback: callback,
+            userInfo: selfPtr
+        ) {
+            self.eventTap = sessionTap
+            let runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, sessionTap, 0)
+            CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, .commonModes)
+            CGEvent.tapEnable(tap: sessionTap, enable: true)
+        }
+    }
+    
+    // 파인더의 드래그 세션을 ESC로 취소한 뒤 깨끗한(Option 없는) MouseUp을 전달
+    func cancelFinderDragAndReleaseMouseCleanly(at pt: CGPoint) {
+        let src = CGEventSource(stateID: .hidSystemState)
+        if let escDown = CGEvent(keyboardEventSource: src, virtualKey: 53, keyDown: true),
+           let escUp = CGEvent(keyboardEventSource: src, virtualKey: 53, keyDown: false) {
+            escDown.flags = []; escUp.flags = []
+            escDown.post(tap: .cgSessionEventTap)
+            escUp.post(tap: .cgSessionEventTap)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.035) { [weak self] in
+            guard let self = self else { return }
+            self.isSyntheticMouseUp = true
+            let cleanSrc = CGEventSource(stateID: .hidSystemState)
+            if let cleanUp = CGEvent(mouseEventSource: cleanSrc, mouseType: .leftMouseUp, mouseCursorPosition: pt, mouseButton: .left) {
+                cleanUp.flags = []
+                cleanUp.post(tap: .cghidEventTap)
+            }
         }
     }
     
