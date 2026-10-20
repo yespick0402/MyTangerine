@@ -209,7 +209,7 @@ struct EditPhotoView: View {
     }
 }
 
-// MARK: - 9. Redact & 8방향 핸들 Crop 스튜디오 (저장 시 메타데이터 보존)
+// MARK: - 9. Redact & 8방향 핸들 Crop 스튜디오
 enum RedactStyle: String, CaseIterable {
     case pixelate = "픽셀 모자이크"
     case blur = "블러 (흐림)"
@@ -596,8 +596,7 @@ class MultiChannelMediaController: ObservableObject {
                 var detected = 0
                 for track in aTracks {
                     if let descs = try? await track.load(.formatDescriptions), let desc = descs.first {
-                        let fmtDesc = desc as! CMAudioFormatDescription
-                        if let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fmtDesc) {
+                        if let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(desc) {
                             detected += Int(asbd.pointee.mChannelsPerFrame)
                         }
                     }
@@ -1024,7 +1023,7 @@ struct ProMediaStudioView: View {
     }
 }
 
-// MARK: - 11. 배경 추가 창 / 압축 창(메타데이터 보존) / 메타데이터 창 / 앱 델리게이트
+// MARK: - 11. 배경 추가 창 / 압축 창 / 메타데이터 창 / 앱 델리게이트
 struct AddBGView: View {
     let fileURL: URL
     @State private var selectedPreset = 0
@@ -1202,6 +1201,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        if let customIcon = FileProcessor.customAppIconImage() {
+            NSApp.applicationIconImage = customIcon
+        }
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         updateStatusBarMenu()
         JobProgressManager.shared.onUpdate = { [weak self] in self?.updateStatusBarMenu() }
@@ -1217,7 +1219,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 btn.image = NSImage(systemSymbolName: "gearshape.arrow.triangle.2.circlepath", accessibilityDescription: "Processing")
                 btn.title = " \(pct)%"
             } else {
-                btn.image = NSImage(systemSymbolName: "circle.hexagongrid.fill", accessibilityDescription: "MyTangerine")
+                if let customIcon = FileProcessor.customAppIconImage() {
+                    let menuIcon = (customIcon.copy() as? NSImage) ?? customIcon
+                    menuIcon.size = NSSize(width: 18, height: 18)
+                    menuIcon.isTemplate = false
+                    btn.image = menuIcon
+                } else {
+                    btn.image = NSImage(systemSymbolName: "circle.hexagongrid.fill", accessibilityDescription: "MyTangerine")
+                }
                 btn.title = ""
             }
         }
