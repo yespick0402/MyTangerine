@@ -1,4 +1,109 @@
-// MARK: - 8. 전문가 사진 보정 창 (Part 2 — 저장 시 원본 EXIF 메타데이터 100% 보존)
+// MARK: - 7-C. 변환 시 Command 키 조합으로 열리는 1~100% 퀄리티 선택 팝업 창 (Part 2)
+struct ConvertQualityPopupView: View {
+    let files: [URL]
+    let targetExt: String
+    @State private var quality: Double = 100.0
+    @State private var origBytes: Int64 = 0
+    @State private var estBytes: Int64 = 0
+    
+    var body: some View {
+        VStack(spacing: 16) {
+            HStack(spacing: 10) {
+                Image(systemName: "slider.horizontal.below.square.and.square.filled")
+                    .font(.title2).foregroundColor(.orange)
+                Text("\(targetExt.uppercased()) 변환 퀄리티 설정 (\(files.count)개 파일)")
+                    .font(.headline)
+            }
+            
+            HStack(spacing: 18) {
+                VStack(spacing: 4) {
+                    Text("원본 크기").font(.caption).foregroundColor(.secondary)
+                    Text(ByteCountFormatter.string(fromByteCount: origBytes, countStyle: .file))
+                        .font(.system(size: 15, weight: .bold, design: .rounded))
+                }
+                Image(systemName: "arrow.right.circle.fill").font(.title2).foregroundColor(.orange)
+                VStack(spacing: 4) {
+                    Text("\(targetExt.uppercased()) 예상 크기").font(.caption).foregroundColor(.orange)
+                    Text("~" + ByteCountFormatter.string(fromByteCount: estBytes, countStyle: .file))
+                        .font(.system(size: 18, weight: .heavy, design: .rounded)).foregroundColor(.orange)
+                }
+                if Int(quality.rounded()) == 100 {
+                    Text("원본 동일 최고화질")
+                        .font(.system(size: 11, weight: .bold, design: .rounded)).foregroundColor(.white)
+                        .padding(.horizontal, 10).padding(.vertical, 5).background(Color.orange, in: Capsule())
+                }
+            }
+            .padding(14).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+            
+            VStack(spacing: 8) {
+                HStack {
+                    Text("변환 퀄리티: \(Int(quality.rounded()))%")
+                        .font(.system(size: 14, weight: .bold))
+                        .foregroundColor(.orange)
+                    Spacer()
+                    Text(Int(quality.rounded()) == 100 ? "100% = 무손실/원본 동일 퀄리티" : "낮출수록 용량이 줄어듭니다")
+                        .font(.caption).foregroundColor(.secondary)
+                }
+                
+                Slider(value: $quality, in: 1...100, step: 1)
+                    .tint(.orange)
+                    .onChange(of: quality) { recalculate() }
+                
+                HStack(spacing: 8) {
+                    Text("빠른 선택:").font(.caption).foregroundColor(.secondary)
+                    ForEach([25, 50, 75, 90, 100], id: \.self) { preset in
+                        Button("\(preset)%") {
+                            quality = Double(preset)
+                            recalculate()
+                        }
+                        .font(.caption)
+                    }
+                }
+            }
+            .padding(.horizontal, 8)
+            
+            Text("💡 메타데이터(EXIF 촬영일시, 카메라 정보, GPS)는 삭제되지 않고 그대로 보존됩니다.")
+                .font(.caption2).foregroundColor(.secondary)
+            
+            HStack {
+                Button("취소") { NSApp.keyWindow?.close() }
+                Spacer()
+                Button("\(Int(quality.rounded()))% 퀄리티로 \(targetExt.uppercased()) 변환 저장") {
+                    for f in files {
+                        FileProcessor.convertFile(f, to: targetExt, qualityPercent: quality)
+                    }
+                    NSApp.keyWindow?.close()
+                }
+                .buttonStyle(.borderedProminent).tint(.orange)
+            }
+            .padding(.horizontal, 8)
+        }
+        .padding(22)
+        .onAppear {
+            origBytes = files.reduce(0) { $0 + ((try? FileManager.default.attributesOfItem(atPath: $1.path)[.size] as? Int64) ?? 0) }
+            recalculate()
+        }
+    }
+    
+    func recalculate() {
+        let q = quality
+        let fList = files
+        let orig = origBytes
+        let tgt = targetExt
+        DispatchQueue.global(qos: .userInteractive).async {
+            let imageExts = ["png", "jpg", "jpeg", "heic", "webp", "tiff", "bmp", "pdf"]
+            let est: Int64
+            if imageExts.contains(tgt.lowercased()) {
+                est = FileSizeEstimator.exactImageConversionBytes(files: fList, originalTotalBytes: orig, targetExt: tgt, qualityPercent: q)
+            } else {
+                est = FileSizeEstimator.estimateConversionBytes(files: fList, originalTotalBytes: orig, targetExt: tgt, qualityPercent: q)
+            }
+            DispatchQueue.main.async { self.estBytes = est }
+        }
+    }
+}
+
+// MARK: - 8. 전문가 사진 보정 창 (저장 시 원본 EXIF 메타데이터 100% 보존)
 struct EditPhotoView: View {
     let fileURL: URL
     @State private var exposure: Double = 0.0
@@ -1110,7 +1215,7 @@ struct CompressToolView: View {
                     Spacer()
                     Text("EXIF 촬영정보 및 메타데이터는 삭제되지 않고 그대로 보존됩니다").font(.caption2).foregroundColor(.orange)
                 }
-                Slider(value: $quality, in: 10...95).tint(.orange).onChange(of: quality) { recalculateEstimate() }
+                Slider(value: $quality, in: 1...100).tint(.orange).onChange(of: quality) { recalculateEstimate() }
             }.padding(.horizontal, 8)
             HStack {
                 Button("취소") { NSApp.keyWindow?.close() }
@@ -1135,7 +1240,7 @@ struct CompressToolView: View {
                 FileProcessor.showToast("이미지 압축 완료 (메타데이터 유지됨): \(out.lastPathComponent)")
             } else if FileProcessor.ffmpegPath != nil {
                 let out = FileProcessor.uniqueOutputURL(for: f, newExt: ext, suffix: "_compressed")
-                let crf = Int(40.0 - (quality / 100.0) * 20.0)
+                let crf = quality >= 99.5 ? 0 : Int(40.0 - (quality / 100.0) * 22.0)
                 let dur = FileProcessor.mediaDurationSeconds(for: f)
                 FileProcessor.runFFmpegWithProgress(args: ["-y", "-i", f.path, "-map_metadata", "0", "-movflags", "use_metadata_tags", "-vcodec", "libx264", "-crf", "\(crf)", out.path], totalDuration: dur, jobTitle: "압축: \(f.lastPathComponent)") { _ in
                     FileProcessor.preserveFileDates(from: f, to: out)
@@ -1190,7 +1295,7 @@ struct MetadataToolView: View {
     }
 }
 
-// MARK: - 12. 앱 델리게이트 & HID 레벨 Option 복제 원천 차단 엔진 (cghidEventTap)
+// MARK: - 12. 앱 델리게이트 & 무결점 원형 창(hasShadow = false) & 홀드/토글 엔진
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var wheelPanel: NSPanel!
@@ -1200,12 +1305,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var isCurrentMouseStrokeValidFileDrag: Bool = false
     var eventTap: CFMachPort?
     var isSyntheticMouseUp: Bool = false
+    var previousRawFlags: NSEvent.ModifierFlags = []
     
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         applyPureTransparentCustomIconToAppBundle()
         
-        // 손쉬운 사용(Accessibility) 권한 확인 및 자동 프롬프트
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
         _ = AXIsProcessTrustedWithOptions(options)
         
@@ -1246,7 +1351,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "🍊 MyTangerine 4.3 Pro", action: nil, keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "🍊 MyTangerine 4.4 Pro", action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         if jobs.isEmpty {
             menu.addItem(NSMenuItem(title: "대기 중 (현재 진행 중인 변환 작업 없음)", action: nil, keyEquivalent: ""))
@@ -1260,27 +1365,29 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         menu.addItem(NSMenuItem.separator())
-        let helpItem = NSMenuItem(title: "📖 설명 및 설정 (단축키 / 이름 변환 양식)...", action: #selector(openHelpAndSettings), keyEquivalent: ",")
+        let helpItem = NSMenuItem(title: "📖 설명 및 설정 (단축키 / 홀드·토글 / 이름 양식)...", action: #selector(openHelpAndSettings), keyEquivalent: ",")
         helpItem.target = self
         menu.addItem(helpItem)
+        menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "종료 (Quit)", action: #selector(quitApp), keyEquivalent: "q"))
         statusItem.menu = menu
     }
     @objc func openHelpAndSettings() { ToolWindowManager.shared.showHelpAndSettingsWindow() }
     @objc func quitApp() { NSApp.terminate(nil) }
     
+    // MARK: 핵심 1 — 창 크기를 440x440으로 넉넉히 넓히고 시스템 사각 그림자(hasShadow = false)를 꺼서 팔각형 테두리 잘림 현상을 완벽히 해결!
     func setupWheelPanel() {
-        let size = NSRect(x: 0, y: 0, width: 356, height: 356)
+        let size = NSRect(x: 0, y: 0, width: 440, height: 440)
         wheelPanel = NSPanel(contentRect: size, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         wheelPanel.isOpaque = false
         wheelPanel.backgroundColor = .clear
+        wheelPanel.hasShadow = false
         wheelPanel.level = .screenSaver
         wheelPanel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         wheelPanel.ignoresMouseEvents = true
         wheelPanel.contentView = NSHostingView(rootView: RadialWheelView())
     }
     
-    // MARK: 핵심 해결 — 하드웨어 최상단(.cghidEventTap)에서 드래그 중 Option 키 이벤트와 MouseUp 드롭 이벤트를 완전히 삼켜 파인더의 초록색 '+' 복제를 원천 봉쇄
     func setupHIDEventTapToBlockFinderOptionCopy() {
         let mask = (1 << CGEventType.leftMouseDown.rawValue) |
                    (1 << CGEventType.leftMouseUp.rawValue) |
@@ -1299,35 +1406,78 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             if type == .leftMouseDown {
                 mySelf.dragCountAtMouseDown = NSPasteboard(name: .drag).changeCount
                 mySelf.isCurrentMouseStrokeValidFileDrag = false
+                mySelf.previousRawFlags = []
                 return Unmanaged.passUnretained(event)
             }
             
             let mousePressed = (NSEvent.pressedMouseButtons & 1) != 0
             
-            // 1) 마우스를 잡고 드래그하는 도중 보조키(Shift / Option+Shift / Control)를 누른 경우:
             if mousePressed && (type == .flagsChanged || type == .leftMouseDragged) {
-                let rawFlags = NSEvent.ModifierFlags(rawValue: UInt(event.flags.rawValue))
-                if let matched = ShortcutSettings.shared.matchWheelMode(for: rawFlags) {
-                    DispatchQueue.main.async {
-                        mySelf.activateOrSwitchWheelFromTap(mode: matched, mouseLocation: NSEvent.mouseLocation)
+                let rawFlags = NSEvent.ModifierFlags(rawValue: UInt(event.flags.rawValue)).intersection([.shift, .option, .control, .command])
+                let qReq = ShortcutSettings.shared.qualityFlags
+                let qualityPressed = !qReq.isEmpty && rawFlags.isSuperset(of: qReq)
+                
+                DispatchQueue.main.async {
+                    if AppState.shared.isQualityOptionActive != qualityPressed {
+                        AppState.shared.isQualityOptionActive = qualityPressed
                     }
-                    // 파인더가 Option 키를 감지하여 초록색 '+' 복제 커서를 띄우지 못하도록
-                    // flagsChanged 이벤트는 아예 삼켜버리고(return nil), 드래그 이벤트에서는 보조키 플래그를 완전히 지움!
-                    event.flags.remove([.maskAlternate, .maskShift, .maskControl, .maskCommand])
-                    if type == .flagsChanged {
-                        return nil
+                }
+                
+                let matched = ShortcutSettings.shared.matchWheelMode(for: rawFlags)
+                let isToggle = ShortcutSettings.shared.isToggleMode
+                
+                if type == .flagsChanged {
+                    // 키가 새로 눌린 시점(Rising Edge)인지 확인
+                    let newlyPressed = !rawFlags.subtracting(mySelf.previousRawFlags).isEmpty
+                    mySelf.previousRawFlags = rawFlags
+                    
+                    if isToggle {
+                        // [토글 방식]: 단축키를 한 번 누르면 켜지고, 같은 모드 키를 다시 한 번 누르면 꺼짐!
+                        if newlyPressed, let m = matched {
+                            DispatchQueue.main.async {
+                                if AppState.shared.isDragging && AppState.shared.wheelMode == m && !qualityPressed {
+                                    mySelf.hideWheel()
+                                } else {
+                                    mySelf.activateOrSwitchWheelFromTap(mode: m, mouseLocation: NSEvent.mouseLocation)
+                                }
+                            }
+                            event.flags.remove([.maskAlternate, .maskShift, .maskControl, .maskCommand])
+                            return nil
+                        }
+                        if AppState.shared.isDragging {
+                            event.flags.remove([.maskAlternate, .maskShift, .maskControl, .maskCommand])
+                            return nil
+                        }
+                    } else {
+                        // [홀드 방식]: 누르고 있는 동안만 켜지고 손을 떼면 꺼짐
+                        if let m = matched {
+                            DispatchQueue.main.async {
+                                mySelf.activateOrSwitchWheelFromTap(mode: m, mouseLocation: NSEvent.mouseLocation)
+                            }
+                            event.flags.remove([.maskAlternate, .maskShift, .maskControl, .maskCommand])
+                            return nil
+                        } else if AppState.shared.isDragging {
+                            DispatchQueue.main.async { mySelf.hideWheel() }
+                            event.flags.remove([.maskAlternate, .maskShift, .maskControl, .maskCommand])
+                            return nil
+                        }
                     }
-                    return Unmanaged.passUnretained(event)
-                } else if AppState.shared.isDragging && type == .flagsChanged {
-                    DispatchQueue.main.async { mySelf.hideWheel() }
-                    event.flags.remove([.maskAlternate, .maskShift, .maskControl, .maskCommand])
-                    return nil
+                } else if type == .leftMouseDragged {
+                    if let m = matched, !isToggle {
+                        DispatchQueue.main.async {
+                            mySelf.activateOrSwitchWheelFromTap(mode: m, mouseLocation: NSEvent.mouseLocation)
+                        }
+                    } else if AppState.shared.isDragging {
+                        DispatchQueue.main.async {
+                            mySelf.updateHoveredSlice(mouseLocation: NSEvent.mouseLocation)
+                        }
+                    }
+                    if AppState.shared.isDragging || matched != nil {
+                        event.flags.remove([.maskAlternate, .maskShift, .maskControl, .maskCommand])
+                    }
                 }
             }
             
-            // 2) 동그란 휠이 떠 있는 상태에서 마우스 버튼을 놓는 순간(leftMouseUp):
-            //    파인더에 드롭(복제/이동) 신호가 전달되지 않도록 원래의 MouseUp을 삼키고(return nil),
-            //    먼저 ESC로 파인더 드래그 세션을 취소시킨 뒤 실행!
             if type == .leftMouseUp {
                 if mySelf.isSyntheticMouseUp {
                     mySelf.isSyntheticMouseUp = false
@@ -1336,11 +1486,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 if AppState.shared.isDragging {
                     let dropLocation = event.location
+                    let rawFlags = NSEvent.ModifierFlags(rawValue: UInt(event.flags.rawValue))
+                    let qReq = ShortcutSettings.shared.qualityFlags
+                    let wantsQualityPopup = (!qReq.isEmpty && rawFlags.isSuperset(of: qReq)) || AppState.shared.isQualityOptionActive
                     DispatchQueue.main.async {
-                        mySelf.handleMouseUp()
+                        mySelf.handleMouseUp(openQualityPopup: wantsQualityPopup)
                     }
                     mySelf.cancelFinderDragAndReleaseMouseCleanly(at: dropLocation)
-                    return nil // 원래의 MouseUp을 차단하여 파인더가 파일을 복제하지 못하게 함!
+                    return nil
                 }
             }
             
@@ -1349,24 +1502,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         
         let selfPtr = Unmanaged.passUnretained(self).toOpaque()
         if let tap = CGEvent.tapCreate(
-            tap: .cghidEventTap,
-            place: .headInsertEventTap,
-            options: .defaultTap,
-            eventsOfInterest: CGEventMask(mask),
-            callback: callback,
-            userInfo: selfPtr
+            tap: .cghidEventTap, place: .headInsertEventTap, options: .defaultTap,
+            eventsOfInterest: CGEventMask(mask), callback: callback, userInfo: selfPtr
         ) {
             self.eventTap = tap
             let runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
             CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, .commonModes)
             CGEvent.tapEnable(tap: tap, enable: true)
         } else if let sessionTap = CGEvent.tapCreate(
-            tap: .cgSessionEventTap,
-            place: .headInsertEventTap,
-            options: .defaultTap,
-            eventsOfInterest: CGEventMask(mask),
-            callback: callback,
-            userInfo: selfPtr
+            tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap,
+            eventsOfInterest: CGEventMask(mask), callback: callback, userInfo: selfPtr
         ) {
             self.eventTap = sessionTap
             let runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, sessionTap, 0)
@@ -1375,7 +1520,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
     
-    // 파인더의 드래그 세션을 ESC로 취소한 뒤 깨끗한(Option 없는) MouseUp을 전달
     func cancelFinderDragAndReleaseMouseCleanly(at pt: CGPoint) {
         let src = CGEventSource(stateID: .hidSystemState)
         if let escDown = CGEvent(keyboardEventSource: src, virtualKey: 53, keyDown: true),
@@ -1427,25 +1571,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self = self else { return }
             self.dragCountAtMouseDown = NSPasteboard(name: .drag).changeCount
             self.isCurrentMouseStrokeValidFileDrag = false
+            self.previousRawFlags = []
         }
         NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDragged, .flagsChanged]) { [weak self] event in
-            self?.handleDragOrFlags(event: event)
+            self?.handleDragOrFlagsFallback(event: event)
         }
         NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseUp]) { [weak self] _ in
             guard let self = self else { return }
-            if AppState.shared.isDragging { self.handleMouseUp() }
+            if AppState.shared.isDragging {
+                self.handleMouseUp(openQualityPopup: AppState.shared.isQualityOptionActive)
+            }
         }
     }
     
-    func handleDragOrFlags(event: NSEvent) {
+    func handleDragOrFlagsFallback(event: NSEvent) {
         let mousePressed = (NSEvent.pressedMouseButtons & 1) != 0
-        guard mousePressed else { if AppState.shared.isDragging { hideWheel() }; return }
-        if AppState.shared.isDragging {
-            updateHoveredSlice(mouseLocation: NSEvent.mouseLocation)
+        guard mousePressed else {
+            if AppState.shared.isDragging { hideWheel() }
             return
         }
-        guard let matchedMode = ShortcutSettings.shared.matchWheelMode(for: NSEvent.modifierFlags) else { return }
-        activateOrSwitchWheelFromTap(mode: matchedMode, mouseLocation: NSEvent.mouseLocation)
+        if AppState.shared.isDragging {
+            updateHoveredSlice(mouseLocation: NSEvent.mouseLocation)
+        }
     }
     
     func readValidDraggedFiles(from pboard: NSPasteboard) -> [URL] {
@@ -1465,11 +1612,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         wheelCenterPoint = point
         AppState.shared.isDragging = true
         AppState.shared.hoveredIndex = nil
-        wheelPanel.setFrameOrigin(NSPoint(x: point.x - 178, y: point.y - 178))
+        // 440x440 크기의 정중앙(220)에 마우스 포인터가 오도록 배치
+        wheelPanel.setFrameOrigin(NSPoint(x: point.x - 220, y: point.y - 220))
         wheelPanel.orderFrontRegardless()
     }
     func hideWheel() {
         AppState.shared.isDragging = false
+        AppState.shared.isQualityOptionActive = false
         AppState.shared.hoveredIndex = nil
         wheelPanel.orderOut(nil)
     }
@@ -1485,7 +1634,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let shifted = (degrees + step / 2.0).truncatingRemainder(dividingBy: 360.0)
         AppState.shared.hoveredIndex = Int(shifted / step) % count
     }
-    func handleMouseUp() {
+    func handleMouseUp(openQualityPopup: Bool = false) {
         isCurrentMouseStrokeValidFileDrag = false
         guard AppState.shared.isDragging else { return }
         let selectedIdx = AppState.shared.hoveredIndex
@@ -1493,7 +1642,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let items = AppState.shared.items
         hideWheel()
         if let idx = selectedIdx, idx < items.count {
-            FileProcessor.execute(actionKey: items[idx].actionKey, files: files)
+            FileProcessor.execute(actionKey: items[idx].actionKey, files: files, openQualityPopup: openQualityPopup)
         }
     }
 }
