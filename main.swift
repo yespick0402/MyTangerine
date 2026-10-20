@@ -53,7 +53,7 @@ class JobProgressManager: ObservableObject {
     }
 }
 
-// MARK: - 2. 글로벌 상태 및 휠 메뉴 모델
+// MARK: - 2. 글로벌 상태 및 휠 메뉴 모델 (예상 용량 표시 포함)
 enum WheelMode: String {
     case convert = "CONVERT"
     case tools = "TOOLS"
@@ -65,6 +65,7 @@ struct WheelItem: Identifiable {
     let title: String
     let icon: String
     let actionKey: String
+    var estimatedSizeText: String? = nil
 }
 
 class AppState: ObservableObject {
@@ -72,6 +73,7 @@ class AppState: ObservableObject {
     @Published var isDragging = false
     @Published var wheelMode: WheelMode = .convert
     @Published var draggedFiles: [URL] = []
+    @Published var totalBytes: Int64 = 0
     @Published var totalSizeText: String = ""
     @Published var hoveredIndex: Int? = nil
     @Published var items: [WheelItem] = []
@@ -86,10 +88,12 @@ class AppState: ObservableObject {
         let videoExts = ["mp4", "mov", "mkv", "avi", "webm", "m4v"]
         let audioExts = ["mp3", "m4a", "wav", "flac", "ogg", "aac", "aiff", "caf"]
         
+        var baseItems: [WheelItem] = []
+        
         switch wheelMode {
         case .convert:
             if imageExts.contains(ext) {
-                items = [
+                baseItems = [
                     WheelItem(title: "JPG", icon: "photo", actionKey: "conv_jpg"),
                     WheelItem(title: "PNG", icon: "photo.fill", actionKey: "conv_png"),
                     WheelItem(title: "WEBP", icon: "globe", actionKey: "conv_webp"),
@@ -100,7 +104,7 @@ class AppState: ObservableObject {
                     WheelItem(title: "ICNS", icon: "app.dashed", actionKey: "conv_icns")
                 ]
             } else if videoExts.contains(ext) {
-                items = [
+                baseItems = [
                     WheelItem(title: "MP4", icon: "film", actionKey: "conv_mp4"),
                     WheelItem(title: "MOV", icon: "video", actionKey: "conv_mov"),
                     WheelItem(title: "GIF", icon: "sparkles.tv", actionKey: "conv_gif"),
@@ -110,7 +114,7 @@ class AppState: ObservableObject {
                     WheelItem(title: "MKV", icon: "play.rectangle", actionKey: "conv_mkv")
                 ]
             } else if audioExts.contains(ext) {
-                items = [
+                baseItems = [
                     WheelItem(title: "M4A", icon: "music.quarternote.3", actionKey: "conv_m4a"),
                     WheelItem(title: "WAV", icon: "waveform", actionKey: "conv_wav"),
                     WheelItem(title: "MP3", icon: "music.note", actionKey: "conv_mp3"),
@@ -119,12 +123,40 @@ class AppState: ObservableObject {
                     WheelItem(title: "CAF", icon: "speaker.wave.2", actionKey: "conv_caf")
                 ]
             } else {
-                items = [
+                baseItems = [
                     WheelItem(title: "ZIP 압축", icon: "doc.zipper", actionKey: "conv_zip"),
                     WheelItem(title: "TAR.GZ", icon: "archivebox", actionKey: "conv_targz"),
                     WheelItem(title: "PDF 변환", icon: "doc.richtext", actionKey: "conv_pdf")
                 ]
             }
+            
+            // 변환 모드일 때 각 포맷의 예상 용량 계산
+            let files = draggedFiles
+            let origTotal = totalBytes
+            for i in 0..<baseItems.count {
+                let targetExt = baseItems[i].actionKey.replacingOccurrences(of: "conv_", with: "")
+                let estBytes = FileSizeEstimator.estimateConversionBytes(files: files, originalTotalBytes: origTotal, targetExt: targetExt)
+                baseItems[i].estimatedSizeText = "~" + ByteCountFormatter.string(fromByteCount: estBytes, countStyle: .file)
+            }
+            items = baseItems
+            
+            // 이미지 파일인 경우 백그라운드에서 실제 인코딩 샘플링으로 더 정밀한 용량 업데이트
+            if imageExts.contains(ext) {
+                DispatchQueue.global(qos: .userInteractive).async {
+                    var updated = baseItems
+                    for i in 0..<updated.count {
+                        let targetExt = updated[i].actionKey.replacingOccurrences(of: "conv_", with: "")
+                        let exactBytes = FileSizeEstimator.exactImageConversionBytes(files: files, originalTotalBytes: origTotal, targetExt: targetExt)
+                        updated[i].estimatedSizeText = "~" + ByteCountFormatter.string(fromByteCount: exactBytes, countStyle: .file)
+                    }
+                    DispatchQueue.main.async {
+                        if self.isDragging && self.wheelMode == .convert {
+                            self.items = updated
+                        }
+                    }
+                }
+            }
+            
         case .tools:
             if imageExts.contains(ext) {
                 items = [
@@ -164,7 +196,149 @@ class AppState: ObservableObject {
     }
 }
 
-// MARK: - 3. 파일 처리 및 실시간 진행률(%) 파싱 엔진
+// MARK: - 3. 변환 및 압축 파일 예상 크기 계산 엔진 (FileSizeEstimator)
+class FileSizeEstimator {
+    // 1) 즉시 반환용 휴리스틱 + 미디어 길이 기반 예상 크기 계산
+    static func estimateConversionBytes(files: [URL], originalTotalBytes: Int64, targetExt: String) -> Int64 {
+        guard let first = files.first, originalTotalBytes > 0 else { return 0 }
+        let srcExt = first.pathExtension.lowercased()
+        let tgt = targetExt.lowercased()
+        
+        if srcExt == tgt { return originalTotalBytes }
+        
+        // 비디오/오디오 파일인 경우 재생 시간(초) * 목표 비트레이트로 정밀 추정
+        let videoExts = ["mp4", "mov", "mkv", "avi", "webm", "m4v"]
+        let audioExts = ["mp3", "m4a", "wav", "flac", "ogg", "aac", "aiff", "caf"]
+        
+        if videoExts.contains(srcExt) || audioExts.contains(srcExt) {
+            var totalDuration: Double = 0
+            for f in files {
+                totalDuration += FileProcessor.mediaDurationSeconds(for: f)
+            }
+            if totalDuration > 0 {
+                switch tgt {
+                case "mp3":
+                    // ~192 kbps = 24 KB/s
+                    return max(4096, Int64(totalDuration * 24_000))
+                case "m4a", "aac", "caf", "ogg":
+                    // ~192 kbps = 24 KB/s
+                    return max(4096, Int64(totalDuration * 24_000))
+                case "wav", "aiff":
+                    // 44.1kHz 16-bit Stereo PCM = ~176.4 KB/s
+                    return max(8192, Int64(totalDuration * 176_400))
+                case "flac":
+                    // 무손실 압축 (WAV 대비 약 55%)
+                    return max(8192, Int64(totalDuration * 96_000))
+                case "gif":
+                    // 640p 12fps GIF 평균 ~380 KB/s
+                    return max(10_240, Int64(totalDuration * 380_000))
+                case "mp4", "mov", "mkv":
+                    // H.264 CRF 22 변환 시 원본 코덱에 따른 비율 추정
+                    let ratio: Double = (srcExt == "mov") ? 0.68 : 0.88
+                    return max(16_384, Int64(Double(originalTotalBytes) * ratio))
+                default:
+                    break
+                }
+            }
+        }
+        
+        // 이미지 및 압축 아카이브의 포맷별 상대 용량 가중치 계산
+        let weights: [String: Double] = [
+            "bmp": 3.2,
+            "tiff": 2.4,
+            "png": 1.0,
+            "pdf": 0.95,
+            "jpg": 0.36,
+            "jpeg": 0.36,
+            "heic": 0.22,
+            "webp": 0.25,
+            "icns": 0.45,
+            "zip": 0.72,
+            "targz": 0.68
+        ]
+        
+        let srcW = weights[srcExt] ?? 1.0
+        let tgtW = weights[tgt] ?? 0.85
+        let estimated = Double(originalTotalBytes) * (tgtW / srcW)
+        return max(1024, Int64(estimated))
+    }
+    
+    // 2) 이미지 파일의 경우 실제 첫 번째 이미지를 메모리에서 변환하여 정확한 바이트 크기 산출
+    static func exactImageConversionBytes(files: [URL], originalTotalBytes: Int64, targetExt: String) -> Int64 {
+        guard let first = files.first,
+              let attrs = try? FileManager.default.attributesOfItem(atPath: first.path),
+              let firstOrigSize = attrs[.size] as? Int64, firstOrigSize > 0,
+              let cg = FileProcessor.loadRawCGImage(from: first) else {
+            return estimateConversionBytes(files: files, originalTotalBytes: originalTotalBytes, targetExt: targetExt)
+        }
+        
+        let rep = NSBitmapImageRep(cgImage: cg)
+        let tgt = targetExt.lowercased()
+        var sampleDataSize: Int64? = nil
+        
+        switch tgt {
+        case "jpg", "jpeg":
+            sampleDataSize = Int64(rep.representation(using: .jpeg, properties: [.compressionFactor: 0.85])?.count ?? 0)
+        case "png":
+            sampleDataSize = Int64(rep.representation(using: .png, properties: [:])?.count ?? 0)
+        case "tiff":
+            sampleDataSize = Int64(rep.representation(using: .tiff, properties: [:])?.count ?? 0)
+        case "bmp":
+            sampleDataSize = Int64(rep.representation(using: .bmp, properties: [:])?.count ?? 0)
+        case "heic", "webp":
+            // HEIC/WEBP는 JPEG 85% 대비 평균 약 62% 크기
+            if let jpgCount = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.85])?.count {
+                sampleDataSize = Int64(Double(jpgCount) * 0.62)
+            }
+        case "pdf":
+            if let jpgCount = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.90])?.count {
+                sampleDataSize = Int64(jpgCount + 4096)
+            }
+        default:
+            break
+        }
+        
+        if let sSize = sampleDataSize, sSize > 0 {
+            let scaleRatio = Double(sSize) / Double(firstOrigSize)
+            return max(1024, Int64(Double(originalTotalBytes) * scaleRatio))
+        }
+        return estimateConversionBytes(files: files, originalTotalBytes: originalTotalBytes, targetExt: targetExt)
+    }
+    
+    // 3) 압축(Compress) 도구에서 품질(Quality 10~95%)에 따른 예상 저장 크기 계산
+    static func estimateCompressedBytes(files: [URL], quality: Double) -> (original: Int64, estimated: Int64) {
+        var origTotal: Int64 = 0
+        var estTotal: Int64 = 0
+        
+        for (index, f) in files.enumerated() {
+            let fSize = (try? FileManager.default.attributesOfItem(atPath: f.path)[.size] as? Int64) ?? 0
+            origTotal += fSize
+            let ext = f.pathExtension.lowercased()
+            
+            if ["jpg", "jpeg", "png", "heic", "tiff", "bmp", "webp"].contains(ext) {
+                // 첫 번째 이미지는 실제 JPEG 메모리 압축으로 정확한 바이트 측정
+                if index == 0, let cg = FileProcessor.loadRawCGImage(from: f) {
+                    let rep = NSBitmapImageRep(cgImage: cg)
+                    if let data = rep.representation(using: .jpeg, properties: [.compressionFactor: quality / 100.0]) {
+                        estTotal += Int64(data.count)
+                        continue
+                    }
+                }
+                let ratio = pow(quality / 100.0, 1.35) * (ext == "png" || ext == "tiff" || ext == "bmp" ? 0.45 : 0.85)
+                estTotal += max(1024, Int64(Double(fSize) * ratio))
+            } else {
+                // 비디오/오디오 CRF 압축 시 예상 용량 (CRF = 40 - (quality/100)*20)
+                let crf = 40.0 - (quality / 100.0) * 20.0
+                // CRF가 6 증가할 때마다 비트레이트 약 절반 감소 (기준 CRF 23)
+                let ratio = min(0.95, max(0.08, pow(2.0, (23.0 - crf) / 6.0) * 0.78))
+                estTotal += max(4096, Int64(Double(fSize) * ratio))
+            }
+        }
+        return (origTotal, estTotal)
+    }
+}
+
+// MARK: - 4. 파일 처리 및 실시간 진행률(%) 파싱 엔진
 class FileProcessor {
     static var ffmpegPath: String? {
         let candidates = [
@@ -198,7 +372,6 @@ class FileProcessor {
         return (sec.isFinite && sec > 0) ? sec : 0
     }
     
-    // FFmpeg 실행 중 time=00:00:00.00 로그를 실시간 추적하여 메뉴바 퍼센트(%) 업데이트
     static func runFFmpegWithProgress(args: [String], totalDuration: Double, jobTitle: String, completion: @escaping (Bool) -> Void) {
         guard let ffmpeg = ffmpegPath else {
             completion(false)
@@ -550,7 +723,7 @@ class FileProcessor {
     }
 }
 
-// MARK: - 4. 마우스 휠 확대/축소 감지용 헬퍼 뷰 (ScrollWheel Zoom + 중앙 정렬)
+// MARK: - 5. 마우스 휠 확대/축소 감지용 헬퍼 뷰
 struct ScrollWheelCatcher: NSViewRepresentable {
     var onScroll: (CGFloat) -> Void
     
@@ -575,11 +748,11 @@ struct ScrollWheelCatcher: NSViewRepresentable {
     }
 }
 
-// MARK: - 5. 원형 다이얼 휠 UI
+// MARK: - 6. 원형 다이얼 휠 UI (변환 포맷별 예상 용량 표시 포함)
 struct PieSliceShape: Shape {
     var startAngle: Angle
     var endAngle: Angle
-    var innerRadiusRatio: CGFloat = 0.34
+    var innerRadiusRatio: CGFloat = 0.35
     
     func path(in rect: CGRect) -> Path {
         let center = CGPoint(x: rect.midX, y: rect.midY)
@@ -596,7 +769,7 @@ struct PieSliceShape: Shape {
 
 struct RadialWheelView: View {
     @ObservedObject var state = AppState.shared
-    let wheelSize: CGFloat = 310
+    let wheelSize: CGFloat = 324
     
     var body: some View {
         ZStack {
@@ -626,11 +799,11 @@ struct RadialWheelView: View {
         let end = Angle(degrees: Double(index + 1) * angleStep - 90.0 - angleStep / 2.0 - 1.8)
         let midAngle = (start.radians + end.radians) / 2.0
         let isHovered = (state.hoveredIndex == index)
-        let labelRadius = (wheelSize / 2.0) * 0.67
+        let labelRadius = (wheelSize / 2.0) * 0.68
         
         let fillGrad = isHovered ?
             LinearGradient(colors: [Color.orange, Color.red], startPoint: .topLeading, endPoint: .bottomTrailing) :
-            LinearGradient(colors: [Color.white.opacity(0.75), Color.white.opacity(0.45)], startPoint: .top, endPoint: .bottom)
+            LinearGradient(colors: [Color.white.opacity(0.78), Color.white.opacity(0.48)], startPoint: .top, endPoint: .bottom)
         
         return ZStack {
             PieSliceShape(startAngle: start, endAngle: end)
@@ -640,12 +813,20 @@ struct RadialWheelView: View {
                         .stroke(isHovered ? Color.white : Color.black.opacity(0.08), lineWidth: 1.2)
                 )
             
-            VStack(spacing: 4) {
+            VStack(spacing: 2) {
                 Image(systemName: item.icon)
-                    .font(.system(size: 16, weight: .semibold))
+                    .font(.system(size: 15, weight: .semibold))
                 Text(item.title)
                     .font(.system(size: 11, weight: .bold, design: .rounded))
                     .lineLimit(1)
+                if let est = item.estimatedSizeText {
+                    Text(est)
+                        .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                        .foregroundColor(isHovered ? .white.opacity(0.95) : .black.opacity(0.62))
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(isHovered ? Color.black.opacity(0.22) : Color.black.opacity(0.06), in: Capsule())
+                }
             }
             .foregroundColor(isHovered ? .white : .black.opacity(0.85))
             .position(
@@ -661,12 +842,20 @@ struct RadialWheelView: View {
             Text(state.wheelMode.rawValue)
                 .font(.system(size: 9, weight: .heavy, design: .rounded))
                 .foregroundColor(.orange)
+            
             Text(state.totalSizeText)
-                .font(.system(size: 13, weight: .bold, design: .rounded))
+                .font(.system(size: 12, weight: .bold, design: .rounded))
                 .foregroundColor(.primary)
-            Text("\(state.draggedFiles.count)개 파일")
-                .font(.system(size: 10))
-                .foregroundColor(.secondary)
+            
+            if let idx = state.hoveredIndex, idx < state.items.count, let est = state.items[idx].estimatedSizeText {
+                Text("예상 \(est)")
+                    .font(.system(size: 10, weight: .heavy, design: .monospaced))
+                    .foregroundColor(.orange)
+            } else {
+                Text("\(state.draggedFiles.count)개 파일")
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+            }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
@@ -675,7 +864,7 @@ struct RadialWheelView: View {
     }
 }
 
-// MARK: - 6. 도구 창 매니저
+// MARK: - 7. 도구 창 매니저
 class ToolWindowManager {
     static let shared = ToolWindowManager()
     var activeWindows: [NSWindow] = []
@@ -742,7 +931,7 @@ class ToolWindowManager {
     }
     
     func showCompressWindow(urls: [URL]) {
-        openWindow(title: "Compress Files", view: CompressToolView(files: urls), size: NSSize(width: 460, height: 320), minSize: NSSize(width: 400, height: 280))
+        openWindow(title: "Compress Files", view: CompressToolView(files: urls), size: NSSize(width: 480, height: 370), minSize: NSSize(width: 440, height: 340))
     }
     
     func showMetadataWindow(url: URL) {
@@ -754,7 +943,7 @@ class ToolWindowManager {
     }
 }
 
-// MARK: - 7. 전문가 사진 보정 창 (정중앙 배치 + 마우스 휠 확대/축소 + 드래그 이동)
+// MARK: - 8. 전문가 사진 보정 창 (정중앙 배치 + 마우스 휠 확대/축소 + 드래그 이동)
 struct EditPhotoView: View {
     let fileURL: URL
     
@@ -773,7 +962,6 @@ struct EditPhotoView: View {
     @State private var vignette: Double = 0.0
     @State private var sepia: Double = 0.0
     
-    // 줌 & 패닝 상태
     @State private var zoomScale: CGFloat = 1.0
     @State private var panOffset: CGSize = .zero
     @State private var lastPanOffset: CGSize = .zero
@@ -786,7 +974,6 @@ struct EditPhotoView: View {
     
     var body: some View {
         HSplitView {
-            // 좌측: 중앙 정렬 & 마우스 휠 줌 & 드래그 패닝 캔버스
             VStack(spacing: 0) {
                 HStack(spacing: 12) {
                     Text("\(Int(pixelSize.width)) × \(Int(pixelSize.height)) px")
@@ -857,7 +1044,6 @@ struct EditPhotoView: View {
             }
             .frame(minWidth: 560, maxWidth: .infinity)
             
-            // 우측: 14종 슬라이더
             VStack(spacing: 0) {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 14) {
@@ -1017,7 +1203,7 @@ struct EditPhotoView: View {
     }
 }
 
-// MARK: - 8. Redact & 8방향 핸들 Crop 스튜디오 (정중앙 배치 + 휠 줌 + 드래그 패닝 + 8방향 모서리/변 조절)
+// MARK: - 9. Redact & 8방향 핸들 Crop 스튜디오
 enum RedactStyle: String, CaseIterable {
     case pixelate = "픽셀 모자이크"
     case blur = "블러 (흐림)"
@@ -1038,18 +1224,16 @@ enum CropHandle: CaseIterable {
 
 struct RedactCropStudioView: View {
     let fileURL: URL
-    @State var mode: Int // 0 = Redact, 1 = Crop, 2 = Pan(화면 이동)
+    @State var mode: Int
     @State private var redactStyle: RedactStyle = .pixelate
     @State private var strength: Double = 30.0
     @State private var redactItems: [RedactItem] = []
     @State private var activeDragRect: CGRect? = nil
     
-    // Crop 정규화 영역 (0.0 ~ 1.0)
     @State private var cropRect: CGRect = CGRect(x: 0.1, y: 0.1, width: 0.8, height: 0.8)
     @State private var initialCropOnDrag: CGRect? = nil
     @State private var activeCropHandle: CropHandle? = nil
     
-    // Zoom & Pan (항상 정중앙 기준)
     @State private var zoomScale: CGFloat = 1.0
     @State private var panOffset: CGSize = .zero
     @State private var lastPanOffset: CGSize = .zero
@@ -1060,7 +1244,6 @@ struct RedactCropStudioView: View {
     
     var body: some View {
         VStack(spacing: 0) {
-            // 상단 컨트롤 바
             HStack(spacing: 14) {
                 Picker("작업", selection: $mode) {
                     Text("👁️ 가리기 (Redact)").tag(0)
@@ -1100,7 +1283,6 @@ struct RedactCropStudioView: View {
                 
                 Spacer()
                 
-                // 확대/축소 및 중앙 정렬 버튼
                 HStack(spacing: 6) {
                     Button(action: { zoomScale = max(0.25, zoomScale - 0.25) }) { Image(systemName: "minus.magnifyingglass") }
                     Text("\(Int(zoomScale * 100))%").font(.caption.monospacedDigit()).frame(width: 44)
@@ -1115,7 +1297,6 @@ struct RedactCropStudioView: View {
             .padding(10)
             .background(.regularMaterial)
             
-            // 중앙 뷰포트 (확대/축소 시에도 항상 정중앙 유지)
             GeometryReader { outerGeo in
                 let baseFitSize = calculateFitSize(in: outerGeo.size)
                 let scaledSize = CGSize(width: baseFitSize.width * zoomScale, height: baseFitSize.height * zoomScale)
@@ -1123,7 +1304,6 @@ struct RedactCropStudioView: View {
                 ZStack {
                     Color(white: 0.12)
                     
-                    // 이미지 & 오버레이 컨테이너 (정중앙 배치 + panOffset)
                     ZStack(alignment: .topLeading) {
                         if let cg = rawCGImage {
                             Image(nsImage: NSImage(cgImage: cg, size: scaledSize))
@@ -1132,7 +1312,6 @@ struct RedactCropStudioView: View {
                                 .frame(width: scaledSize.width, height: scaledSize.height)
                         }
                         
-                        // Redact 항목들
                         ForEach(redactItems) { item in
                             let r = CGRect(
                                 x: item.normalizedRect.origin.x * scaledSize.width,
@@ -1147,7 +1326,6 @@ struct RedactCropStudioView: View {
                             redactOverlayView(rect: drag, style: redactStyle)
                         }
                         
-                        // Crop 오버레이 + 8방향(모서리 4 + 상하좌우 변 4) 조절 핸들
                         if mode == 1 {
                             cropOverlayWith8Handles(canvasSize: scaledSize)
                         }
@@ -1158,7 +1336,6 @@ struct RedactCropStudioView: View {
                     .offset(panOffset)
                     .position(x: outerGeo.size.width / 2, y: outerGeo.size.height / 2)
                     
-                    // 마우스 휠 확대/축소 수신기
                     ScrollWheelCatcher { delta in
                         let step = delta * 0.012
                         zoomScale = min(8.0, max(0.25, zoomScale + step))
@@ -1169,7 +1346,6 @@ struct RedactCropStudioView: View {
                 .clipped()
             }
             
-            // 하단 상태 바
             HStack {
                 if let cg = rawCGImage {
                     let outW = mode == 1 ? Int(CGFloat(cg.width) * cropRect.width) : cg.width
@@ -1193,7 +1369,6 @@ struct RedactCropStudioView: View {
         }
     }
     
-    // MARK: 8방향 핸들(4 모서리 + 4 변)이 포함된 크롭 UI
     @ViewBuilder
     func cropOverlayWith8Handles(canvasSize: CGSize) -> some View {
         let cRect = CGRect(
@@ -1204,14 +1379,12 @@ struct RedactCropStudioView: View {
         )
         
         ZStack(alignment: .topLeading) {
-            // 바깥 어두운 마스크 영역 (Even-Odd Fill)
             Path { path in
                 path.addRect(CGRect(origin: .zero, size: canvasSize))
                 path.addRect(cRect)
             }
             .fill(Color.black.opacity(0.58), style: FillStyle(eoFill: true))
             
-            // 크롭 테두리 및 3분할 그리드
             ZStack {
                 Rectangle()
                     .stroke(Color.yellow, lineWidth: 2)
@@ -1221,13 +1394,11 @@ struct RedactCropStudioView: View {
             .frame(width: cRect.width, height: cRect.height)
             .position(x: cRect.midX, y: cRect.midY)
             
-            // 모서리 핸들 4개 (맞닿은 두 변을 동시에 조절)
-            handleKnob(at: CGPoint(x: cRect.minX, y: cRect.minY), isCorner: true)
-            handleKnob(at: CGPoint(x: cRect.maxX, y: cRect.minY), isCorner: true)
-            handleKnob(at: CGPoint(x: cRect.minX, y: cRect.maxY), isCorner: true)
-            handleKnob(at: CGPoint(x: cRect.maxX, y: cRect.maxY), isCorner: true)
+            handleKnob(at: CGPoint(x: cRect.minX, y: cRect.minY))
+            handleKnob(at: CGPoint(x: cRect.maxX, y: cRect.minY))
+            handleKnob(at: CGPoint(x: cRect.minX, y: cRect.maxY))
+            handleKnob(at: CGPoint(x: cRect.maxX, y: cRect.maxY))
             
-            // 상·하·좌·우 변 핸들 4개 (해당 변만 단독 조절)
             handleBar(at: CGPoint(x: cRect.midX, y: cRect.minY), horizontal: true)
             handleBar(at: CGPoint(x: cRect.midX, y: cRect.maxY), horizontal: true)
             handleBar(at: CGPoint(x: cRect.minX, y: cRect.midY), horizontal: false)
@@ -1235,7 +1406,7 @@ struct RedactCropStudioView: View {
         }
     }
     
-    func handleKnob(at pt: CGPoint, isCorner: Bool) -> some View {
+    func handleKnob(at pt: CGPoint) -> some View {
         Circle()
             .fill(Color.yellow)
             .frame(width: 14, height: 14)
@@ -1253,11 +1424,9 @@ struct RedactCropStudioView: View {
             .position(pt)
     }
     
-    // 드래그 제스처 (화면 이동 / Redact / 8방향 Crop 핸들 판정)
     func canvasDragGesture(canvasSize: CGSize) -> some Gesture {
         DragGesture(minimumDistance: 1)
             .onChanged { val in
-                // 1) 화면 이동(Pan) 모드이거나 Option 키를 누른 상태면 캔버스 이동
                 if isPanMode || NSEvent.modifierFlags.contains(.option) {
                     panOffset = CGSize(
                         width: lastPanOffset.width + val.translation.width,
@@ -1266,7 +1435,6 @@ struct RedactCropStudioView: View {
                     return
                 }
                 
-                // 2) 가리기(Redact) 모드
                 if mode == 0 {
                     let s = CGPoint(x: max(0, min(canvasSize.width, val.startLocation.x)),
                                     y: max(0, min(canvasSize.height, val.startLocation.y)))
@@ -1276,7 +1444,6 @@ struct RedactCropStudioView: View {
                     return
                 }
                 
-                // 3) 자르기(Crop) 모드: 8방향 핸들 및 내부 이동 처리
                 if initialCropOnDrag == nil {
                     initialCropOnDrag = cropRect
                     activeCropHandle = detectCropHandle(at: val.startLocation, canvasSize: canvasSize)
@@ -1321,7 +1488,6 @@ struct RedactCropStudioView: View {
                     maxX = minX + w
                     maxY = minY + h
                 case .none:
-                    // 바깥 빈 공간을 드래그하면 새 크롭 영역 지정
                     let sx = max(0, min(1, val.startLocation.x / canvasSize.width))
                     let sy = max(0, min(1, val.startLocation.y / canvasSize.height))
                     let cx = max(0, min(1, val.location.x / canvasSize.width))
@@ -1359,21 +1525,18 @@ struct RedactCropStudioView: View {
             width: cropRect.width * canvasSize.width,
             height: cropRect.height * canvasSize.height
         )
-        let r: CGFloat = 22.0 // 핸들 감지 반경
+        let r: CGFloat = 22.0
         
-        // 1. 모서리 4곳 우선 감지
         if hypot(pt.x - cRect.minX, pt.y - cRect.minY) <= r { return .topLeft }
         if hypot(pt.x - cRect.maxX, pt.y - cRect.minY) <= r { return .topRight }
         if hypot(pt.x - cRect.minX, pt.y - cRect.maxY) <= r { return .bottomLeft }
         if hypot(pt.x - cRect.maxX, pt.y - cRect.maxY) <= r { return .bottomRight }
         
-        // 2. 상·하·좌·우 변 감지
         if abs(pt.y - cRect.minY) <= r && pt.x >= cRect.minX && pt.x <= cRect.maxX { return .top }
         if abs(pt.y - cRect.maxY) <= r && pt.x >= cRect.minX && pt.x <= cRect.maxX { return .bottom }
         if abs(pt.x - cRect.minX) <= r && pt.y >= cRect.minY && pt.y <= cRect.maxY { return .left }
         if abs(pt.x - cRect.maxX) <= r && pt.y >= cRect.minY && pt.y <= cRect.maxY { return .right }
         
-        // 3. 크롭 영역 내부 드래그 -> 박스 이동
         if cRect.contains(pt) { return .moveInside }
         return nil
     }
@@ -1481,7 +1644,7 @@ struct RedactCropStudioView: View {
     }
 }
 
-// MARK: - 9. QuickTime 스타일 비디오 프리뷰 + 프레임(HH:MM:SS:FF) 트림 + 다중 채널(1ch~8ch+) 오디오 스튜디오
+// MARK: - 10. QuickTime 비디오 프리뷰 + 프레임(HH:MM:SS:FF) 트림 + 다중 채널(1ch~8ch+) 오디오 스튜디오
 struct VideoPlayerPreview: NSViewRepresentable {
     let player: AVPlayer
     func makeNSView(context: Context) -> AVPlayerView {
@@ -1508,7 +1671,6 @@ class MultiChannelMediaController: ObservableObject {
     @Published var endTime: Double = 10.0
     @Published var isPlaying: Bool = false
     
-    // 다중 오디오 채널 상태 (1ch ~ 16ch 자동 감지)
     @Published var channelCount: Int = 2
     @Published var channelEnabled: [Bool] = [true, true]
     @Published var soloChannel: Int? = nil
@@ -1537,7 +1699,6 @@ class MultiChannelMediaController: ObservableObject {
             endTime = sec
         }
         
-        // 비디오 FPS 및 오디오 채널 수 정밀 감지
         if let vTrack = asset.tracks(withMediaType: .video).first {
             isVideo = true
             let rate = Double(vTrack.nominalFrameRate)
@@ -1558,7 +1719,6 @@ class MultiChannelMediaController: ObservableObject {
         channelCount = min(16, max(1, detectedChannels))
         channelEnabled = Array(repeating: true, count: channelCount)
         
-        // 오디오 전용 파일인 경우 AVAudioEngine을 구성하여 개별 채널(Ch 1..N) 실시간 뮤트/솔로 청취 지원
         if !isVideo, let af = try? AVAudioFile(forReading: fileURL) {
             self.audioFile = af
             let ch = Int(af.processingFormat.channelCount)
@@ -1643,7 +1803,6 @@ class MultiChannelMediaController: ObservableObject {
         }
     }
     
-    // AVPlayer 비디오 재생 중 오디오 트랙 볼륨/채널 제어
     private func applyPlayerChannelMix() {
         guard let item = player.currentItem else { return }
         let anyActive = (0..<channelCount).contains { isChannelActive($0) }
@@ -1663,7 +1822,6 @@ class MultiChannelMediaController: ObservableObject {
         }
     }
     
-    // 다중 채널(1~8ch+) 오디오 파일에서 원하는 채널만 끄고 켜서 실시간으로 듣는 커스텀 믹서
     private func playMultiChannelAudioEngine(from startSec: Double) {
         guard let af = audioFile else { return }
         audioPlayerNode?.stop()
@@ -1681,7 +1839,6 @@ class MultiChannelMediaController: ObservableObject {
         af.framePosition = startFrame
         try? af.read(into: readBuf, frameCount: frameCount)
         
-        // 출력용 스테레오 버퍼 생성 후 활성화된 채널만 믹싱
         guard let stereoFmt = AVAudioFormat(standardFormatWithSampleRate: sr, channels: 2),
               let outBuf = AVAudioPCMBuffer(pcmFormat: stereoFmt, frameCapacity: frameCount) else { return }
         outBuf.frameLength = readBuf.frameLength
@@ -1702,7 +1859,6 @@ class MultiChannelMediaController: ObservableObject {
             let gain = activeIndices.isEmpty ? 0.0 : (1.0 / Float(max(1, activeIndices.count)))
             for c in activeIndices {
                 let src = inData[c]
-                // 솔로(Solo) 선택 시 양쪽 귀(L/R) 모두에 들려주고, 다중 선택 시 짝수 채널은 L, 홀수 채널은 R로 배분
                 if soloChannel != nil || inChCount == 1 {
                     for i in 0..<len {
                         outData[0][i] += src[i]
@@ -1730,7 +1886,6 @@ class MultiChannelMediaController: ObservableObject {
         self.audioPlayerNode = node
     }
     
-    // 시:분:초:프레임(HH:MM:SS:FF) 포맷 변환
     func formatTimecode(_ sec: Double) -> String {
         let safe = max(0.0, sec)
         let totalSecs = Int(safe)
@@ -1775,7 +1930,6 @@ struct ProMediaStudioView: View {
     @State private var bleepStartRatio: Double = 0.3
     @State private var bleepEndRatio: Double = 0.45
     
-    // 정밀 시:분:초:프레임 입력 필드
     @State private var inH: Int = 0; @State private var inM: Int = 0; @State private var inS: Int = 0; @State private var inF: Int = 0
     @State private var outH: Int = 0; @State private var outM: Int = 0; @State private var outS: Int = 0; @State private var outF: Int = 0
     
@@ -1792,7 +1946,6 @@ struct ProMediaStudioView: View {
     
     var body: some View {
         VStack(spacing: 12) {
-            // 1. 비디오 실시간 모니터 화면 (오디오 파일일 경우 대형 파형 모니터 표시)
             ZStack {
                 RoundedRectangle(cornerRadius: 12).fill(Color.black)
                 if ctrl.isVideo {
@@ -1813,7 +1966,6 @@ struct ProMediaStudioView: View {
                     }
                 }
                 
-                // 우측 상단 실시간 타임코드 오버레이
                 VStack {
                     HStack {
                         Spacer()
@@ -1830,7 +1982,6 @@ struct ProMediaStudioView: View {
             }
             .frame(height: ctrl.isVideo ? 320 : 140)
             
-            // 2. QuickTime 스타일 타임라인 (마우스 클릭/드래그로 재생 위치 스크러빙 + 좌우 노란색 시작/끝 트림 핸들)
             VStack(alignment: .leading, spacing: 6) {
                 HStack {
                     Text("QuickTime 타임라인 (타임라인 클릭/드래그: 장면 이동 | 양끝 노란색 바 드래그: 시작/끝점 조절)")
@@ -1851,11 +2002,9 @@ struct ProMediaStudioView: View {
                     let playX = CGFloat(ctrl.currentTime / max(0.01, ctrl.duration)) * w
                     
                     ZStack(alignment: .leading) {
-                        // 배경 트랙
                         RoundedRectangle(cornerRadius: 8)
                             .fill(Color(white: 0.16))
                         
-                        // 파형 바
                         HStack(spacing: (w / CGFloat(sampleBars.count)) * 0.25) {
                             ForEach(0..<sampleBars.count, id: \.self) { idx in
                                 let t = (Double(idx) / Double(sampleBars.count)) * ctrl.duration
@@ -1867,7 +2016,6 @@ struct ProMediaStudioView: View {
                         }
                         .padding(.horizontal, 6)
                         
-                        // 트림 제외 구간 어둡게 처리
                         Rectangle()
                             .fill(Color.black.opacity(0.6))
                             .frame(width: max(0, startX), height: h)
@@ -1877,13 +2025,11 @@ struct ProMediaStudioView: View {
                             .frame(width: max(0, w - endX), height: h)
                             .offset(x: endX)
                         
-                        // QuickTime 스타일 노란색 트림 박스 테두리
                         RoundedRectangle(cornerRadius: 6)
                             .stroke(Color.yellow, lineWidth: 3)
                             .frame(width: max(10, endX - startX), height: h - 2)
                             .offset(x: startX)
                         
-                        // 좌측 시작점(In) 노란색 핸들
                         ZStack {
                             RoundedRectangle(cornerRadius: 4).fill(Color.yellow).frame(width: 14, height: h)
                             Rectangle().fill(Color.black).frame(width: 2, height: 18)
@@ -1899,7 +2045,6 @@ struct ProMediaStudioView: View {
                                 }
                         )
                         
-                        // 우측 종료점(Out) 노란색 핸들
                         ZStack {
                             RoundedRectangle(cornerRadius: 4).fill(Color.yellow).frame(width: 14, height: h)
                             Rectangle().fill(Color.black).frame(width: 2, height: 18)
@@ -1915,7 +2060,6 @@ struct ProMediaStudioView: View {
                                 }
                         )
                         
-                        // 빨간색 재생 헤드(Playhead)
                         ZStack {
                             Rectangle().fill(Color.red).frame(width: 2.5, height: h + 6)
                             Circle().fill(Color.red).frame(width: 11, height: 11).offset(y: -h / 2)
@@ -1934,9 +2078,7 @@ struct ProMediaStudioView: View {
                 .frame(height: 68)
             }
             
-            // 3. 재생 컨트롤 및 시:분:초:프레임(HH:MM:SS:FF) 정밀 입력 패널
             HStack(spacing: 14) {
-                // 재생 & 1프레임 이동 컨트롤
                 HStack(spacing: 6) {
                     Button(action: { ctrl.stepFrames(-1) }) { Image(systemName: "backward.frame.fill") }
                         .help("1프레임 뒤로")
@@ -1962,7 +2104,6 @@ struct ProMediaStudioView: View {
                 
                 Divider().frame(height: 28)
                 
-                // 시작 지점 (시:분:초:프레임)
                 timecodeStepperBox(
                     label: "시작(In)",
                     h: $inH, m: $inM, s: $inS, f: $inF,
@@ -1980,7 +2121,6 @@ struct ProMediaStudioView: View {
                     }
                 )
                 
-                // 종료 지점 (시:분:초:프레임)
                 timecodeStepperBox(
                     label: "종료(Out)",
                     h: $outH, m: $outM, s: $outS, f: $outF,
@@ -2001,7 +2141,6 @@ struct ProMediaStudioView: View {
             .padding(10)
             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
             
-            // 4. 다중 오디오 채널 (1ch ~ 8ch+) 개별 On/Off 및 Solo 청취 믹서
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
                     Text("🎛️ 다중 오디오 채널 믹서 (총 \(ctrl.channelCount)채널 감지됨 — 원하는 채널만 켜서 듣거나 내보낼 수 있습니다)")
@@ -2027,7 +2166,6 @@ struct ProMediaStudioView: View {
                                     .foregroundColor(isOn ? .primary : .secondary)
                                 
                                 HStack(spacing: 6) {
-                                    // 채널 켜기/끄기 버튼
                                     Button(action: {
                                         ctrl.soloChannel = nil
                                         if chIdx < ctrl.channelEnabled.count {
@@ -2041,7 +2179,6 @@ struct ProMediaStudioView: View {
                                     .buttonStyle(.borderedProminent)
                                     .tint(isOn ? .green : .gray)
                                     
-                                    // 해당 채널만 단독으로 듣기 (Solo)
                                     Button(action: {
                                         if ctrl.soloChannel == chIdx {
                                             ctrl.soloChannel = nil
@@ -2067,7 +2204,6 @@ struct ProMediaStudioView: View {
             .padding(10)
             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
             
-            // 5. 부가 옵션 및 내보내기 버튼
             HStack(spacing: 18) {
                 HStack(spacing: 6) {
                     Text("볼륨").font(.caption)
@@ -2142,7 +2278,6 @@ struct ProMediaStudioView: View {
         let outURL = FileProcessor.uniqueOutputURL(for: fileURL, newExt: fileURL.pathExtension, suffix: "_trimmed")
         let jobTitle = "트림 편집: \(fileURL.lastPathComponent)"
         
-        // 활성화된 채널 목록 확인
         var activeChannels: [Int] = []
         for idx in 0..<ctrl.channelCount {
             if ctrl.isChannelActive(idx) { activeChannels.append(idx) }
@@ -2151,7 +2286,6 @@ struct ProMediaStudioView: View {
         if FileProcessor.ffmpegPath != nil {
             var filters: [String] = ["volume=\(volumePercent / 100.0)"]
             
-            // 특정 채널만 켜진 경우 FFmpeg pan 필터로 선택된 채널만 추출/믹싱
             if activeChannels.count > 0 && activeChannels.count < ctrl.channelCount {
                 if activeChannels.count == 1 {
                     let ch = activeChannels[0]
@@ -2216,7 +2350,7 @@ struct ProMediaStudioView: View {
     }
 }
 
-// MARK: - 10. 배경 추가 창 (Add BG)
+// MARK: - 11. 배경 추가 창 (Add BG)
 struct AddBGView: View {
     let fileURL: URL
     @State private var selectedPreset = 0
@@ -2299,46 +2433,116 @@ struct AddBGView: View {
     }
 }
 
-// MARK: - 11. 압축 도구 창 (진행률 % 연동)
+// MARK: - 12. 압축 도구 창 (실시간 예상 저장 용량 & 절감률 % 안내 포함)
 struct CompressToolView: View {
     let files: [URL]
     @State private var quality: Double = 65.0
+    @State private var origBytes: Int64 = 0
+    @State private var estBytes: Int64 = 0
     
     var body: some View {
-        VStack(spacing: 18) {
+        VStack(spacing: 16) {
             Text("Compress \(files.count) File(s)").font(.headline)
-            Text("목표 품질: \(Int(quality))% (낮을수록 파일 크기가 줄어듭니다)").font(.caption)
-            Slider(value: $quality, in: 10...95).tint(.orange).padding(.horizontal)
             
-            Button("압축 실행") {
-                for f in files {
-                    let ext = f.pathExtension.lowercased()
-                    if ["jpg", "jpeg", "png", "heic", "tiff", "bmp"].contains(ext),
-                       let cg = FileProcessor.loadRawCGImage(from: f) {
-                        let out = FileProcessor.uniqueOutputURL(for: f, newExt: "jpg", suffix: "_compressed")
-                        FileProcessor.saveCGImage(cg, to: out, formatExt: "jpg", quality: quality / 100.0)
-                        FileProcessor.showToast("이미지 압축 완료: \(out.lastPathComponent)")
-                    } else if FileProcessor.ffmpegPath != nil {
-                        let out = FileProcessor.uniqueOutputURL(for: f, newExt: ext, suffix: "_compressed")
-                        let crf = Int(40.0 - (quality / 100.0) * 20.0)
-                        let dur = FileProcessor.mediaDurationSeconds(for: f)
-                        FileProcessor.runFFmpegWithProgress(args: ["-y", "-i", f.path, "-vcodec", "libx264", "-crf", "\(crf)", out.path], totalDuration: dur, jobTitle: "압축: \(f.lastPathComponent)") { _ in
-                            FileProcessor.showToast("미디어 압축 완료: \(out.lastPathComponent)")
-                        }
-                    } else {
-                        let out = FileProcessor.uniqueOutputURL(for: f, newExt: "mp4", suffix: "_compressed")
-                        FileProcessor.avAssetConvertWithProgress(file: f, to: "mp4", outURL: out, jobTitle: "압축: \(f.lastPathComponent)")
-                    }
+            // 원본 용량 vs 예상 저장 용량 비교 카드
+            HStack(spacing: 18) {
+                VStack(spacing: 4) {
+                    Text("원본 크기").font(.caption).foregroundColor(.secondary)
+                    Text(ByteCountFormatter.string(fromByteCount: origBytes, countStyle: .file))
+                        .font(.system(size: 16, weight: .bold, design: .rounded))
                 }
-                NSApp.keyWindow?.close()
+                
+                Image(systemName: "arrow.right.circle.fill")
+                    .font(.title2)
+                    .foregroundColor(.orange)
+                
+                VStack(spacing: 4) {
+                    Text("예상 저장 크기").font(.caption).foregroundColor(.orange)
+                    Text("~" + ByteCountFormatter.string(fromByteCount: estBytes, countStyle: .file))
+                        .font(.system(size: 18, weight: .heavy, design: .rounded))
+                        .foregroundColor(.orange)
+                }
+                
+                if origBytes > 0 {
+                    let savedRatio = max(0, Int(((1.0 - Double(estBytes) / Double(origBytes)) * 100.0).rounded()))
+                    Text("-\(savedRatio)% 절감")
+                        .font(.system(size: 12, weight: .bold, design: .rounded))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background(Color.green, in: Capsule())
+                }
             }
-            .buttonStyle(.borderedProminent)
-            .tint(.orange)
-        }.padding(24)
+            .padding(14)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+            
+            VStack(spacing: 6) {
+                HStack {
+                    Text("압축 품질 설정: \(Int(quality))%")
+                        .font(.caption.bold())
+                    Spacer()
+                    Text("낮을수록 파일 크기가 더 많이 줄어듭니다")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+                Slider(value: $quality, in: 10...95)
+                    .tint(.orange)
+                    .onChange(of: quality) { _ in recalculateEstimate() }
+            }
+            .padding(.horizontal, 8)
+            
+            HStack {
+                Button("취소") { NSApp.keyWindow?.close() }
+                Spacer()
+                Button("압축 실행 및 저장") {
+                    runCompression()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.orange)
+            }
+            .padding(.horizontal, 8)
+        }
+        .padding(22)
+        .onAppear { recalculateEstimate() }
+    }
+    
+    func recalculateEstimate() {
+        let q = quality
+        let targetFiles = files
+        DispatchQueue.global(qos: .userInteractive).async {
+            let res = FileSizeEstimator.estimateCompressedBytes(files: targetFiles, quality: q)
+            DispatchQueue.main.async {
+                self.origBytes = res.original
+                self.estBytes = res.estimated
+            }
+        }
+    }
+    
+    func runCompression() {
+        for f in files {
+            let ext = f.pathExtension.lowercased()
+            if ["jpg", "jpeg", "png", "heic", "tiff", "bmp", "webp"].contains(ext),
+               let cg = FileProcessor.loadRawCGImage(from: f) {
+                let out = FileProcessor.uniqueOutputURL(for: f, newExt: "jpg", suffix: "_compressed")
+                FileProcessor.saveCGImage(cg, to: out, formatExt: "jpg", quality: quality / 100.0)
+                FileProcessor.showToast("이미지 압축 완료: \(out.lastPathComponent)")
+            } else if FileProcessor.ffmpegPath != nil {
+                let out = FileProcessor.uniqueOutputURL(for: f, newExt: ext, suffix: "_compressed")
+                let crf = Int(40.0 - (quality / 100.0) * 20.0)
+                let dur = FileProcessor.mediaDurationSeconds(for: f)
+                FileProcessor.runFFmpegWithProgress(args: ["-y", "-i", f.path, "-vcodec", "libx264", "-crf", "\(crf)", out.path], totalDuration: dur, jobTitle: "압축: \(f.lastPathComponent)") { _ in
+                    FileProcessor.showToast("미디어 압축 완료: \(out.lastPathComponent)")
+                }
+            } else {
+                let out = FileProcessor.uniqueOutputURL(for: f, newExt: "mp4", suffix: "_compressed")
+                FileProcessor.avAssetConvertWithProgress(file: f, to: "mp4", outURL: out, jobTitle: "압축: \(f.lastPathComponent)")
+            }
+        }
+        NSApp.keyWindow?.close()
     }
 }
 
-// MARK: - 12. 메타데이터 확인 및 삭제 창
+// MARK: - 13. 메타데이터 확인 및 삭제 창
 struct MetadataToolView: View {
     let fileURL: URL
     @State private var metaDict: [String: String] = [:]
@@ -2380,11 +2584,16 @@ struct MetadataToolView: View {
     }
 }
 
-// MARK: - 13. 앱 델리게이트 & 메뉴바 실시간 진행률(%) 표시기
+// MARK: - 14. 앱 델리게이트 & 실제 파일 드래그 세션 정밀 판별기 (빈 화면 드래그 오작동 완벽 차단)
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var wheelPanel: NSPanel!
     var wheelCenterPoint: NSPoint = .zero
+    
+    // 마우스 클릭 시점의 드래그 보드 카운트를 추적하여 실제 파일 드래그만 통과시킴
+    var dragCountAtMouseDown: Int = -1
+    var activeSessionDragCount: Int = -1
+    var isCurrentMouseStrokeValidFileDrag: Bool = false
     
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -2414,7 +2623,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "🍊 MyTangerine 3.0 Pro", action: nil, keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "🍊 MyTangerine 3.5 Pro", action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         
         if jobs.isEmpty {
@@ -2443,7 +2652,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     
     func setupWheelPanel() {
         wheelPanel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 340, height: 340),
+            contentRect: NSRect(x: 0, y: 0, width: 356, height: 356),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -2457,9 +2666,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
     
     func startGlobalMonitors() {
+        let dragPboard = NSPasteboard(name: .drag)
+        dragCountAtMouseDown = dragPboard.changeCount
+        
+        // 1. 마우스 버튼을 누르는 순간의 드래그 보드 번호를 기록 (이전 잔여 데이터와 구분)
+        NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown]) { [weak self] _ in
+            guard let self = self else { return }
+            self.dragCountAtMouseDown = NSPasteboard(name: .drag).changeCount
+            self.isCurrentMouseStrokeValidFileDrag = false
+        }
+        
+        // 2. 드래그 이동 및 보조키(Shift/Option/Control) 감지
         NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDragged, .flagsChanged]) { [weak self] event in
             self?.handleDragOrFlags(event: event)
         }
+        
+        // 3. 마우스 버튼을 뗄 때 처리
         NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseUp]) { [weak self] _ in
             self?.handleMouseUp()
         }
@@ -2472,20 +2694,38 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let controlPressed = flags.contains(.control)
         
         let wantsWheel = shiftPressed || controlPressed
-        let mousePressed = NSEvent.pressedMouseButtons & 1 != 0
+        let mousePressed = (NSEvent.pressedMouseButtons & 1) != 0
         
         guard mousePressed && wantsWheel else {
             if AppState.shared.isDragging { hideWheel() }
             return
         }
         
+        // 현재 마우스 스트로크에서 실제로 '새로운 파일 드래그 세션'이 발생했는지 검증
+        let dragPboard = NSPasteboard(name: .drag)
+        let currentChangeCount = dragPboard.changeCount
+        
+        if !isCurrentMouseStrokeValidFileDrag {
+            // 마우스를 누른 이후 NSPasteboard.Name.drag의 changeCount가 증가했을 때만 실제 드래그로 인정!
+            guard currentChangeCount != dragCountAtMouseDown,
+                  currentChangeCount != activeSessionDragCount else {
+                return
+            }
+            let files = readValidDraggedFiles(from: dragPboard)
+            guard !files.isEmpty else { return }
+            
+            isCurrentMouseStrokeValidFileDrag = true
+            activeSessionDragCount = currentChangeCount
+            AppState.shared.draggedFiles = files
+            let bytes = calculateTotalBytes(files: files)
+            AppState.shared.totalBytes = bytes
+            AppState.shared.totalSizeText = ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+        }
+        
         let newMode: WheelMode = controlPressed ? .actions : (optionPressed && shiftPressed ? .tools : .convert)
         
         if !AppState.shared.isDragging {
-            let files = readDraggedFiles()
-            guard !files.isEmpty else { return }
-            AppState.shared.draggedFiles = files
-            AppState.shared.totalSizeText = calculateSizeText(files: files)
+            guard isCurrentMouseStrokeValidFileDrag, !AppState.shared.draggedFiles.isEmpty else { return }
             AppState.shared.wheelMode = newMode
             AppState.shared.updateItems()
             showWheel(at: NSEvent.mouseLocation)
@@ -2497,12 +2737,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         updateHoveredSlice(mouseLocation: NSEvent.mouseLocation)
     }
     
-    func readDraggedFiles() -> [URL] {
-        let pboard = NSPasteboard(name: .drag)
-        return (pboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? []
+    // 드래그 보드에서 실제 디스크에 존재하는 로컬 파일 URL만 엄격하게 필터링
+    func readValidDraggedFiles(from pboard: NSPasteboard) -> [URL] {
+        guard let types = pboard.types,
+              types.contains(.fileURL) || types.contains(NSPasteboard.PasteboardType("NSFilenamesPboardType")) else {
+            return []
+        }
+        guard let urls = pboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] else {
+            return []
+        }
+        return urls.filter { $0.isFileURL && FileManager.default.fileExists(atPath: $0.path) }
     }
     
-    func calculateSizeText(files: [URL]) -> String {
+    func calculateTotalBytes(files: [URL]) -> Int64 {
         var total: Int64 = 0
         for f in files {
             if let attrs = try? FileManager.default.attributesOfItem(atPath: f.path),
@@ -2510,14 +2757,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 total += sz
             }
         }
-        return ByteCountFormatter.string(fromByteCount: total, countStyle: .file)
+        return total
     }
     
     func showWheel(at point: NSPoint) {
         wheelCenterPoint = point
         AppState.shared.isDragging = true
         AppState.shared.hoveredIndex = nil
-        wheelPanel.setFrameOrigin(NSPoint(x: point.x - 170, y: point.y - 170))
+        wheelPanel.setFrameOrigin(NSPoint(x: point.x - 178, y: point.y - 178))
         wheelPanel.orderFrontRegardless()
     }
     
@@ -2532,7 +2779,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let dy = mouseLocation.y - wheelCenterPoint.y
         let dist = hypot(dx, dy)
         
-        guard dist > 45 && dist < 190 else {
+        guard dist > 48 && dist < 195 else {
             AppState.shared.hoveredIndex = nil
             return
         }
@@ -2548,6 +2795,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
     
     func handleMouseUp() {
+        isCurrentMouseStrokeValidFileDrag = false
         guard AppState.shared.isDragging else { return }
         let selectedIdx = AppState.shared.hoveredIndex
         let files = AppState.shared.draggedFiles
