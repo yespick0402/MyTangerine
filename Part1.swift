@@ -23,11 +23,9 @@ class ShortcutSettings: ObservableObject {
     @Published var actionsFlagsRaw: UInt {
         didSet { UserDefaults.standard.set(Int(actionsFlagsRaw), forKey: "tangerine_sc_actions_v44") }
     }
-    // 변환 시 퀄리티(1~100%) 선택 창을 띄우는 추가 키 (기본값: Command)
     @Published var qualityModifierRaw: UInt {
         didSet { UserDefaults.standard.set(Int(qualityModifierRaw), forKey: "tangerine_sc_quality_v44") }
     }
-    // false = 누르고 있는 동안 활성화(Hold), true = 한 번 누르면 켜지고 다시 누르면 꺼짐(Toggle)
     @Published var isToggleMode: Bool {
         didSet { UserDefaults.standard.set(isToggleMode, forKey: "tangerine_sc_toggle_mode_v44") }
     }
@@ -89,7 +87,6 @@ class ShortcutSettings: ObservableObject {
     }
     
     func matchWheelMode(for flags: NSEvent.ModifierFlags) -> WheelMode? {
-        // 퀄리티 보조키(예: Command)가 함께 눌려 있어도 휠 모드 판정이 깨지지 않도록 분리 후 매칭
         var clean = flags.intersection([.shift, .option, .control, .command])
         guard !clean.isEmpty else { return nil }
         
@@ -98,7 +95,6 @@ class ShortcutSettings: ObservableObject {
         if clean == aFlags { return .actions }
         if clean == cFlags { return .convert }
         
-        // 퀄리티 키를 제외한 나머지 플래그로도 검사 (예: Shift + Command -> Shift(Convert) + Command(Quality))
         let withoutQuality = clean.subtracting(qFlags)
         if !withoutQuality.isEmpty {
             if withoutQuality == tFlags { return .tools }
@@ -216,7 +212,7 @@ class AppState: ObservableObject {
     static let shared = AppState()
     @Published var isDragging = false
     @Published var wheelMode: WheelMode = .convert
-    @Published var isQualityOptionActive: Bool = false // Command 키 등을 눌러 1~100% 퀄리티 선택 모드가 켜졌는지 여부
+    @Published var isQualityOptionActive: Bool = false
     @Published var draggedFiles: [URL] = []
     @Published var totalBytes: Int64 = 0
     @Published var totalSizeText: String = ""
@@ -336,7 +332,7 @@ class AppState: ObservableObject {
     }
 }
 
-// MARK: - 3. 변환 및 압축 파일 예상 크기 계산 엔진 (퀄리티 1~100% 반영)
+// MARK: - 3. 변환 및 압축 파일 예상 크기 계산 엔진
 class FileSizeEstimator {
     static func estimateConversionBytes(files: [URL], originalTotalBytes: Int64, targetExt: String, qualityPercent: Double = 90.0) -> Int64 {
         guard let first = files.first, originalTotalBytes > 0 else { return 0 }
@@ -353,11 +349,11 @@ class FileSizeEstimator {
             if totalDuration > 0 {
                 switch tgt {
                 case "mp3", "m4a", "aac", "caf", "ogg":
-                    let kbps = 64.0 + 256.0 * qFactor // 64kbps ~ 320kbps
+                    let kbps = 64.0 + 256.0 * qFactor
                     return max(4096, Int64(totalDuration * (kbps * 1000.0 / 8.0)))
                 case "wav", "aiff": return max(8192, Int64(totalDuration * 176_400))
                 case "flac": return max(8192, Int64(totalDuration * 96_000))
-                case "gif": return max(10_240, Int64(totalDuration * 380_000 * qFactor))
+                case "gif": return max(10_240, Int64(totalDuration * 260_000 * qFactor))
                 case "mp4", "mov", "mkv":
                     if qualityPercent >= 99.5 { return originalTotalBytes }
                     let baseRatio: Double = (srcExt == "mov") ? 0.68 : 0.88
@@ -420,10 +416,7 @@ class FileSizeEstimator {
         for (index, f) in files.enumerated() {
             let fSize = (try? FileManager.default.attributesOfItem(atPath: f.path)[.size] as? Int64) ?? 0
             origTotal += fSize
-            if quality >= 99.5 {
-                estTotal += fSize
-                continue
-            }
+            if quality >= 99.5 { estTotal += fSize; continue }
             let ext = f.pathExtension.lowercased()
             if ["jpg", "jpeg", "png", "heic", "tiff", "bmp", "webp"].contains(ext) {
                 if index == 0, let cg = FileProcessor.loadRawCGImage(from: f) {
@@ -444,7 +437,7 @@ class FileSizeEstimator {
     }
 }
 
-// MARK: - 4. 파일 처리, 1~100% 퀄리티 변환 및 메타데이터 보존 엔진
+// MARK: - 4. 파일 처리, 순정 애니메이션 GIF 생성 및 메타데이터 보존 엔진
 class FileProcessor {
     static func customAppIconImage() -> NSImage? {
         if let path = Bundle.main.path(forResource: "icon", ofType: "png"), let img = NSImage(contentsOfFile: path) { return img }
@@ -555,7 +548,79 @@ class FileProcessor {
             let sr = af.processingFormat.sampleRate
             if sr > 0 { return Double(af.length) / sr }
         }
-        return 15.0
+        return 10.0
+    }
+    
+    // MARK: 핵심 해결 — Apple 순정 AVAssetImageGenerator + ImageIO를 사용하여 100% 표준 규격의 움직이는 GIF 생성 (손상된 파일 오류 원천 해결!)
+    static func convertVideoToAnimatedGIFNative(file: URL, outURL: URL, qualityPercent: Double) {
+        let jobTitle = "\(file.lastPathComponent) → GIF"
+        let jobID = JobProgressManager.shared.startJob(title: jobTitle)
+        
+        Task {
+            let asset = AVURLAsset(url: file)
+            var durationSec: Double = 5.0
+            if let cmDur = try? await asset.load(.duration) {
+                let s = CMTimeGetSeconds(cmDur)
+                if s.isFinite && s > 0 { durationSec = s }
+            }
+            
+            // 퀄리티(1~100%)에 따라 FPS(8~15fps)와 최대 해상도(360px ~ 960px) 결정
+            let qRatio = max(0.1, min(1.0, qualityPercent / 100.0))
+            let fps: Double = qualityPercent >= 85 ? 12.0 : (qualityPercent >= 50 ? 10.0 : 8.0)
+            let maxDimension: CGFloat = CGFloat(320.0 + 640.0 * qRatio)
+            let totalFrames = max(2, min(360, Int((durationSec * fps).rounded())))
+            let frameDelay = 1.0 / fps
+            
+            let generator = AVAssetImageGenerator(asset: asset)
+            generator.appliesPreferredTrackTransform = true
+            generator.maximumSize = CGSize(width: maxDimension, height: maxDimension)
+            generator.requestedTimeToleranceBefore = CMTime(seconds: 0.04, preferredTimescale: 600)
+            generator.requestedTimeToleranceAfter = CMTime(seconds: 0.04, preferredTimescale: 600)
+            
+            guard let dest = CGImageDestinationCreateWithURL(outURL as CFURL, UTType.gif.identifier as CFString, totalFrames, nil) else {
+                JobProgressManager.shared.finishJob(id: jobID)
+                showToast("GIF 생성기를 초기화할 수 없습니다.")
+                return
+            }
+            
+            // 무한 반복(Loop = 0) GIF 헤더 설정
+            let fileProps: [CFString: Any] = [
+                kCGImagePropertyGIFDictionary: [
+                    kCGImagePropertyGIFLoopCount: 0
+                ]
+            ]
+            CGImageDestinationSetProperties(dest, fileProps as CFDictionary)
+            
+            let frameProps: [CFString: Any] = [
+                kCGImagePropertyGIFDictionary: [
+                    kCGImagePropertyGIFDelayTime: frameDelay,
+                    kCGImagePropertyGIFUnclampedDelayTime: frameDelay
+                ]
+            ]
+            
+            var addedCount = 0
+            for i in 0..<totalFrames {
+                let sec = min(durationSec - 0.01, Double(i) * frameDelay)
+                let cmTime = CMTime(seconds: max(0.0, sec), preferredTimescale: 600)
+                if let cgImg = try? generator.copyCGImage(at: cmTime, actualTime: nil) {
+                    CGImageDestinationAddImage(dest, cgImg, frameProps as CFDictionary)
+                    addedCount += 1
+                }
+                let prog = Double(i + 1) / Double(totalFrames)
+                JobProgressManager.shared.updateJob(id: jobID, progress: prog)
+            }
+            
+            let ok = addedCount > 0 && CGImageDestinationFinalize(dest)
+            JobProgressManager.shared.finishJob(id: jobID)
+            
+            if ok {
+                preserveFileDates(from: file, to: outURL)
+                showToast("움직이는 GIF 변환 완료: \(outURL.lastPathComponent)")
+            } else {
+                try? FileManager.default.removeItem(at: outURL)
+                showToast("GIF 변환에 실패했습니다.")
+            }
+        }
     }
     
     static func runFFmpegWithProgress(args: [String], totalDuration: Double, jobTitle: String, completion: @escaping (Bool) -> Void) {
@@ -648,7 +713,6 @@ class FileProcessor {
             showToast("사본 생성 완료!"); return
         }
         
-        // 파일 변환(conv_*) 시 Command 키 등을 누르고 드롭했다면 1~100% 퀄리티 지정 팝업창 호출!
         if actionKey.hasPrefix("conv_") {
             let targetExt = actionKey.replacingOccurrences(of: "conv_", with: "")
             if openQualityPopup && !["zip", "targz"].contains(targetExt) {
@@ -666,7 +730,6 @@ class FileProcessor {
         }
     }
     
-    // qualityPercent (1.0 ~ 100.0): 100% 선택 시 원본 퀄리티 그대로 무손실/최고화질 변환
     static func convertFile(_ file: URL, to ext: String, qualityPercent: Double = 92.0) {
         if ext == "zip" {
             let out = uniqueOutputURL(for: file, newExt: "zip")
@@ -682,6 +745,13 @@ class FileProcessor {
                 preserveFileDates(from: file, to: out)
                 showToast("TAR.GZ 압축 완료: \(out.lastPathComponent)")
             }
+            return
+        }
+        
+        // 영상을 GIF로 변환 요청한 경우 Apple 순정 애니메이션 GIF 엔진으로 즉시 처리!
+        if ext == "gif" {
+            let out = uniqueOutputURL(for: file, newExt: "gif")
+            convertVideoToAnimatedGIFNative(file: file, outURL: out, qualityPercent: qualityPercent)
             return
         }
         
@@ -726,11 +796,14 @@ class FileProcessor {
     
     static func convertMediaHybrid(_ file: URL, to ext: String, qualityPercent: Double = 92.0) {
         let out = uniqueOutputURL(for: file, newExt: ext)
+        if ext == "gif" {
+            convertVideoToAnimatedGIFNative(file: file, outURL: out, qualityPercent: qualityPercent)
+            return
+        }
         let duration = mediaDurationSeconds(for: file)
         let qInt = Int(qualityPercent.rounded())
         let jobTitle = "\(file.lastPathComponent) → \(ext.uppercased()) (\(qInt)%)"
         
-        // 100%면 CRF 0 (무손실 원본 화질) 및 320k 최고 음질 적용
         let crf = qualityPercent >= 99.5 ? 0 : Int((42.0 - (qualityPercent / 100.0) * 24.0).rounded())
         let audioBitrateK = Int((64.0 + (qualityPercent / 100.0) * 256.0).rounded())
         
@@ -740,9 +813,6 @@ class FileProcessor {
                 args += ["-movflags", "use_metadata_tags", "-c:v", "libx264", "-preset", "fast", "-crf", "\(crf)", "-c:a", "aac", "-b:a", "\(audioBitrateK)k", "-pix_fmt", "yuv420p", out.path]
             } else if ext == "mov" {
                 args += ["-movflags", "use_metadata_tags", "-c:v", "libx264", "-crf", "\(crf)", "-c:a", "aac", "-b:a", "\(audioBitrateK)k", out.path]
-            } else if ext == "gif" {
-                let scaleW = Int(320.0 + (qualityPercent / 100.0) * 480.0)
-                args += ["-vf", "fps=12,scale=\(scaleW):-1:flags=lanczos", out.path]
             } else if ext == "mp3" {
                 args += ["-vn", "-c:a", "libmp3lame", "-b:a", "\(audioBitrateK)k", out.path]
             } else if ext == "m4a" {
@@ -755,7 +825,7 @@ class FileProcessor {
                 args.append(out.path)
             }
             runFFmpegWithProgress(args: args, totalDuration: duration, jobTitle: jobTitle) { ok in
-                if ok && FileManager.default.fileExists(atPath: out.path) {
+                if ok && FileManager.default.fileExists(atPath: out.path) && ((try? FileManager.default.attributesOfItem(atPath: out.path)[.size] as? Int64) ?? 0) > 256 {
                     preserveFileDates(from: file, to: out)
                     showToast("\(ext.uppercased()) 변환 완료 (\(qInt)%): \(out.lastPathComponent)")
                 } else {
@@ -769,6 +839,10 @@ class FileProcessor {
     }
     
     static func avAssetConvertWithProgress(file: URL, to ext: String, outURL: URL, jobTitle: String) {
+        if ext == "gif" {
+            convertVideoToAnimatedGIFNative(file: file, outURL: outURL, qualityPercent: 90.0)
+            return
+        }
         let asset = AVURLAsset(url: file)
         let isAudioOnly = ["m4a", "mp3", "wav", "aiff", "flac", "caf"].contains(ext)
         let preset = isAudioOnly ? AVAssetExportPresetAppleM4A : AVAssetExportPresetHighestQuality
@@ -778,7 +852,7 @@ class FileProcessor {
         var targetURL = outURL
         if isAudioOnly { targetURL = uniqueOutputURL(for: file, newExt: "m4a"); exporter.outputFileType = .m4a }
         else if ext == "mp4" { exporter.outputFileType = .mp4 }
-        else { exporter.outputFileType = .mov }
+        else { targetURL = uniqueOutputURL(for: file, newExt: "mov"); exporter.outputFileType = .mov }
         exporter.outputURL = targetURL
         
         let jobID = JobProgressManager.shared.startJob(title: jobTitle)
@@ -912,7 +986,7 @@ class FileProcessor {
     }
 }
 
-// MARK: - 5. 마우스 휠 확대/축소 감지 뷰 및 완벽한 원형 다이얼 휠 UI (테두리 잘림 완벽 해결)
+// MARK: - 5. 마우스 휠 확대/축소 감지 뷰 및 원형 다이얼 휠 UI
 struct ScrollWheelCatcher: NSViewRepresentable {
     var onScroll: (CGFloat) -> Void
     func makeNSView(context: Context) -> ScrollWheelNSView {
@@ -944,7 +1018,7 @@ struct PieSliceShape: Shape {
 struct RadialWheelView: View {
     @ObservedObject var state = AppState.shared
     let wheelSize: CGFloat = 316
-    let containerSize: CGFloat = 440 // 넉넉한 여백(62pt)을 두어 그림자와 바깥 원형 테두리가 절대 잘리지 않도록 설계
+    let containerSize: CGFloat = 440
     
     var body: some View {
         ZStack {
@@ -1023,7 +1097,7 @@ struct RadialWheelView: View {
     }
 }
 
-// MARK: - 6. 도구 창 매니저 및 단축키(홀드/토글) + 파일명 변환 양식 설정 창
+// MARK: - 6. 도구 창 매니저 및 설정 창
 class ToolWindowManager {
     static let shared = ToolWindowManager()
     var activeWindows: [NSWindow] = []
@@ -1083,7 +1157,7 @@ class ToolWindowManager {
         openWindow(title: "File Metadata", view: MetadataToolView(fileURL: url), size: NSSize(width: 560, height: 520))
     }
     func showMediaStudioWindow(url: URL, initialTab: String) {
-        openWindow(title: "QuickTime & Multi-Channel Studio — \(url.lastPathComponent)", view: ProMediaStudioView(fileURL: url, initialMode: initialTab), size: NSSize(width: 1060, height: 800), minSize: NSSize(width: 900, height: 680))
+        openWindow(title: "QuickTime & Multi-Channel Studio — \(url.lastPathComponent)", view: ProMediaStudioView(fileURL: url, initialMode: initialTab), size: NSSize(width: 1080, height: 830), minSize: NSSize(width: 920, height: 700))
     }
 }
 
@@ -1110,8 +1184,8 @@ struct HelpAndSettingsView: View {
                     Image(systemName: "circle.hexagongrid.fill").font(.system(size: 36)).foregroundColor(.orange)
                 }
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("MyTangerine 4.4 Pro").font(.system(size: 20, weight: .heavy, design: .rounded))
-                    Text("1~100% 퀄리티 변환 · 홀드/토글 작동 모드 · 촬영일자 이름 일괄변환").font(.caption).foregroundColor(.secondary)
+                    Text("MyTangerine 4.5 Pro").font(.system(size: 20, weight: .heavy, design: .rounded))
+                    Text("순정 애니메이션 GIF 엔진 · 20배 확대 정밀 트림 · 홀드/토글 작동 모드").font(.caption).foregroundColor(.secondary)
                 }
                 Spacer()
                 Picker("", selection: $selectedTab) {
@@ -1152,7 +1226,6 @@ struct HelpAndSettingsView: View {
     var shortcutRecorderTab: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                // 1) 홀드(누르고 있는 동안) vs 토글(버튼식 한 번 눌러 켜고 끄기) 설정 카드
                 VStack(alignment: .leading, spacing: 10) {
                     Text("1. 파일 드래그 시 휠 활성화 방식 선택").font(.headline).foregroundColor(.orange)
                     Picker("작동 방식", selection: $settings.isToggleMode) {
@@ -1170,7 +1243,6 @@ struct HelpAndSettingsView: View {
                 .padding(14)
                 .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
                 
-                // 2) 단축키 직접 입력 설정
                 VStack(alignment: .leading, spacing: 6) {
                     Text("2. 원형 휠 및 퀄리티 옵션 단축키 설정").font(.headline).foregroundColor(.orange)
                     Text("바꾸고 싶은 기능의 [단축키 입력하기] 버튼을 누른 뒤, 키보드에서 원하는 키를 누르고 마우스로 [완료]를 클릭하세요.")
@@ -1325,14 +1397,14 @@ struct HelpAndSettingsView: View {
     var usageGuideTab: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                guideCard(icon: "dial.high.fill", title: "1. 파일 변환 시 1~100% 퀄리티 선택 기능", items: [
+                guideCard(icon: "dial.high.fill", title: "1. 파일 변환 시 1~100% 퀄리티 선택 기능 & 순정 GIF 변환", items: [
                     "파일 드래그 중 Shift를 눌러 변환(CONVERT) 휠을 띄운 뒤, 그냥 놓으면 즉시 변환됩니다.",
-                    "변환 휠에서 ⌘ Command 키를 함께 누른 채로 원하는 확장자(예: JPG, WEBP, MP4 등)에 놓으면 1~100% 퀄리티 설정 창이 열립니다.",
-                    "100%로 설정하면 원본 파일과 동일한 최고 퀄리티(무손실)로 저장되며, 슬라이더를 조절할 때마다 예상 용량을 실시간으로 보여줍니다."
+                    "변환 휠에서 ⌘ Command 키를 함께 누른 채로 확장자(JPG, WEBP, GIF, MP4 등)에 놓으면 1~100% 퀄리티 설정 창이 열립니다.",
+                    "영상을 GIF로 변환할 때는 Apple 순정 애니메이션 GIF 엔진이 작동하여 깨짐 없이 미리보기/사파리에서 완벽히 열리는 GIF를 생성합니다."
                 ])
-                guideCard(icon: "hand.tap.fill", title: "2. 홀드(Hold) vs 토글(Toggle) 작동 모드", items: [
-                    "누르고 있는 동안 켜기(Hold): 단축키를 누르고 있는 동안 휠이 유지됩니다.",
-                    "한 번 눌러 켜고 끄기(Toggle): 드래그 중 단축키를 한 번만 톡 누르면 키에서 손을 떼도 휠이 계속 떠 있어 손가락이 편합니다."
+                guideCard(icon: "scissors", title: "2. 타임라인 20배 확대/축소 정밀 트림 기능", items: [
+                    "트림(TRIM) 창에서 타임라인 위쪽의 확대 슬라이더(1x ~ 20x)를 조절하거나 타임라인 위에서 마우스 휠을 굴리면 타임라인이 최대 20배까지 확대됩니다.",
+                    "[🎯 트림 구간만 꽉 차게 확대] 버튼을 누르면 현재 선택된 시작~끝 구간만 화면에 큼직하게 확대되어 1프레임 단위로 미세 조정이 가능합니다."
                 ])
                 guideCard(icon: "character.cursor.ibeam", title: "3. 촬영일자 파일명 일괄 변환 (RENAME)", items: [
                     "사진이나 영상을 잡고 TOOLS 또는 ACTIONS 휠의 [RENAME]에 놓으면 EXIF 촬영일시를 읽어 '20261011_170535__DSC3015.JPG' 형태로 일괄 변경합니다."
