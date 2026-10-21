@@ -636,7 +636,7 @@ struct RedactCropStudioView: View {
     }
 }
 
-// MARK: - 10. QuickTime 비디오 프리뷰 + 트림 구간 내 재생 잠금 + 다중 채널 사운드 스튜디오
+// MARK: - 10. QuickTime 비디오 프리뷰 + 20배 확대/축소 정밀 트림 타임라인 + 다중 채널 사운드 스튜디오
 struct VideoPlayerPreview: NSViewRepresentable {
     let player: AVPlayer
     func makeNSView(context: Context) -> AVPlayerView {
@@ -862,16 +862,19 @@ struct ProMediaStudioView: View {
     @State private var inH: Int = 0; @State private var inM: Int = 0; @State private var inS: Int = 0; @State private var inF: Int = 0
     @State private var outH: Int = 0; @State private var outM: Int = 0; @State private var outS: Int = 0; @State private var outF: Int = 0
     
-    let sampleBars: [CGFloat] = (0..<90).map { i in
+    // 타임라인 확대/축소(Zoom 1x ~ 20x) 상태
+    @State private var timelineZoom: CGFloat = 1.0
+    
+    let sampleBars: [CGFloat] = (0..<240).map { i in
         let d = Double(i)
-        return CGFloat(abs(sin(d * 0.31) * cos(d * 0.17)) * 0.78 + 0.18)
+        return CGFloat(abs(sin(d * 0.29) * cos(d * 0.13)) * 0.78 + 0.18)
     }
     init(fileURL: URL, initialMode: String) {
         self.fileURL = fileURL; self.initialMode = initialMode
         _ctrl = StateObject(wrappedValue: MultiChannelMediaController(url: fileURL))
     }
     var body: some View {
-        VStack(spacing: 12) {
+        VStack(spacing: 10) {
             ZStack {
                 RoundedRectangle(cornerRadius: 12).fill(Color.black)
                 if ctrl.isVideo {
@@ -885,7 +888,7 @@ struct ProMediaStudioView: View {
                 }
                 VStack {
                     HStack {
-                        Text("🔒 트림 구간 내 재생 잠금 활성화됨 (트림 바깥 구간은 재생되지 않습니다)")
+                        Text("🔒 트림 구간 내 재생 잠금 활성화됨")
                             .font(.system(size: 11, weight: .semibold)).foregroundColor(.white)
                             .padding(.horizontal, 10).padding(.vertical, 5).background(Color.orange.opacity(0.85), in: Capsule())
                         Spacer()
@@ -895,68 +898,139 @@ struct ProMediaStudioView: View {
                     }.padding(10)
                     Spacer()
                 }
-            }.frame(height: ctrl.isVideo ? 320 : 140)
+            }.frame(height: ctrl.isVideo ? 300 : 130)
             
+            // MARK: 타임라인 1x ~ 20x 확대/축소 컨트롤 바 및 스크롤 가능 정밀 타임라인
             VStack(alignment: .leading, spacing: 6) {
-                HStack {
-                    Text("QuickTime 타임라인 (노란색 트림 구간 안에서만 재생 헤드가 이동하며 시작점과 끝점을 정확히 확인합니다)")
-                        .font(.caption.bold()).foregroundColor(.secondary)
+                HStack(spacing: 10) {
+                    Image(systemName: "magnifyingglass.circle.fill").foregroundColor(.orange)
+                    Text("타임라인 확대/축소:")
+                        .font(.caption.bold())
+                    Button(action: { timelineZoom = max(1.0, timelineZoom - 1.0) }) { Image(systemName: "minus.magnifyingglass") }
+                    Slider(value: $timelineZoom, in: 1.0...20.0)
+                        .frame(width: 140)
+                        .tint(.orange)
+                    Button(action: { timelineZoom = min(20.0, timelineZoom + 1.0) }) { Image(systemName: "plus.magnifyingglass") }
+                    Text(String(format: "%.1fx", timelineZoom))
+                        .font(.caption.monospacedDigit().bold())
+                        .foregroundColor(.orange)
+                        .frame(width: 38)
+                    
+                    Button("🎯 트림 구간만 확대") {
+                        let trimLen = max(0.2, ctrl.endTime - ctrl.startTime)
+                        let targetZoom = min(20.0, max(1.5, CGFloat(ctrl.duration / trimLen) * 0.85))
+                        withAnimation(.easeOut(duration: 0.15)) { timelineZoom = targetZoom }
+                    }.font(.caption)
+                    
+                    Button("1x 전체보기") {
+                        withAnimation(.easeOut(duration: 0.15)) { timelineZoom = 1.0 }
+                    }.font(.caption)
+                    
                     Spacer()
-                    Text("트림 구간 길이: \(ctrl.formatTimecode(max(0, ctrl.endTime - ctrl.startTime)))")
+                    Text("트림 길이: \(ctrl.formatTimecode(max(0, ctrl.endTime - ctrl.startTime)))")
                         .font(.caption.monospacedDigit().bold()).foregroundColor(.orange)
                 }
-                GeometryReader { geo in
-                    let w = max(100, geo.size.width); let h = geo.size.height
-                    let startX = CGFloat(ctrl.startTime / max(0.01, ctrl.duration)) * w
-                    let endX = CGFloat(ctrl.endTime / max(0.01, ctrl.duration)) * w
-                    let playX = CGFloat(ctrl.currentTime / max(0.01, ctrl.duration)) * w
-                    ZStack(alignment: .leading) {
-                        RoundedRectangle(cornerRadius: 8).fill(Color(white: 0.16))
-                        HStack(spacing: (w / CGFloat(sampleBars.count)) * 0.25) {
-                            ForEach(0..<sampleBars.count, id: \.self) { idx in
-                                let t = (Double(idx) / Double(sampleBars.count)) * ctrl.duration
-                                let inTrim = (t >= ctrl.startTime && t <= ctrl.endTime)
-                                Capsule().fill(inTrim ? Color.orange.opacity(0.88) : Color.gray.opacity(0.22))
-                                    .frame(width: max(2, (w / CGFloat(sampleBars.count)) * 0.65), height: (h - 16) * sampleBars[idx])
-                            }
-                        }.padding(.horizontal, 6)
+                
+                GeometryReader { outerGeo in
+                    let baseW = max(200, outerGeo.size.width)
+                    let totalW = baseW * timelineZoom
+                    let h: CGFloat = 74
+                    let visibleBars = min(sampleBars.count, max(80, Int(85.0 * timelineZoom)))
+                    let tickCount = max(5, min(60, Int(5.0 * timelineZoom)))
+                    
+                    ScrollView(.horizontal, showsIndicators: true) {
+                        let startX = CGFloat(ctrl.startTime / max(0.01, ctrl.duration)) * totalW
+                        let endX = CGFloat(ctrl.endTime / max(0.01, ctrl.duration)) * totalW
+                        let playX = CGFloat(ctrl.currentTime / max(0.01, ctrl.duration)) * totalW
                         
-                        Rectangle().fill(Color.black.opacity(0.72)).frame(width: max(0, startX), height: h)
-                        Rectangle().fill(Color.black.opacity(0.72)).frame(width: max(0, w - endX), height: h).offset(x: endX)
-                        RoundedRectangle(cornerRadius: 6).stroke(Color.yellow, lineWidth: 3).frame(width: max(10, endX - startX), height: h - 2).offset(x: startX)
-                        
-                        ZStack {
-                            RoundedRectangle(cornerRadius: 4).fill(Color.yellow).frame(width: 14, height: h)
-                            Rectangle().fill(Color.black).frame(width: 2, height: 18)
-                        }.position(x: max(7, startX), y: h / 2).gesture(
-                            DragGesture().onChanged { val in
-                                ctrl.pause()
-                                let sec = Double(val.location.x / w) * ctrl.duration
-                                ctrl.startTime = max(0.0, min(ctrl.endTime - (1.0 / ctrl.fps), sec))
-                                ctrl.seek(to: ctrl.startTime); syncTimecodeFields()
+                        ZStack(alignment: .leading) {
+                            RoundedRectangle(cornerRadius: 8).fill(Color(white: 0.15))
+                            
+                            // 상단 시간 눈금자(Time Ruler) 표시
+                            VStack {
+                                HStack(spacing: 0) {
+                                    ForEach(0..<tickCount, id: \.self) { tIdx in
+                                        let tSec = (Double(tIdx) / Double(tickCount)) * ctrl.duration
+                                        HStack(spacing: 2) {
+                                            Rectangle().fill(Color.white.opacity(0.35)).frame(width: 1, height: 8)
+                                            Text(ctrl.formatTimecode(tSec))
+                                                .font(.system(size: 8.5, design: .monospaced))
+                                                .foregroundColor(.white.opacity(0.55))
+                                            Spacer()
+                                        }
+                                        .frame(width: totalW / CGFloat(tickCount))
+                                    }
+                                }
+                                Spacer()
                             }
-                        )
-                        ZStack {
-                            RoundedRectangle(cornerRadius: 4).fill(Color.yellow).frame(width: 14, height: h)
-                            Rectangle().fill(Color.black).frame(width: 2, height: 18)
-                        }.position(x: min(w - 7, endX), y: h / 2).gesture(
-                            DragGesture().onChanged { val in
-                                ctrl.pause()
-                                let sec = Double(val.location.x / w) * ctrl.duration
-                                ctrl.endTime = min(ctrl.duration, max(ctrl.startTime + (1.0 / ctrl.fps), sec))
-                                ctrl.seek(to: ctrl.endTime); syncTimecodeFields()
+                            .padding(.top, 2)
+                            
+                            // 확대 배율에 맞춰 촘촘해지는 오디오 파형 바
+                            HStack(spacing: (totalW / CGFloat(visibleBars)) * 0.25) {
+                                ForEach(0..<visibleBars, id: \.self) { idx in
+                                    let t = (Double(idx) / Double(visibleBars)) * ctrl.duration
+                                    let inTrim = (t >= ctrl.startTime && t <= ctrl.endTime)
+                                    let barSample = sampleBars[idx % sampleBars.count]
+                                    Capsule().fill(inTrim ? Color.orange.opacity(0.88) : Color.gray.opacity(0.22))
+                                        .frame(width: max(2, (totalW / CGFloat(visibleBars)) * 0.65), height: (h - 24) * barSample)
+                                }
                             }
-                        )
-                        ZStack {
-                            Rectangle().fill(Color.red).frame(width: 2.5, height: h + 6)
-                            Circle().fill(Color.red).frame(width: 11, height: 11).offset(y: -h / 2)
-                        }.position(x: playX, y: h / 2)
+                            .padding(.horizontal, 6)
+                            .offset(y: 6)
+                            
+                            // 트림 제외 구간 어둡게 마스킹
+                            Rectangle().fill(Color.black.opacity(0.72)).frame(width: max(0, startX), height: h)
+                            Rectangle().fill(Color.black.opacity(0.72)).frame(width: max(0, totalW - endX), height: h).offset(x: endX)
+                            
+                            // 노란색 트림 박스 테두리
+                            RoundedRectangle(cornerRadius: 6).stroke(Color.yellow, lineWidth: 3)
+                                .frame(width: max(10, endX - startX), height: h - 2).offset(x: startX)
+                            
+                            // 좌측 시작점(In) 핸들
+                            ZStack {
+                                RoundedRectangle(cornerRadius: 4).fill(Color.yellow).frame(width: 14, height: h)
+                                Rectangle().fill(Color.black).frame(width: 2, height: 18)
+                            }.position(x: max(7, startX), y: h / 2).gesture(
+                                DragGesture().onChanged { val in
+                                    ctrl.pause()
+                                    let sec = Double(val.location.x / totalW) * ctrl.duration
+                                    ctrl.startTime = max(0.0, min(ctrl.endTime - (1.0 / ctrl.fps), sec))
+                                    ctrl.seek(to: ctrl.startTime); syncTimecodeFields()
+                                }
+                            )
+                            
+                            // 우측 종료점(Out) 핸들
+                            ZStack {
+                                RoundedRectangle(cornerRadius: 4).fill(Color.yellow).frame(width: 14, height: h)
+                                Rectangle().fill(Color.black).frame(width: 2, height: 18)
+                            }.position(x: min(totalW - 7, endX), y: h / 2).gesture(
+                                DragGesture().onChanged { val in
+                                    ctrl.pause()
+                                    let sec = Double(val.location.x / totalW) * ctrl.duration
+                                    ctrl.endTime = min(ctrl.duration, max(ctrl.startTime + (1.0 / ctrl.fps), sec))
+                                    ctrl.seek(to: ctrl.endTime); syncTimecodeFields()
+                                }
+                            )
+                            
+                            // 빨간색 재생 헤드(Playhead)
+                            ZStack {
+                                Rectangle().fill(Color.red).frame(width: 2.5, height: h + 6)
+                                Circle().fill(Color.red).frame(width: 11, height: 11).offset(y: -h / 2)
+                            }.position(x: playX, y: h / 2)
+                        }
+                        .frame(width: totalW, height: h)
+                        .contentShape(Rectangle())
+                        .gesture(DragGesture(minimumDistance: 0).onChanged { val in
+                            ctrl.seek(to: Double(max(0, min(totalW, val.location.x)) / totalW) * ctrl.duration)
+                        })
                     }
-                    .contentShape(Rectangle())
-                    .gesture(DragGesture(minimumDistance: 0).onChanged { val in
-                        ctrl.seek(to: Double(max(0, min(w, val.location.x)) / w) * ctrl.duration)
-                    })
-                }.frame(height: 68)
+                    .overlay(
+                        ScrollWheelCatcher { delta in
+                            timelineZoom = min(20.0, max(1.0, timelineZoom + delta * 0.04))
+                        }
+                        .allowsHitTesting(false)
+                    )
+                }.frame(height: 88)
             }
             
             HStack(spacing: 14) {
@@ -1351,7 +1425,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "🍊 MyTangerine 4.4 Pro", action: nil, keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "🍊 MyTangerine 4.5 Pro", action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         if jobs.isEmpty {
             menu.addItem(NSMenuItem(title: "대기 중 (현재 진행 중인 변환 작업 없음)", action: nil, keyEquivalent: ""))
@@ -1375,7 +1449,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func openHelpAndSettings() { ToolWindowManager.shared.showHelpAndSettingsWindow() }
     @objc func quitApp() { NSApp.terminate(nil) }
     
-    // MARK: 핵심 1 — 창 크기를 440x440으로 넉넉히 넓히고 시스템 사각 그림자(hasShadow = false)를 꺼서 팔각형 테두리 잘림 현상을 완벽히 해결!
     func setupWheelPanel() {
         let size = NSRect(x: 0, y: 0, width: 440, height: 440)
         wheelPanel = NSPanel(contentRect: size, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
@@ -1427,12 +1500,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 let isToggle = ShortcutSettings.shared.isToggleMode
                 
                 if type == .flagsChanged {
-                    // 키가 새로 눌린 시점(Rising Edge)인지 확인
                     let newlyPressed = !rawFlags.subtracting(mySelf.previousRawFlags).isEmpty
                     mySelf.previousRawFlags = rawFlags
                     
                     if isToggle {
-                        // [토글 방식]: 단축키를 한 번 누르면 켜지고, 같은 모드 키를 다시 한 번 누르면 꺼짐!
                         if newlyPressed, let m = matched {
                             DispatchQueue.main.async {
                                 if AppState.shared.isDragging && AppState.shared.wheelMode == m && !qualityPressed {
@@ -1449,7 +1520,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                             return nil
                         }
                     } else {
-                        // [홀드 방식]: 누르고 있는 동안만 켜지고 손을 떼면 꺼짐
                         if let m = matched {
                             DispatchQueue.main.async {
                                 mySelf.activateOrSwitchWheelFromTap(mode: m, mouseLocation: NSEvent.mouseLocation)
@@ -1612,7 +1682,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         wheelCenterPoint = point
         AppState.shared.isDragging = true
         AppState.shared.hoveredIndex = nil
-        // 440x440 크기의 정중앙(220)에 마우스 포인터가 오도록 배치
         wheelPanel.setFrameOrigin(NSPoint(x: point.x - 220, y: point.y - 220))
         wheelPanel.orderFrontRegardless()
     }
