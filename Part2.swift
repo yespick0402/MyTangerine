@@ -861,8 +861,6 @@ struct ProMediaStudioView: View {
     @State private var enableBleep: Bool = false
     @State private var inH: Int = 0; @State private var inM: Int = 0; @State private var inS: Int = 0; @State private var inF: Int = 0
     @State private var outH: Int = 0; @State private var outM: Int = 0; @State private var outS: Int = 0; @State private var outF: Int = 0
-    
-    // 타임라인 확대/축소(Zoom 1x ~ 20x) 상태
     @State private var timelineZoom: CGFloat = 1.0
     
     let sampleBars: [CGFloat] = (0..<240).map { i in
@@ -900,21 +898,14 @@ struct ProMediaStudioView: View {
                 }
             }.frame(height: ctrl.isVideo ? 300 : 130)
             
-            // MARK: 타임라인 1x ~ 20x 확대/축소 컨트롤 바 및 스크롤 가능 정밀 타임라인
             VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 10) {
                     Image(systemName: "magnifyingglass.circle.fill").foregroundColor(.orange)
-                    Text("타임라인 확대/축소:")
-                        .font(.caption.bold())
+                    Text("타임라인 확대/축소:").font(.caption.bold())
                     Button(action: { timelineZoom = max(1.0, timelineZoom - 1.0) }) { Image(systemName: "minus.magnifyingglass") }
-                    Slider(value: $timelineZoom, in: 1.0...20.0)
-                        .frame(width: 140)
-                        .tint(.orange)
+                    Slider(value: $timelineZoom, in: 1.0...20.0).frame(width: 140).tint(.orange)
                     Button(action: { timelineZoom = min(20.0, timelineZoom + 1.0) }) { Image(systemName: "plus.magnifyingglass") }
-                    Text(String(format: "%.1fx", timelineZoom))
-                        .font(.caption.monospacedDigit().bold())
-                        .foregroundColor(.orange)
-                        .frame(width: 38)
+                    Text(String(format: "%.1fx", timelineZoom)).font(.caption.monospacedDigit().bold()).foregroundColor(.orange).frame(width: 38)
                     
                     Button("🎯 트림 구간만 확대") {
                         let trimLen = max(0.2, ctrl.endTime - ctrl.startTime)
@@ -946,7 +937,6 @@ struct ProMediaStudioView: View {
                         ZStack(alignment: .leading) {
                             RoundedRectangle(cornerRadius: 8).fill(Color(white: 0.15))
                             
-                            // 상단 시간 눈금자(Time Ruler) 표시
                             VStack {
                                 HStack(spacing: 0) {
                                     ForEach(0..<tickCount, id: \.self) { tIdx in
@@ -965,7 +955,6 @@ struct ProMediaStudioView: View {
                             }
                             .padding(.top, 2)
                             
-                            // 확대 배율에 맞춰 촘촘해지는 오디오 파형 바
                             HStack(spacing: (totalW / CGFloat(visibleBars)) * 0.25) {
                                 ForEach(0..<visibleBars, id: \.self) { idx in
                                     let t = (Double(idx) / Double(visibleBars)) * ctrl.duration
@@ -978,15 +967,12 @@ struct ProMediaStudioView: View {
                             .padding(.horizontal, 6)
                             .offset(y: 6)
                             
-                            // 트림 제외 구간 어둡게 마스킹
                             Rectangle().fill(Color.black.opacity(0.72)).frame(width: max(0, startX), height: h)
                             Rectangle().fill(Color.black.opacity(0.72)).frame(width: max(0, totalW - endX), height: h).offset(x: endX)
                             
-                            // 노란색 트림 박스 테두리
                             RoundedRectangle(cornerRadius: 6).stroke(Color.yellow, lineWidth: 3)
                                 .frame(width: max(10, endX - startX), height: h - 2).offset(x: startX)
                             
-                            // 좌측 시작점(In) 핸들
                             ZStack {
                                 RoundedRectangle(cornerRadius: 4).fill(Color.yellow).frame(width: 14, height: h)
                                 Rectangle().fill(Color.black).frame(width: 2, height: 18)
@@ -999,7 +985,6 @@ struct ProMediaStudioView: View {
                                 }
                             )
                             
-                            // 우측 종료점(Out) 핸들
                             ZStack {
                                 RoundedRectangle(cornerRadius: 4).fill(Color.yellow).frame(width: 14, height: h)
                                 Rectangle().fill(Color.black).frame(width: 2, height: 18)
@@ -1012,7 +997,6 @@ struct ProMediaStudioView: View {
                                 }
                             )
                             
-                            // 빨간색 재생 헤드(Playhead)
                             ZStack {
                                 Rectangle().fill(Color.red).frame(width: 2.5, height: h + 6)
                                 Circle().fill(Color.red).frame(width: 11, height: 11).offset(y: -h / 2)
@@ -1369,13 +1353,12 @@ struct MetadataToolView: View {
     }
 }
 
-// MARK: - 12. 앱 델리게이트 & 무결점 원형 창(hasShadow = false) & 홀드/토글 엔진
+// MARK: - 12. 앱 델리게이트 & 한 번의 파일 드래그 중 3가지 휠(CONVERT / TOOLS / ACTIONS) 무한 전환 엔진
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var wheelPanel: NSPanel!
     var wheelCenterPoint: NSPoint = .zero
     var dragCountAtMouseDown: Int = -1
-    var activeSessionDragCount: Int = -1
     var isCurrentMouseStrokeValidFileDrag: Bool = false
     var eventTap: CFMachPort?
     var isSyntheticMouseUp: Bool = false
@@ -1425,7 +1408,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "🍊 MyTangerine 4.5 Pro", action: nil, keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "🍊 MyTangerine 4.6 Pro", action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         if jobs.isEmpty {
             menu.addItem(NSMenuItem(title: "대기 중 (현재 진행 중인 변환 작업 없음)", action: nil, keyEquivalent: ""))
@@ -1461,6 +1444,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         wheelPanel.contentView = NSHostingView(rootView: RadialWheelView())
     }
     
+    // MARK: 핵심 — 드래그 중 키를 추가(Shift -> Shift+Option)하거나 다 떼고 다른 키(Control)를 눌러도 끊김 없이 3가지 휠이 즉시 전환되도록 처리!
     func setupHIDEventTapToBlockFinderOptionCopy() {
         let mask = (1 << CGEventType.leftMouseDown.rawValue) |
                    (1 << CGEventType.leftMouseUp.rawValue) |
@@ -1476,6 +1460,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 return Unmanaged.passUnretained(event)
             }
             
+            // 새 마우스 클릭 시작 시점에만 이전 드래그 세션을 초기화
             if type == .leftMouseDown {
                 mySelf.dragCountAtMouseDown = NSPasteboard(name: .drag).changeCount
                 mySelf.isCurrentMouseStrokeValidFileDrag = false
@@ -1504,11 +1489,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     mySelf.previousRawFlags = rawFlags
                     
                     if isToggle {
-                        if newlyPressed, let m = matched {
-                            DispatchQueue.main.async {
-                                if AppState.shared.isDragging && AppState.shared.wheelMode == m && !qualityPressed {
-                                    mySelf.hideWheel()
-                                } else {
+                        // [토글 방식]: 단축키를 누를 때마다 해당 휠로 전환되거나 같은 휠이면 꺼짐
+                        if let m = matched {
+                            if newlyPressed {
+                                DispatchQueue.main.async {
+                                    if AppState.shared.isDragging && AppState.shared.wheelMode == m && !qualityPressed {
+                                        mySelf.hideWheel()
+                                    } else {
+                                        mySelf.activateOrSwitchWheelFromTap(mode: m, mouseLocation: NSEvent.mouseLocation)
+                                    }
+                                }
+                            } else if AppState.shared.isDragging && AppState.shared.wheelMode != m {
+                                // 예: Shift+Option에서 Option만 떼어 Shift가 된 경우 CONVERT로 자연스럽게 전환
+                                DispatchQueue.main.async {
                                     mySelf.activateOrSwitchWheelFromTap(mode: m, mouseLocation: NSEvent.mouseLocation)
                                 }
                             }
@@ -1520,6 +1513,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                             return nil
                         }
                     } else {
+                        // [홀드 방식]:
+                        // 1) Shift 누름 -> CONVERT 휠
+                        // 2) Option 추가(Shift+Option) -> TOOLS 휠로 즉시 전환
+                        // 3) 모든 키를 다 뗌 -> 일단 휠 숨김 (하지만 드래그 파일 세션은 유지!)
+                        // 4) 드래그 유지한 채 Control 누름 -> ACTIONS 휠 즉시 재등장!
                         if let m = matched {
                             DispatchQueue.main.async {
                                 mySelf.activateOrSwitchWheelFromTap(mode: m, mouseLocation: NSEvent.mouseLocation)
@@ -1564,6 +1562,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     }
                     mySelf.cancelFinderDragAndReleaseMouseCleanly(at: dropLocation)
                     return nil
+                } else {
+                    mySelf.isCurrentMouseStrokeValidFileDrag = false
                 }
             }
             
@@ -1609,22 +1609,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
     
+    // MARK: 핵심 2 — 한 번 파일 드래그로 확인된 세션(isCurrentMouseStrokeValidFileDrag == true)은 마우스를 놓을 때까지 계속 유효하므로, 중간에 키를 다 떼었다가 다른 키를 눌러도 즉시 휠이 다시 나타남!
     func activateOrSwitchWheelFromTap(mode: WheelMode, mouseLocation: NSPoint) {
-        let dragPboard = NSPasteboard(name: .drag)
-        let currentChangeCount = dragPboard.changeCount
         if !isCurrentMouseStrokeValidFileDrag {
-            guard currentChangeCount != dragCountAtMouseDown, currentChangeCount != activeSessionDragCount else { return }
+            let dragPboard = NSPasteboard(name: .drag)
+            let currentChangeCount = dragPboard.changeCount
+            guard currentChangeCount != dragCountAtMouseDown else { return }
             let files = readValidDraggedFiles(from: dragPboard)
             guard !files.isEmpty else { return }
+            
             isCurrentMouseStrokeValidFileDrag = true
-            activeSessionDragCount = currentChangeCount
             AppState.shared.draggedFiles = files
             let bytes = calculateTotalBytes(files: files)
             AppState.shared.totalBytes = bytes
             AppState.shared.totalSizeText = ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
         }
+        
+        guard isCurrentMouseStrokeValidFileDrag, !AppState.shared.draggedFiles.isEmpty else { return }
+        
         if !AppState.shared.isDragging {
-            guard isCurrentMouseStrokeValidFileDrag, !AppState.shared.draggedFiles.isEmpty else { return }
             AppState.shared.wheelMode = mode
             AppState.shared.updateItems()
             showWheel(at: mouseLocation)
@@ -1650,6 +1653,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self = self else { return }
             if AppState.shared.isDragging {
                 self.handleMouseUp(openQualityPopup: AppState.shared.isQualityOptionActive)
+            } else {
+                self.isCurrentMouseStrokeValidFileDrag = false
             }
         }
     }
@@ -1658,6 +1663,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let mousePressed = (NSEvent.pressedMouseButtons & 1) != 0
         guard mousePressed else {
             if AppState.shared.isDragging { hideWheel() }
+            isCurrentMouseStrokeValidFileDrag = false
             return
         }
         if AppState.shared.isDragging {
