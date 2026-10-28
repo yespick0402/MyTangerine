@@ -69,9 +69,7 @@ struct ConvertQualityPopupView: View {
                 Button("취소") { NSApp.keyWindow?.close() }
                 Spacer()
                 Button("\(Int(quality.rounded()))% 퀄리티로 \(targetExt.uppercased()) 변환 저장") {
-                    for f in files {
-                        FileProcessor.convertFile(f, to: targetExt, qualityPercent: quality)
-                    }
+                    FileProcessor.batchConvertFiles(files, to: targetExt, qualityPercent: quality)
                     NSApp.keyWindow?.close()
                 }
                 .buttonStyle(.borderedProminent).tint(.orange)
@@ -80,7 +78,8 @@ struct ConvertQualityPopupView: View {
         }
         .padding(22)
         .onAppear {
-            origBytes = files.reduce(0) { $0 + ((try? FileManager.default.attributesOfItem(atPath: $1.path)[.size] as? Int64) ?? 0) }
+            origBytes = AppState.shared.totalBytes > 0 ? AppState.shared.totalBytes :
+                files.prefix(200).reduce(0) { $0 + ((try? FileManager.default.attributesOfItem(atPath: $1.path)[.size] as? Int64) ?? 0) }
             recalculate()
         }
     }
@@ -1290,26 +1289,35 @@ struct CompressToolView: View {
         }
     }
     func runCompression() {
-        for f in files {
-            let ext = f.pathExtension.lowercased()
-            if ["jpg", "jpeg", "png", "heic", "tiff", "bmp", "webp"].contains(ext), let cg = FileProcessor.loadRawCGImage(from: f) {
-                let out = FileProcessor.uniqueOutputURL(for: f, newExt: "jpg", suffix: "_compressed")
-                FileProcessor.saveCGImage(cg, to: out, formatExt: "jpg", quality: quality / 100.0, sourceURLForMetadata: f)
-                FileProcessor.showToast("이미지 압축 완료 (메타데이터 유지됨): \(out.lastPathComponent)")
-            } else if FileProcessor.ffmpegPath != nil {
-                let out = FileProcessor.uniqueOutputURL(for: f, newExt: ext, suffix: "_compressed")
-                let crf = quality >= 99.5 ? 0 : Int(40.0 - (quality / 100.0) * 22.0)
-                let dur = FileProcessor.mediaDurationSeconds(for: f)
-                FileProcessor.runFFmpegWithProgress(args: ["-y", "-i", f.path, "-map_metadata", "0", "-movflags", "use_metadata_tags", "-vcodec", "libx264", "-crf", "\(crf)", out.path], totalDuration: dur, jobTitle: "압축: \(f.lastPathComponent)") { _ in
-                    FileProcessor.preserveFileDates(from: f, to: out)
-                    FileProcessor.showToast("미디어 압축 완료 (메타데이터 유지됨): \(out.lastPathComponent)")
-                }
-            } else {
-                let out = FileProcessor.uniqueOutputURL(for: f, newExt: "mp4", suffix: "_compressed")
-                FileProcessor.avAssetConvertWithProgress(file: f, to: "mp4", outURL: out, jobTitle: "압축: \(f.lastPathComponent)")
-            }
-        }
+        let targetFiles = files
+        let q = quality
         NSApp.keyWindow?.close()
+        
+        let jobID = JobProgressManager.shared.startJob(title: "파일 압축 (\(targetFiles.count)개)")
+        DispatchQueue.global(qos: .userInitiated).async {
+            for (idx, f) in targetFiles.enumerated() {
+                autoreleasepool {
+                    let ext = f.pathExtension.lowercased()
+                    if ["jpg", "jpeg", "png", "heic", "tiff", "bmp", "webp"].contains(ext), let cg = FileProcessor.loadRawCGImage(from: f) {
+                        let out = FileProcessor.uniqueOutputURL(for: f, newExt: "jpg", suffix: "_compressed")
+                        FileProcessor.saveCGImage(cg, to: out, formatExt: "jpg", quality: q / 100.0, sourceURLForMetadata: f)
+                    } else if FileProcessor.ffmpegPath != nil {
+                        let out = FileProcessor.uniqueOutputURL(for: f, newExt: ext, suffix: "_compressed")
+                        let crf = q >= 99.5 ? 0 : Int(40.0 - (q / 100.0) * 22.0)
+                        let dur = FileProcessor.mediaDurationSeconds(for: f)
+                        FileProcessor.runFFmpegWithProgress(args: ["-y", "-i", f.path, "-map_metadata", "0", "-movflags", "use_metadata_tags", "-vcodec", "libx264", "-crf", "\(crf)", out.path], totalDuration: dur, jobTitle: "압축: \(f.lastPathComponent)") { _ in
+                            FileProcessor.preserveFileDates(from: f, to: out)
+                        }
+                    } else {
+                        let out = FileProcessor.uniqueOutputURL(for: f, newExt: "mp4", suffix: "_compressed")
+                        FileProcessor.avAssetConvertWithProgress(file: f, to: "mp4", outURL: out, jobTitle: "압축: \(f.lastPathComponent)")
+                    }
+                }
+                JobProgressManager.shared.updateJob(id: jobID, progress: Double(idx + 1) / Double(targetFiles.count))
+            }
+            JobProgressManager.shared.finishJob(id: jobID)
+            FileProcessor.showToast("총 \(targetFiles.count)개 파일 압축 완료 (메타데이터 유지됨)!")
+        }
     }
 }
 
@@ -1346,14 +1354,14 @@ struct MetadataToolView: View {
         metaDict["📌 감지된 촬영일시"] = df.string(from: info.date)
         if !info.camera.isEmpty { metaDict["📷 감지된 카메라"] = info.camera }
         
-        if let src = CGImageSourceCreateWithURL(fileURL as CFURL, nil),
+        if let src = CGImageSourceCreateWithURL(fileURL as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
            let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [String: Any] {
             for (k, v) in props { metaDict[k] = "\(v)" }
         }
     }
 }
 
-// MARK: - 12. 초경량·무간섭 앱 델리게이트 (다중 선택/단축키 충돌 완벽 해결 + 파인더 포커스 복구 + 리소스 95% 절감)
+// MARK: - 12. 초경량·대용량(2,000개+) 무누락 앱 델리게이트
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var wheelPanel: NSPanel?
@@ -1367,7 +1375,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var previousRawFlags: NSEvent.ModifierFlags = []
     
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // 백그라운드 유틸리티의 불필요한 타이머 깨움을 묶어 배터리 소모 최소화
         ProcessInfo.processInfo.automaticTerminationSupportEnabled = false
         NSApp.setActivationPolicy(.accessory)
         applyPureTransparentCustomIconToAppBundle()
@@ -1379,7 +1386,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         updateStatusBarMenu()
         JobProgressManager.shared.onUpdate = { [weak self] in self?.updateStatusBarMenu() }
         
-        // 중복 모니터(NSEvent.addGlobalMonitor)를 제거하고 초경량 단일 EventTap만 구동하여 CPU 사용량 0.0% 달성
         setupUltraLightEventTap()
     }
     
@@ -1412,7 +1418,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "🍊 MyTangerine 4.7 Pro (Apple Silicon 저전력 최적화)", action: nil, keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "🍊 MyTangerine 4.8 Pro (대용량 초고속 최적화)", action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         if jobs.isEmpty {
             menu.addItem(NSMenuItem(title: "대기 중 (현재 진행 중인 변환 작업 없음)", action: nil, keyEquivalent: ""))
@@ -1436,7 +1442,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func openHelpAndSettings() { ToolWindowManager.shared.showHelpAndSettingsWindow() }
     @objc func quitApp() { NSApp.terminate(nil) }
     
-    // 휠이 실제로 필요할 때만 지연 생성(Lazy Init)하고, 닫힐 때는 SwiftUI 뷰 트리를 비워 GPU/배터리 소모를 0으로 만듦
     func ensureWheelPanel() -> NSPanel {
         if let existing = wheelPanel { return existing }
         let size = NSRect(x: 0, y: 0, width: 440, height: 440)
@@ -1451,7 +1456,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return panel
     }
     
-    // MARK: 핵심 해결 — 실제 파일 아이콘이 드래그되기 전(단순 클릭, Shift+클릭 다중선택, 빈 공간 드래그 선택 등)에는 키보드/마우스 이벤트를 단 1비트도 건드리지 않고 100% 그대로 통과시킴!
     func setupUltraLightEventTap() {
         let mask = (1 << CGEventType.leftMouseDown.rawValue) |
                    (1 << CGEventType.leftMouseUp.rawValue) |
@@ -1467,7 +1471,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 return Unmanaged.passUnretained(event)
             }
             
-            // 1) 마우스 버튼을 누르는 순간: 현재 드래그 보드 번호만 기록하고 이벤트는 절대 건드리지 않음 (Shift+클릭 다중 선택 100% 정상 작동 보장!)
             if type == .leftMouseDown {
                 mySelf.dragCountAtMouseDown = mySelf.dragPboard.changeCount
                 mySelf.isCurrentMouseStrokeValidFileDrag = false
@@ -1475,7 +1478,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 return Unmanaged.passUnretained(event)
             }
             
-            // 2) 마우스 버튼을 뗄 때:
             if type == .leftMouseUp {
                 if mySelf.isSyntheticMouseUp {
                     mySelf.isSyntheticMouseUp = false
@@ -1500,15 +1502,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
             
-            // 3) 마우스 왼쪽 버튼이 눌려 있지 않은 평상시에는 키보드(flagsChanged)를 즉시 통과시켜 일반 단축키 간섭 제로 & CPU 절약!
             let mousePressed = (NSEvent.pressedMouseButtons & 1) != 0
             guard mousePressed else {
                 return Unmanaged.passUnretained(event)
             }
             
-            // 4) 마우스가 눌려 있는 상태에서 실제로 '파일 아이콘 드래그'가 시작되었는지 확인:
-            //    바탕화면이나 파인더에서 빈 공간을 드래그해 여러 파일을 네모 박스로 선택할 때는 changeCount가 바뀌지 않으므로,
-            //    여기서 즉시 통과(passUnretained)되어 파인더의 Shift/Command 다중 드래그 선택이 100% 완벽하게 작동함!
             if !mySelf.isCurrentMouseStrokeValidFileDrag {
                 let currentCount = mySelf.dragPboard.changeCount
                 guard currentCount != mySelf.dragCountAtMouseDown else {
@@ -1520,7 +1518,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     return Unmanaged.passUnretained(event)
                 }
                 mySelf.isCurrentMouseStrokeValidFileDrag = true
-                let bytes = mySelf.calculateTotalBytes(files: files)
+                let bytes = mySelf.calculateTotalBytesFast(files: files)
                 let sizeStr = ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
                 DispatchQueue.main.async {
                     AppState.shared.draggedFiles = files
@@ -1529,7 +1527,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
             
-            // 5) 여기부터는 '100% 검증된 실제 파일 드래그 세션' 중일 때만 실행됨!
             let rawFlags = NSEvent.ModifierFlags(rawValue: UInt(event.flags.rawValue)).intersection([.shift, .option, .control, .command])
             let qReq = ShortcutSettings.shared.qualityFlags
             let qualityPressed = !qReq.isEmpty && rawFlags.isSuperset(of: qReq)
@@ -1592,7 +1589,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                         mySelf.showOrSwitchWheel(mode: m, mouseLocation: mouseLoc)
                     }
                 } else if AppState.shared.isDragging {
-                    // 120Hz 마우스 이동 시 파이 조각 인덱스가 실제로 바뀔 때만 메인 스레드 UI를 갱신하여 CPU 소모 95% 절감!
                     mySelf.updateHoveredSliceLightweight(mouseLocation: NSEvent.mouseLocation)
                 }
                 if AppState.shared.isDragging || matched != nil {
@@ -1623,7 +1619,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
     
-    // 파인더의 드래그를 안전하게 취소하고, 파인더 창 포커스(좌상단 애플로고 옆 메뉴바)가 먹통이 되지 않도록 깨끗하게 복원!
     func cancelFinderDragAndRestoreFocus(at pt: CGPoint) {
         let src = CGEventSource(stateID: .hidSystemState)
         if let escDown = CGEvent(keyboardEventSource: src, virtualKey: 53, keyDown: true),
@@ -1640,7 +1635,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 cleanUp.flags = []
                 cleanUp.post(tap: .cghidEventTap)
             }
-            // 만약 편집 도구 창이 뜨지 않는 일반 변환/취소 작업이라면 파인더의 활성 상태를 즉시 복구해 Command+W 등이 정상 작동하게 보장
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
                 if NSApp.WindowsHaveNoVisibleTools {
                     if let finder = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.finder").first {
@@ -1652,6 +1646,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
     
     func showOrSwitchWheel(mode: WheelMode, mouseLocation: NSPoint) {
+        // 휠을 띄우는 시점에 파인더가 마저 채워 넣은 전체 파일 목록(예: 2,000개)을 다시 한번 스캔하여 업데이트!
+        let latestFiles = readValidDraggedFiles(from: dragPboard)
+        if latestFiles.count > AppState.shared.draggedFiles.count {
+            AppState.shared.draggedFiles = latestFiles
+            let bytes = calculateTotalBytesFast(files: latestFiles)
+            AppState.shared.totalBytes = bytes
+            AppState.shared.totalSizeText = ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+        }
+        
         guard !AppState.shared.draggedFiles.isEmpty else { return }
         if !AppState.shared.isDragging {
             AppState.shared.wheelMode = mode
@@ -1664,19 +1667,67 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         updateHoveredSliceLightweight(mouseLocation: mouseLocation)
     }
     
+    // MARK: 핵심 해결 — 파인더에서 2,000개 이상의 파일을 드래그할 때 33개에서 잘리지 않도록 3가지 경로(readObjects + pasteboardItems + NSFilenamesPboardType)를 모두 취합하여 100% 전수 추출!
     func readValidDraggedFiles(from pboard: NSPasteboard) -> [URL] {
-        guard let types = pboard.types,
-              types.contains(.fileURL) || types.contains(NSPasteboard.PasteboardType("NSFilenamesPboardType")) else { return [] }
-        guard let urls = pboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] else { return [] }
-        return urls.filter { $0.isFileURL && FileManager.default.fileExists(atPath: $0.path) }
+        var collected: [URL] = []
+        var seenPaths = Set<String>()
+        
+        // 1) readObjects로 전체 NSURL 객체 추출
+        if let urls = pboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] {
+            for u in urls {
+                let p = u.path
+                if !p.isEmpty && seenPaths.insert(p).inserted {
+                    collected.append(u)
+                }
+            }
+        }
+        
+        // 2) pasteboardItems 개별 순회 (대량 드래그 시 누락된 항목 보완)
+        if let items = pboard.pasteboardItems, items.count > collected.count {
+            for item in items {
+                if let str = item.string(forType: .fileURL),
+                   let u = URL(string: str)?.standardizedFileURL {
+                    let p = u.path
+                    if !p.isEmpty && seenPaths.insert(p).inserted {
+                        collected.append(u)
+                    }
+                }
+            }
+        }
+        
+        // 3) 레거시 NSFilenamesPboardType 배열 확인 (Finder 대량 파일 목록 폴백)
+        let legacyType = NSPasteboard.PasteboardType("NSFilenamesPboardType")
+        if let pathList = pboard.propertyList(forType: legacyType) as? [String], pathList.count > collected.count {
+            for p in pathList where !p.isEmpty {
+                if seenPaths.insert(p).inserted {
+                    collected.append(URL(fileURLWithPath: p))
+                }
+            }
+        }
+        
+        // 파일이 100개 이하일 때만 개별 fileExists 검사를 수행하고, 수천 개일 때는 지체 없이 즉시 반환!
+        if collected.count <= 100 {
+            return collected.filter { FileManager.default.fileExists(atPath: $0.path) }
+        }
+        return collected
     }
     
-    func calculateTotalBytes(files: [URL]) -> Int64 {
-        var total: Int64 = 0
-        for f in files {
-            if let attrs = try? FileManager.default.attributesOfItem(atPath: f.path), let sz = attrs[.size] as? Int64 { total += sz }
+    // 파일이 수천 개일 때는 앞쪽 100개 샘플로 즉시 전체 용량을 추정하여 드래그 시작 시 렉(멈춤) 원천 방지!
+    func calculateTotalBytesFast(files: [URL]) -> Int64 {
+        guard !files.isEmpty else { return 0 }
+        let sampleLimit = 100
+        var sum: Int64 = 0
+        let sampleCount = min(files.count, sampleLimit)
+        for i in 0..<sampleCount {
+            if let res = try? files[i].resourceValues(forKeys: [.fileSizeKey]),
+               let sz = res.fileSize {
+                sum += Int64(sz)
+            }
         }
-        return total
+        if files.count > sampleLimit && sampleCount > 0 {
+            return Int64(Double(sum) * (Double(files.count) / Double(sampleCount)))
+        }
+        return sum
     }
     
     func showWheel(at point: NSPoint) {
@@ -1696,11 +1747,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         AppState.shared.isQualityOptionActive = false
         AppState.shared.hoveredIndex = nil
         wheelPanel?.orderOut(nil)
-        // 휠이 닫혀 있을 때 백그라운드 SwiftUI 렌더링을 완전히 해제하여 배터리 및 GPU 점유율 0% 유지
         wheelPanel?.contentView = nil
     }
     
-    // 마우스 이동 시 이전 인덱스와 다를 때만 @Published 변수를 업데이트하여 불필요한 SwiftUI 120Hz 재렌더링 방지
     func updateHoveredSliceLightweight(mouseLocation: NSPoint) {
         let dx = mouseLocation.x - wheelCenterPoint.x
         let dy = mouseLocation.y - wheelCenterPoint.y
@@ -1729,7 +1778,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         isCurrentMouseStrokeValidFileDrag = false
         guard AppState.shared.isDragging else { return }
         let selectedIdx = AppState.shared.hoveredIndex
-        let files = AppState.shared.draggedFiles
+        
+        // 마우스를 놓는 최종 순간에 드래그 보드를 한 번 더 스캔하여 2,000개 전체 목록이 빠짐없이 들어왔는지 최종 확인!
+        let latestFiles = readValidDraggedFiles(from: dragPboard)
+        let files = latestFiles.count > AppState.shared.draggedFiles.count ? latestFiles : AppState.shared.draggedFiles
         let items = AppState.shared.items
         hideWheel()
         if let idx = selectedIdx, idx < items.count {
