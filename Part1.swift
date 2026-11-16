@@ -278,7 +278,7 @@ enum CaptureDateInspector {
         } catch { return nil }
     }
 
-    private static func candidate(_ tags: [String: String], names: [String]) -> (tag: String, raw: String, wall: Date, offset: Int?)? {
+    private static func candidate(_ tags: [String: String], _ names: [String]) -> (tag: String, raw: String, wall: Date, offset: Int?)? {
         for name in names {
             // 완전 일치 우선, 그다음 ExifTool의 그룹이 붙은 동명이인 태그 탐색.
             let keys = tags.keys.filter { $0 == name || $0.hasSuffix(":" + name) }
