@@ -335,6 +335,9 @@ class AppState: ObservableObject {
                 WheelItem(title: "Finder 표시", icon: "folder", actionKey: "act_finder"),
                 WheelItem(title: "사본 만들기", icon: "plus.square.on.square", actionKey: "act_duplicate")
             ]
+            if draggedFiles.filter({ ImageJoinProcessor.isSupportedImage($0) }).count >= 2 {
+                items.append(WheelItem(title: "이미지 합치기", icon: "square.stack", actionKey: "act_join_images"))
+            }
         }
     }
 }
@@ -749,6 +752,7 @@ class FileProcessor {
     
     static func execute(actionKey: String, files: [URL], openQualityPopup: Bool = false) {
         guard !files.isEmpty else { return }
+        if actionKey == "act_join_images" { ToolWindowManager.shared.showImageJoinWindow(urls: files); return }
         if actionKey == "tool_rename_date" { batchRenameFilesWithCaptureDate(files: files); return }
         if actionKey == "tool_edit_photo", let first = files.first { ToolWindowManager.shared.showEditPhotoWindow(url: first); return }
         if actionKey == "tool_crop", let first = files.first { ToolWindowManager.shared.showRedactCropWindow(url: first, initialTab: 1); return }
@@ -1267,6 +1271,9 @@ class ToolWindowManager {
         DispatchQueue.main.asyncAfter(deadline: .now() + 3.2) { panel.close() }
     }
     
+    func showImageJoinWindow(urls: [URL]) {
+        openWindow(title: "이미지 세로 합치기", view: ImageJoinView(files: urls), size: NSSize(width: 780, height: 660), minSize: NSSize(width: 640, height: 500))
+    }
     func showHelpAndSettingsWindow() {
         openWindow(title: "🍊 MyTangerine — 설명 및 설정", view: HelpAndSettingsView(), size: NSSize(width: 820, height: 700), minSize: NSSize(width: 740, height: 600))
     }
@@ -1538,7 +1545,12 @@ struct HelpAndSettingsView: View {
                     "트림(TRIM) 창에서 타임라인 위쪽의 확대 슬라이더(1x ~ 20x)를 조절하거나 타임라인 위에서 마우스 휠을 굴리면 타임라인이 최대 20배까지 확대됩니다.",
                     "[🎯 트림 구간만 꽉 차게 확대] 버튼을 누르면 현재 선택된 시작~끝 구간만 화면에 큼직하게 확대되어 1프레임 단위로 미세 조정이 가능합니다."
                 ])
-                guideCard(icon: "character.cursor.ibeam", title: "3. 수천 개 대량 파일 촬영일자 이름 일괄 변환 (RENAME)", items: [
+                guideCard(icon: "square.stack", title: "3. 이미지 세로 합치기 (ACTIONS)", items: [
+                    "파인더에서 이미지 2장 이상을 선택하여 드래그한 뒤 Control 키를 누르고 ACTIONS 휠에서 [이미지 합치기]를 선택합니다.",
+                    "열린 창에서 위아래 순서를 바꾸고 가로폭, 이미지 사이 간격, PNG/JPG 저장 형식을 선택합니다.",
+                    "원본 이미지는 수정하지 않으며 첫 번째 이미지가 있는 폴더에 새 파일을 만듭니다. 매우 긴 이미지는 메모리 보호를 위해 여러 장으로 자동 분할됩니다."
+                ])
+                guideCard(icon: "character.cursor.ibeam", title: "4. 수천 개 대량 파일 촬영일자 이름 일괄 변환 (RENAME)", items: [
                     "2,000개 이상의 사진이나 영상도 한꺼번에 잡고 TOOLS 또는 ACTIONS 휠의 [RENAME]에 놓으면 누락 없이 전수 스캔하여 일괄 변경합니다.",
                     "백그라운드 엔진이 작동하여 상단 메뉴바 아이콘 옆에 실시간 진행 퍼센트(%)가 표시됩니다."
                 ])

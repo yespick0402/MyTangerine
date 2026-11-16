@@ -1361,6 +1361,293 @@ struct MetadataToolView: View {
     }
 }
 
+
+// MARK: - 11-A. ACTIONS: 세로로 긴 이미지 합치기 (4.8 기능 유지, 새 파일만 생성)
+// 이미지 순서/가로폭/간격/저장 형식은 전용 창에서 조정하고 원본은 읽기 전용으로 취급합니다.
+struct ImageJoinView: View {
+    @State private var imageFiles: [URL]
+    @State private var widthPolicy: String = "first"
+    @State private var outputFormat: String = "png"
+    @State private var spacingPixels: Double = 0
+    @State private var processing = false
+
+    init(files: [URL]) {
+        var seen = Set<String>()
+        let filtered = files.filter { ImageJoinProcessor.isSupportedImage($0) && seen.insert($0.path).inserted }
+        _imageFiles = State(initialValue: filtered)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            headerSection
+            orderedImageList
+            settingsSection
+            actionSection
+        }
+        .padding(22)
+    }
+
+    private var headerSection: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "square.stack")
+                .font(.system(size: 25)).foregroundColor(.orange)
+            VStack(alignment: .leading, spacing: 3) {
+                Text("이미지 세로 합치기").font(.title2.bold())
+                Text("위에서 아래로 연결 · 원본 유지 · 첫 이미지와 같은 폴더에 저장")
+                    .font(.caption).foregroundColor(.secondary)
+            }
+            Spacer()
+            Text("\(imageFiles.count)장").font(.subheadline.bold()).monospacedDigit()
+        }
+    }
+
+    private var orderedImageList: some View {
+        VStack(spacing: 8) {
+            HStack {
+                Text("합쳐질 순서 (맨 위가 첫 번째)").font(.subheadline.bold())
+                Spacer()
+                Button("파일명순 정렬") {
+                    imageFiles.sort { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+                }.disabled(processing)
+            }
+            ScrollView {
+                LazyVStack(spacing: 5) {
+                    ForEach(imageFiles.indices, id: \.self) { idx in
+                        imageRow(at: idx)
+                    }
+                }.padding(7)
+            }
+            .frame(maxHeight: 305)
+            .background(Color.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 10))
+        }
+    }
+
+    private var settingsSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 18) {
+                Picker("가로폭", selection: $widthPolicy) {
+                    Text("첫 이미지 너비로 맞춤").tag("first")
+                    Text("원본 너비 유지(중앙 정렬)").tag("original")
+                }
+                .frame(maxWidth: 380)
+                Picker("파일 형식", selection: $outputFormat) {
+                    Text("PNG (무손실 저장)").tag("png")
+                    Text("JPG (품질 95%)").tag("jpg")
+                }
+                .frame(maxWidth: 270)
+            }
+            HStack(spacing: 12) {
+                Text("사진 간격").font(.subheadline)
+                Slider(value: $spacingPixels, in: 0...100, step: 1).tint(.orange)
+                Text("\(Int(spacingPixels))px").monospacedDigit().frame(width: 54, alignment: .trailing)
+            }
+            Text("서로 다른 가로폭은 비율을 유지하며 배치합니다. JPG는 흰 배경으로 저장합니다. GIF는 첫 프레임만 사용합니다.")
+                .font(.caption2).foregroundColor(.secondary)
+        }
+    }
+
+    private var actionSection: some View {
+        HStack(spacing: 12) {
+            Button("취소") { NSApp.keyWindow?.close() }
+            Spacer()
+            Button("위에서 아래로 합치기") {
+                guard imageFiles.count >= 2, !processing else { return }
+                processing = true
+                ImageJoinProcessor.start(files: imageFiles,
+                                         widthPolicy: widthPolicy,
+                                         format: outputFormat,
+                                         spacing: Int(spacingPixels))
+                NSApp.keyWindow?.close()
+            }
+            .buttonStyle(.borderedProminent).tint(.orange)
+            .disabled(imageFiles.count < 2 || processing)
+        }
+    }
+
+    @ViewBuilder
+    private func imageRow(at idx: Int) -> some View {
+        let file = imageFiles[idx]
+        HStack(spacing: 10) {
+            Text("\(idx + 1)").font(.caption.monospacedDigit()).foregroundColor(.secondary)
+                .frame(width: 28, alignment: .trailing)
+            Image(nsImage: NSWorkspace.shared.icon(forFile: file.path))
+                .resizable().interpolation(.high).frame(width: 30, height: 30)
+            Text(file.lastPathComponent).font(.system(size: 13)).lineLimit(1)
+                .truncationMode(.middle)
+            Spacer(minLength: 4)
+            Button(action: { if idx > 0 { imageFiles.swapAt(idx, idx - 1) } }) {
+                Image(systemName: "arrow.up")
+            }.disabled(idx == 0 || processing).help("한 칸 위로")
+            Button(action: { if idx + 1 < imageFiles.count { imageFiles.swapAt(idx, idx + 1) } }) {
+                Image(systemName: "arrow.down")
+            }.disabled(idx + 1 >= imageFiles.count || processing).help("한 칸 아래로")
+            Button(action: { imageFiles.remove(at: idx) }) {
+                Image(systemName: "xmark").foregroundColor(.secondary)
+            }.disabled(processing).help("목록에서 제외 (원본 삭제 안 함)")
+        }
+        .buttonStyle(.borderless)
+        .padding(.horizontal, 10).padding(.vertical, 5)
+        .background(Color.primary.opacity(idx.isMultiple(of: 2) ? 0.045 : 0.02), in: RoundedRectangle(cornerRadius: 7))
+    }
+}
+
+struct ImageJoinEntry {
+    let url: URL
+    let pixelWidth: Int
+    let pixelHeight: Int
+    let scaledHeight: Int
+}
+
+class ImageJoinProcessor {
+    private static let extensions: Set<String> = ["png", "jpg", "jpeg", "heic", "heif", "webp", "tif", "tiff", "bmp", "gif", "avif"]
+    private static let maxCanvasHeight = 32000
+    // 1억 1천만 픽셀을 넘는 단일 비트맵 생성을 방지하여 메모리 급증/앱 종료 위험 완화.
+    private static let maxCanvasPixels = 110_000_000
+
+    static func isSupportedImage(_ url: URL) -> Bool {
+        extensions.contains(url.pathExtension.lowercased()) && !url.hasDirectoryPath
+    }
+
+    private static func readPixelSize(of url: URL) -> (Int, Int)? {
+        let options: [String: Any] = [kCGImageSourceShouldCache as String: false]
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, options as CFDictionary),
+              CGImageSourceGetCount(src) > 0,
+              let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [String: Any],
+              let width = props[kCGImagePropertyPixelWidth as String] as? Int,
+              let height = props[kCGImagePropertyPixelHeight as String] as? Int,
+              width > 0, height > 0 else { return nil }
+        let orientation = (props[kCGImagePropertyOrientation as String] as? Int) ?? 1
+        return [5, 6, 7, 8].contains(orientation) ? (height, width) : (width, height)
+    }
+
+    // EXIF 회전까지 반영된 CGImage. 전체 크기로 읽고, 필요한 한 장씩만 디코드합니다.
+    private static func decodeOrientedImage(from url: URL, maxPixel: Int) -> CGImage? {
+        let noCache: [String: Any] = [kCGImageSourceShouldCache as String: false]
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, noCache as CFDictionary) else { return nil }
+        let opts: [String: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways as String: true,
+            kCGImageSourceCreateThumbnailWithTransform as String: true,
+            kCGImageSourceThumbnailMaxPixelSize as String: maxPixel,
+            kCGImageSourceShouldCacheImmediately as String: false
+        ]
+        return CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary)
+            ?? CGImageSourceCreateImageAtIndex(src, 0, noCache as CFDictionary)
+    }
+
+    static func start(files: [URL], widthPolicy: String, format: String, spacing: Int) {
+        let jobID = JobProgressManager.shared.startJob(title: "이미지 세로 합치기 (\(files.count)장)")
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = render(files: files, widthPolicy: widthPolicy, format: format, spacing: spacing, jobID: jobID)
+            DispatchQueue.main.async {
+                JobProgressManager.shared.finishJob(id: jobID)
+                if !result.outputs.isEmpty {
+                    NSWorkspace.shared.activateFileViewerSelecting(result.outputs)
+                    if result.outputs.count == 1 {
+                        FileProcessor.showToast("세로 이미지 합치기 완료: \(result.outputs[0].lastPathComponent)")
+                    } else {
+                        FileProcessor.showToast("긴 이미지를 \(result.outputs.count)개 파일로 나누어 저장했습니다.")
+                    }
+                }
+                if let error = result.error {
+                    let alert = NSAlert()
+                    alert.messageText = "이미지 합치기 안내"
+                    alert.informativeText = error
+                    alert.alertStyle = result.outputs.isEmpty ? .warning : .informational
+                    alert.runModal()
+                }
+            }
+        }
+    }
+
+    private static func render(files: [URL], widthPolicy: String, format: String, spacing: Int, jobID: UUID) -> (outputs: [URL], error: String?) {
+        let files = files.filter(isSupportedImage)
+        guard files.count >= 2 else { return ([], "이미지 두 장 이상을 선택해 주세요.") }
+        var sizes: [(URL, Int, Int)] = []
+        for file in files {
+            guard let (w, h) = readPixelSize(of: file) else {
+                return ([], "이미지 크기를 읽을 수 없습니다: \(file.lastPathComponent)")
+            }
+            sizes.append((file, w, h))
+        }
+        let canvasWidth = widthPolicy == "first" ? sizes[0].1 : (sizes.map { $0.1 }.max() ?? sizes[0].1)
+        guard canvasWidth > 0 && canvasWidth <= 16000 else { return ([], "합칠 이미지의 가로폭이 너무 큽니다. 16,000픽셀 이하에서 이용해 주세요.") }
+        let gap = max(0, min(100, spacing))
+        let safeMaxHeight = min(maxCanvasHeight, maxCanvasPixels / canvasWidth)
+        var entries: [ImageJoinEntry] = []
+        for (url, width, height) in sizes {
+            let scale = widthPolicy == "first" ? Double(canvasWidth) / Double(width) : 1.0
+            let scaledHeightDouble = Double(height) * scale
+            guard scaledHeightDouble.isFinite && scaledHeightDouble <= Double(safeMaxHeight) else {
+                return ([], "한 장의 이미지가 안전한 출력 크기를 초과합니다: \(url.lastPathComponent)")
+            }
+            let scaledHeight = max(1, Int(scaledHeightDouble.rounded()))
+            entries.append(ImageJoinEntry(url: url, pixelWidth: width, pixelHeight: height, scaledHeight: scaledHeight))
+        }
+
+        // 이미지가 매우 길면 한 장씩의 경계에서 자동 분할 (렌더링 중 메모리 폭주 방지).
+        var batches: [[ImageJoinEntry]] = []
+        var current: [ImageJoinEntry] = []
+        var currentHeight = 0
+        for entry in entries {
+            let candidateHeight = currentHeight + (current.isEmpty ? 0 : gap) + entry.scaledHeight
+            if !current.isEmpty && candidateHeight > safeMaxHeight {
+                batches.append(current)
+                current = []
+                currentHeight = 0
+            }
+            currentHeight += (current.isEmpty ? 0 : gap) + entry.scaledHeight
+            current.append(entry)
+        }
+        if !current.isEmpty { batches.append(current) }
+
+        var outputs: [URL] = []
+        var finished = 0
+        let rootFile = sizes[0].0
+        for (batchIdx, batch) in batches.enumerated() {
+            let height = batch.reduce(0) { $0 + $1.scaledHeight } + gap * max(0, batch.count - 1)
+            let nameSuffix = batches.count == 1 ? "_vertical_merged" : String(format: "_vertical_merged_part%02d", batchIdx + 1)
+            let outURL = FileProcessor.uniqueOutputURL(for: rootFile, newExt: format == "jpg" ? "jpg" : "png", suffix: nameSuffix)
+            let ok: Bool = autoreleasepool {
+                let colorSpace = CGColorSpaceCreateDeviceRGB()
+                guard let context = CGContext(data: nil, width: canvasWidth, height: height,
+                                              bitsPerComponent: 8, bytesPerRow: 0,
+                                              space: colorSpace, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+                else { return false }
+                context.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
+                context.fill(CGRect(x: 0, y: 0, width: canvasWidth, height: height))
+                var drawTop = height
+                for entry in batch {
+                    let drawWidth: Int = widthPolicy == "first" ? canvasWidth : entry.pixelWidth
+                    let image: CGImage? = autoreleasepool {
+                        decodeOrientedImage(from: entry.url, maxPixel: max(drawWidth, entry.scaledHeight))
+                    }
+                    guard let image = image else { return false }
+                    let x = (canvasWidth - drawWidth) / 2
+                    drawTop -= entry.scaledHeight
+                    context.interpolationQuality = .high
+                    context.draw(image, in: CGRect(x: x, y: drawTop, width: drawWidth, height: entry.scaledHeight))
+                    drawTop -= gap
+                    finished += 1
+                    JobProgressManager.shared.updateJob(id: jobID, progress: Double(finished) / Double(entries.count))
+                }
+                guard let mergedCGImage = context.makeImage() else { return false }
+                let utType: CFString = (format == "jpg" ? UTType.jpeg.identifier : UTType.png.identifier) as CFString
+                guard let dest = CGImageDestinationCreateWithURL(outURL as CFURL, utType, 1, nil) else { return false }
+                let props: [String: Any] = [kCGImageDestinationLossyCompressionQuality as String: 0.95]
+                CGImageDestinationAddImage(dest, mergedCGImage, (format == "jpg" ? props as CFDictionary : nil))
+                return CGImageDestinationFinalize(dest)
+            }
+            if !ok {
+                try? FileManager.default.removeItem(at: outURL)
+                return (outputs, "일부 이미지를 처리하지 못했습니다. \(batchIdx + 1)번째 묶음을 저장하지 못했습니다. 이전에 저장된 파일은 유지됩니다.")
+            }
+            outputs.append(outURL)
+        }
+        let note = batches.count > 1 ? "최대 이미지 크기 제한을 넘어서 \(batches.count)장으로 자동 분할했습니다. 파일은 첫 번째 이미지가 있는 폴더에 저장되었습니다." : nil
+        return (outputs, note)
+    }
+}
+
 // MARK: - 12. 초경량·대용량(2,000개+) 무누락 앱 델리게이트
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
