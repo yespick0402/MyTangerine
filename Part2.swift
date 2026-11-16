@@ -1350,8 +1350,11 @@ struct MetadataToolView: View {
     }
     func loadMeta() {
         let info = FileProcessor.extractCaptureDateAndCamera(for: fileURL)
-        let df = DateFormatter(); df.dateFormat = "yyyy-MM-dd HH:mm:ss"
-        metaDict["📌 감지된 촬영일시"] = df.string(from: info.date)
+        metaDict["📌 감지된 촬영일시"] = CaptureDateInspector.displayDate(info.date)
+        metaDict["📎 판단 상태"] = info.state == "ready" ? "촬영일 사용 가능" : (info.state == "review" ? "시간대·촬영일 확인 필요" : "촬영일 미확인")
+        metaDict["🔎 근거 / 신뢰도"] = info.source + " / " + info.confidence
+        metaDict["📝 원본 메타데이터"] = info.raw
+        metaDict["⚠️ 참고"] = info.note
         if !info.camera.isEmpty { metaDict["📷 감지된 카메라"] = info.camera }
         
         if let src = CGImageSourceCreateWithURL(fileURL as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
@@ -1362,12 +1365,124 @@ struct MetadataToolView: View {
 }
 
 
+
+// MARK: - 촬영일시 이름변경: Camera DateShift식 출처·신뢰도 점검 및 파일별 승인
+struct RenameReviewView: View {
+    let files: [URL]
+    @State private var decisions: [RenameCandidate] = []
+    @State private var selected: Set<String> = []
+    @State private var quickTimeModes: [String:String] = [:]
+    @State private var scanned = 0
+    @State private var loading = true
+    @State private var launched = false
+    private var readyCount: Int { decisions.filter { $0.state == "ready" }.count }
+    private var reviewCount: Int { decisions.filter { $0.state == "review" }.count }
+    private var missingCount: Int { decisions.filter { $0.state == "missing" || $0.state == "error" }.count }
+
+    var body: some View {
+        VStack(alignment:.leading,spacing:12) {
+            HStack {
+                VStack(alignment:.leading,spacing:4) {
+                    Text("촬영일시 확인 후 이름 변경").font(.title2.bold())
+                    Text("EXIF · Sony XML · 영상 내부 기록 우선 / 파일 생성·수정일 사용 안 함").font(.caption).foregroundColor(.secondary)
+                }
+                Spacer()
+                if loading { ProgressView().controlSize(.small) }
+            }
+            Text(loading ? "촬영일시 분석 중: \(scanned) / \(files.count)개" : "확인 가능 \(readyCount)개 · 검토 필요 \(reviewCount)개 · 촬영일 없음 \(missingCount)개")
+                .font(.subheadline.bold()).foregroundColor(.orange)
+            List {
+                ForEach(decisions) { item in
+                    reviewRow(item)
+                }
+            }
+            .listStyle(.inset)
+            HStack {
+                Image(systemName:"info.circle")
+                Text("시간대 미확정 항목은 기본 해제입니다. 파일별 원본 기록을 확인한 후 체크하면 이름 변경에 포함됩니다.")
+                    .font(.caption).foregroundColor(.secondary)
+            }
+            HStack {
+                Button("닫기") { NSApp.keyWindow?.close() }
+                Spacer()
+                Text("선택 \(selected.count)개").font(.caption).monospacedDigit()
+                Button("확인된 항목만 이름 변경") {
+                    let prepared = decisions.map { item in
+                        CaptureDateInspector.adjustQuickTime(item,mode:quickTimeModes[item.id] ?? "utc")
+                    }
+                    let approved = selected
+                    launched = true
+                    FileProcessor.executeVerifiedRename(prepared, approved:approved)
+                    NSApp.keyWindow?.close()
+                }
+                .buttonStyle(.borderedProminent).tint(.orange)
+                .disabled(loading || selected.isEmpty || launched)
+            }
+        }
+        .padding(18)
+        .onAppear { startScan() }
+    }
+    @ViewBuilder private func reviewRow(_ item: RenameCandidate) -> some View {
+        let displayed = CaptureDateInspector.adjustQuickTime(item,mode:quickTimeModes[item.id] ?? "utc")
+        HStack(alignment:.top,spacing:10) {
+            if item.date != nil && item.state != "missing" {
+                Toggle("",isOn:Binding(get:{selected.contains(item.id)},set:{yes in
+                    if yes {selected.insert(item.id)} else {selected.remove(item.id)}
+                }))
+                .labelsHidden().disabled(loading || launched)
+            } else {
+                Image(systemName:"minus.circle").foregroundColor(.secondary).frame(width:22)
+            }
+            VStack(alignment:.leading,spacing:4) {
+                Text(item.url.lastPathComponent).font(.subheadline.weight(.medium)).lineLimit(1)
+                Text(CaptureDateInspector.displayDate(displayed.date) + " · " + displayed.source + " · " + displayed.confidence)
+                    .font(.caption).textSelection(.enabled)
+                if item.state == "review" && (item.source.contains("(UTC 가정)") || item.source.contains("(현지 숫자 가정)")) {
+                    Picker("원시 시각 해석",selection:Binding(get:{quickTimeModes[item.id] ?? "utc"},set:{quickTimeModes[item.id] = $0})) {
+                        Text("UTC 기준 → 이 Mac 시간대").tag("utc")
+                        Text("카메라 현지시각 그대로").tag("local")
+                    }
+                    .pickerStyle(.segmented).frame(maxWidth:410)
+                }
+                if !item.note.isEmpty {
+                    Text(item.note).font(.caption2).foregroundColor(item.state == "review" ? .orange : .secondary)
+                        .textSelection(.enabled)
+                }
+            }
+            Spacer(minLength:8)
+            Text(item.state == "ready" ? "사용 가능" : (item.state == "review" ? "확인 필요" : "촬영일 없음"))
+                .font(.caption2.bold()).foregroundColor(item.state == "ready" ? .green : .orange)
+        }
+        .padding(.vertical,3)
+    }
+    private func startScan() {
+        let input = files
+        DispatchQueue.global(qos:.userInitiated).async {
+            var results: [RenameCandidate] = []
+            var defaults: Set<String> = []
+            for (index,url) in input.enumerated() {
+                let item = autoreleasepool { CaptureDateInspector.scan(url) }
+                results.append(item)
+                if item.state == "ready" && item.date != nil { defaults.insert(item.id) }
+                if index % 20 == 0 || index == input.count - 1 {
+                    DispatchQueue.main.async { scanned = index + 1 }
+                }
+            }
+            DispatchQueue.main.async {
+                decisions = results
+                selected = defaults
+                loading = false
+            }
+        }
+    }
+}
+
 // MARK: - 11-A. ACTIONS: 세로로 긴 이미지 합치기 (4.8 기능 유지, 새 파일만 생성)
 // 이미지 순서/가로폭/간격/저장 형식은 전용 창에서 조정하고 원본은 읽기 전용으로 취급합니다.
 struct ImageJoinView: View {
     @State private var imageFiles: [URL]
     @State private var widthPolicy: String = "first"
-    @State private var outputFormat: String = "png"
+    @State private var outputFormat: String = "auto"
     @State private var spacingPixels: Double = 0
     @State private var processing = false
 
@@ -1431,8 +1546,10 @@ struct ImageJoinView: View {
                 }
                 .frame(maxWidth: 380)
                 Picker("파일 형식", selection: $outputFormat) {
-                    Text("PNG (무손실 저장)").tag("png")
+                    Text("자동 (초장축은 TIFF)").tag("auto")
+                    Text("PNG (무손실)").tag("png")
                     Text("JPG (품질 95%)").tag("jpg")
+                    Text("TIFF/BigTIFF (긴 이미지)").tag("tiff")
                 }
                 .frame(maxWidth: 270)
             }
@@ -1441,7 +1558,7 @@ struct ImageJoinView: View {
                 Slider(value: $spacingPixels, in: 0...100, step: 1).tint(.orange)
                 Text("\(Int(spacingPixels))px").monospacedDigit().frame(width: 54, alignment: .trailing)
             }
-            Text("서로 다른 가로폭은 비율을 유지하며 배치합니다. JPG는 흰 배경으로 저장합니다. GIF는 첫 프레임만 사용합니다.")
+            Text("자동 모드는 일반 크기에 PNG, 32,000px 또는 안전 픽셀 예산을 초과하는 길이에는 TIFF/BigTIFF를 사용합니다. TIFF는 작은 구간씩 기록하므로 매우 긴 이미지를 하나로 저장할 수 있지만 파일이 커지고 일부 앱에서 BigTIFF 미리보기가 제한될 수 있습니다. GIF는 첫 프레임만 사용합니다.")
                 .font(.caption2).foregroundColor(.secondary)
         }
     }
@@ -1577,11 +1694,21 @@ class ImageJoinProcessor {
         for (url, width, height) in sizes {
             let scale = widthPolicy == "first" ? Double(canvasWidth) / Double(width) : 1.0
             let scaledHeightDouble = Double(height) * scale
-            guard scaledHeightDouble.isFinite && scaledHeightDouble <= Double(safeMaxHeight) else {
-                return ([], "한 장의 이미지가 안전한 출력 크기를 초과합니다: \(url.lastPathComponent)")
+            guard scaledHeightDouble.isFinite && scaledHeightDouble >= 1,
+                  scaledHeightDouble <= 1_000_000 else {
+                return ([], "한 장의 이미지가 지원 범위를 초과합니다: \(url.lastPathComponent)")
             }
             let scaledHeight = max(1, Int(scaledHeightDouble.rounded()))
             entries.append(ImageJoinEntry(url: url, pixelWidth: width, pixelHeight: height, scaledHeight: scaledHeight))
+        }
+        let fullHeight = entries.reduce(Int64(0)) { $0 + Int64($1.scaledHeight) } + Int64(gap) * Int64(max(0, entries.count - 1))
+        let effectiveFormat = format == "auto" ? (fullHeight > Int64(safeMaxHeight) ? "tiff" : "png") : format
+        if effectiveFormat == "tiff" {
+            return renderLongTIFF(entries:entries, width:canvasWidth, widthPolicy:widthPolicy, gap:gap, jobID:jobID)
+        }
+        // PNG/JPG는 기존 메모리 보호·자동 분할 방식 유지.
+        for entry in entries where entry.scaledHeight > safeMaxHeight {
+            return ([], "한 장이 PNG/JPG 안전 영역을 초과했습니다. 파일 형식을 ‘TIFF/BigTIFF’ 또는 ‘자동’으로 바꿔주세요: \(entry.url.lastPathComponent)")
         }
 
         // 이미지가 매우 길면 한 장씩의 경계에서 자동 분할 (렌더링 중 메모리 폭주 방지).
@@ -1613,8 +1740,13 @@ class ImageJoinProcessor {
                                               bitsPerComponent: 8, bytesPerRow: 0,
                                               space: colorSpace, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
                 else { return false }
-                context.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
-                context.fill(CGRect(x: 0, y: 0, width: canvasWidth, height: height))
+                // PNG는 투명 영역을 보존하고, JPG만 흰 배경으로 채웁니다.
+                if format == "jpg" {
+                    context.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
+                    context.fill(CGRect(x: 0, y: 0, width: canvasWidth, height: height))
+                } else {
+                    context.clear(CGRect(x: 0, y: 0, width: canvasWidth, height: height))
+                }
                 var drawTop = height
                 for entry in batch {
                     let drawWidth: Int = widthPolicy == "first" ? canvasWidth : entry.pixelWidth
@@ -1646,6 +1778,166 @@ class ImageJoinProcessor {
         let note = batches.count > 1 ? "최대 이미지 크기 제한을 넘어서 \(batches.count)장으로 자동 분할했습니다. 파일은 첫 번째 이미지가 있는 폴더에 저장되었습니다." : nil
         return (outputs, note)
     }
+
+    // TIFF 64비트 오프셋(BigTIFF), 압축 없는 RGBA scanline을 256행씩 기록합니다.
+    // 전체 초장축 이미지를 CGContext 하나에 올리지 않아 고용량에서 메모리 사용량을 제한합니다.
+    private static func renderLongTIFF(entries: [ImageJoinEntry], width: Int, widthPolicy: String, gap: Int, jobID: UUID) -> (outputs:[URL], error:String?) {
+        guard let first = entries.first else { return ([],"선택한 이미지가 없습니다.") }
+        let totalHeight64 = entries.reduce(Int64(0)) { $0 + Int64($1.scaledHeight) } + Int64(gap) * Int64(max(0,entries.count - 1))
+        guard totalHeight64 > 0, totalHeight64 <= 1_000_000,
+              width <= 16000, Int64(width) * totalHeight64 <= 6_000_000_000 else {
+            return ([],"TIFF 안전 범위(높이 최대 1,000,000px)를 초과합니다. 가로폭을 낮추거나 이미지들을 나눠주세요.")
+        }
+        let totalHeight = Int(totalHeight64)
+        let rowBytes = width * 4
+        let rowsPerStrip = 256
+        let strips = (totalHeight + rowsPerStrip - 1) / rowsPerStrip
+        let entryCount = 11
+        // 4GB 미만이면 호환성 좋은 클래식 TIFF(32비트), 그 이상일 때만 BigTIFF(64비트).
+        let classicIFDEnd = 8 + 2 + entryCount * 12 + 4
+        let classicBits = ((classicIFDEnd + 3) / 4) * 4
+        let classicOffsetTable = classicBits + 8
+        let classicByteCountTable = classicOffsetTable + (strips > 1 ? strips * 4 : 0)
+        let classicPixelStart = classicByteCountTable + (strips > 1 ? strips * 4 : 0)
+        let classicBytes = Int64(classicPixelStart) + totalHeight64 * Int64(rowBytes)
+        let isBig = classicBytes >= 4_000_000_000
+        let bigIFDLength = 8 + entryCount * 20 + 8
+        let bigOffsetTable = ((16 + bigIFDLength + 7) / 8) * 8
+        let bigByteCountTable = bigOffsetTable + (strips > 1 ? strips * 8 : 0)
+        let bigPixelStart = bigByteCountTable + (strips > 1 ? strips * 8 : 0)
+        let pixelStart = isBig ? bigPixelStart : classicPixelStart
+        let fileBytes = Int64(pixelStart) + totalHeight64 * Int64(rowBytes)
+        let folder = first.url.deletingLastPathComponent()
+        if let fs = try? FileManager.default.attributesOfFileSystem(forPath:folder.path),
+           let free = fs[.systemFreeSize] as? NSNumber,
+           free.int64Value < fileBytes + 64 * 1024 * 1024 {
+            return ([],"예상 TIFF 용량: \(ByteCountFormatter.string(fromByteCount:fileBytes,countStyle:.file)). 저장 공간이 부족합니다.")
+        }
+        let output = FileProcessor.uniqueOutputURL(for:first.url,newExt:"tif",suffix:"_vertical_merged")
+        guard FileManager.default.createFile(atPath: output.path,contents:nil) else { return ([],"출력 TIFF 파일을 만들 수 없습니다.") }
+        do {
+            let handle = try FileHandle(forWritingTo:output)
+            defer { try? handle.close() }
+            var header = Data()
+            func u16(_ v: UInt16) { var x=v.littleEndian; withUnsafeBytes(of:&x){header.append(contentsOf:$0)} }
+            func u32(_ v: UInt32) { var x=v.littleEndian; withUnsafeBytes(of:&x){header.append(contentsOf:$0)} }
+            func u64(_ v: UInt64) { var x=v.littleEndian; withUnsafeBytes(of:&x){header.append(contentsOf:$0)} }
+            if isBig {
+                func tag(_ id:UInt16,_ type:UInt16,_ count:UInt64,_ value:UInt64) {
+                    u16(id);u16(type);u64(count);u64(value)
+                }
+                u16(0x4949);u16(43);u16(8);u16(0);u64(16)
+                u64(UInt64(entryCount))
+                tag(256,4,1,UInt64(width))
+                tag(257,4,1,UInt64(totalHeight))
+                tag(258,3,4,0x0008_0008_0008_0008)
+                tag(259,3,1,1)
+                tag(262,3,1,2)
+                tag(273,16,UInt64(strips),strips == 1 ? UInt64(pixelStart) : UInt64(bigOffsetTable))
+                tag(277,3,1,4)
+                tag(278,4,1,UInt64(rowsPerStrip))
+                tag(279,16,UInt64(strips),strips == 1 ? UInt64(totalHeight * rowBytes) : UInt64(bigByteCountTable))
+                tag(284,3,1,1)
+                tag(338,3,1,1)
+                u64(0)
+                while header.count < bigOffsetTable { header.append(0) }
+                if strips > 1 {
+                    var at = UInt64(pixelStart)
+                    for n in 0..<strips {
+                        u64(at)
+                        at += UInt64(min(rowsPerStrip,totalHeight - n * rowsPerStrip) * rowBytes)
+                    }
+                    for n in 0..<strips { u64(UInt64(min(rowsPerStrip,totalHeight - n * rowsPerStrip) * rowBytes)) }
+                } else { while header.count < pixelStart { header.append(0) } }
+            } else {
+                func tag(_ id:UInt16,_ type:UInt16,_ count:UInt32,_ value:UInt32) {
+                    u16(id);u16(type);u32(count);u32(value)
+                }
+                u16(0x4949);u16(42);u32(8)
+                u16(UInt16(entryCount))
+                tag(256,4,1,UInt32(width))
+                tag(257,4,1,UInt32(totalHeight))
+                tag(258,3,4,UInt32(classicBits))
+                tag(259,3,1,1)
+                tag(262,3,1,2)
+                tag(273,4,UInt32(strips),UInt32(strips == 1 ? pixelStart : classicOffsetTable))
+                tag(277,3,1,4)
+                tag(278,4,1,UInt32(rowsPerStrip))
+                tag(279,4,UInt32(strips),UInt32(strips == 1 ? totalHeight * rowBytes : classicByteCountTable))
+                tag(284,3,1,1)
+                tag(338,3,1,1)
+                u32(0)
+                while header.count < classicBits { header.append(0) }
+                u16(8);u16(8);u16(8);u16(8)
+                if strips > 1 {
+                    var at = UInt32(pixelStart)
+                    for n in 0..<strips {
+                        u32(at)
+                        at += UInt32(min(rowsPerStrip,totalHeight - n * rowsPerStrip) * rowBytes)
+                    }
+                    for n in 0..<strips { u32(UInt32(min(rowsPerStrip,totalHeight - n * rowsPerStrip) * rowBytes)) }
+                }
+            }
+            guard header.count == pixelStart else { throw NSError(domain:"TIFF",code:1,userInfo:[NSLocalizedDescriptionKey:"헤더 오프셋 계산 실패"]) }
+            try handle.write(contentsOf:header)
+
+            var placements: [(entry:ImageJoinEntry,top:Int)] = []
+            var top = 0
+            for e in entries { placements.append((e,top)); top += e.scaledHeight + gap }
+            var activeIndex = -1
+            var activeImage:CGImage?
+            var nextEntryIndex = 0
+            for strip in 0..<strips {
+                let stripTop = strip * rowsPerStrip
+                let stripRows = min(rowsPerStrip,totalHeight - stripTop)
+                var success = false
+                let stripe: Data? = autoreleasepool {
+                    guard let context = CGContext(data:nil,width:width,height:stripRows,bitsPerComponent:8,
+                                                  bytesPerRow:rowBytes,space:CGColorSpaceCreateDeviceRGB(),
+                                                  bitmapInfo:CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+                    context.clear(CGRect(x:0,y:0,width:width,height:stripRows))
+                    while nextEntryIndex < placements.count &&
+                          placements[nextEntryIndex].top + placements[nextEntryIndex].entry.scaledHeight <= stripTop {
+                        nextEntryIndex += 1
+                    }
+                    var idx = nextEntryIndex
+                    while idx < placements.count {
+                        let entry = placements[idx].entry
+                        let imageTop = placements[idx].top
+                        if imageTop >= stripTop + stripRows { break }
+                        if imageTop + entry.scaledHeight > stripTop {
+                            if activeIndex != idx {
+                                activeImage = decodeOrientedImage(from:entry.url,maxPixel:max(width,entry.scaledHeight))
+                                activeIndex = idx
+                            }
+                            guard let image = activeImage else { return nil }
+                            let drawWidth = widthPolicy == "first" ? width : entry.pixelWidth
+                            let x = (width - drawWidth) / 2
+                            let localY = stripTop + stripRows - (imageTop + entry.scaledHeight)
+                            context.interpolationQuality = .high
+                            context.draw(image,in:CGRect(x:x,y:localY,width:drawWidth,height:entry.scaledHeight))
+                        }
+                        idx += 1
+                    }
+                    guard let raw = context.data else { return nil }
+                    success = true
+                    return Data(bytes:raw,count:rowBytes * stripRows)
+                }
+                guard success, let bytes = stripe else { throw NSError(domain:"TIFF",code:2,userInfo:[NSLocalizedDescriptionKey:"이미지 스트립 생성 실패: \(strip + 1)"]) }
+                try handle.write(contentsOf:bytes)
+                if strip % 4 == 0 || strip == strips - 1 {
+                    JobProgressManager.shared.updateJob(id:jobID,progress:Double(strip + 1)/Double(strips))
+                }
+            }
+            let finalOffset = try handle.offset()
+            guard finalOffset == UInt64(fileBytes) else { throw NSError(domain:"TIFF",code:3,userInfo:[NSLocalizedDescriptionKey:"출력 TIFF 길이 불일치"]) }
+            return ([output],"\(isBig ? "BigTIFF" : "TIFF") 한 장으로 \(totalHeight)px를 저장했습니다. 무압축 저장이며, 일부 이미지 앱은 초장축/BigTIFF 미리보기를 지원하지 않을 수 있습니다.")
+        } catch {
+            try? FileManager.default.removeItem(at:output)
+            return ([],"초장축 TIFF 생성 실패: \(error.localizedDescription)")
+        }
+    }
+
 }
 
 // MARK: - 12. 초경량·대용량(2,000개+) 무누락 앱 델리게이트
@@ -1679,10 +1971,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func applyPureTransparentCustomIconToAppBundle() {
         guard let rawIcon = FileProcessor.customAppIconImage() else { return }
         NSApp.applicationIconImage = rawIcon
-        let bundlePath = Bundle.main.bundlePath
-        DispatchQueue.global(qos: .utility).async {
-            NSWorkspace.shared.setIcon(rawIcon, forFile: bundlePath, options: [])
-        }
+        // 서명된 .app 폴더를 실행 도중 수정하지 않습니다.
+        // Finder 아이콘은 번들에 포함된 AppIcon.icns가 담당합니다.
     }
     
     func updateStatusBarMenu() {
@@ -1935,11 +2225,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func showOrSwitchWheel(mode: WheelMode, mouseLocation: NSPoint) {
         // 휠을 띄우는 시점에 파인더가 마저 채워 넣은 전체 파일 목록(예: 2,000개)을 다시 한번 스캔하여 업데이트!
         let latestFiles = readValidDraggedFiles(from: dragPboard)
+        var fileListChanged = false
         if latestFiles.count > AppState.shared.draggedFiles.count {
             AppState.shared.draggedFiles = latestFiles
             let bytes = calculateTotalBytesFast(files: latestFiles)
             AppState.shared.totalBytes = bytes
             AppState.shared.totalSizeText = ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+            fileListChanged = true
         }
         
         guard !AppState.shared.draggedFiles.isEmpty else { return }
@@ -1947,8 +2239,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             AppState.shared.wheelMode = mode
             AppState.shared.updateItems()
             showWheel(at: mouseLocation)
-        } else if AppState.shared.wheelMode != mode {
+        } else if AppState.shared.wheelMode != mode || fileListChanged {
             AppState.shared.wheelMode = mode
+            // 뒤늦게 발견된 추가 드래그 파일도 ACTIONS 휠의 이미지 합치기 항목에 반영합니다.
             AppState.shared.updateItems()
         }
         updateHoveredSliceLightweight(mouseLocation: mouseLocation)

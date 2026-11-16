@@ -114,7 +114,10 @@ class ShortcutSettings: ObservableObject {
     }
     
     static func formatFileName(pattern: String, originalName: String, captureDate: Date, cameraModel: String, sequenceIndex: Int) -> String {
-        let cal = Calendar.current
+        // 촬영기기의 시계값을 GMT 기준 Date에 보관한 뒤 같은 GMT에서 추출합니다.
+        // 컴퓨터의 현재 시간대로 재변환하여 촬영 시간에 9시간이 더해지지 않게 합니다.
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(secondsFromGMT: 0)!
         let comps = cal.dateComponents([.year, .month, .day, .hour, .minute, .second], from: captureDate)
         let y = comps.year ?? 2026
         let m = comps.month ?? 1
@@ -154,6 +157,241 @@ class ShortcutSettings: ObservableObject {
     }
 }
 
+
+// MARK: - 촬영일시 근거 점검 (Camera DateShift의 판별 원칙 이식)
+// 파일 생성·수정일이나 현재 시각을 촬영 시각으로 대신 사용하지 않습니다.
+struct CaptureDateEvidence {
+    let date: Date?
+    let camera: String
+    let state: String            // ready / review / missing / error
+    let source: String
+    let confidence: String
+    let raw: String
+    let note: String
+}
+
+struct RenameCandidate: Identifiable {
+    let url: URL
+    var date: Date?
+    let camera: String
+    let state: String
+    var source: String
+    let confidence: String
+    let note: String
+    let raw: String
+    let fileSize: Int64
+    let modificationTime: Date?
+    var quickTimeMode: String = "utc"
+    var id: String { url.path }
+}
+
+enum CaptureDateInspector {
+    private static let photos: Set<String> = ["jpg","jpeg","heic","heif","png","tif","tiff","webp","bmp","gif","avif","dng","arw","cr2","cr3","nef","raf","orf","rw2"]
+    private static let videos: Set<String> = ["mp4","mov","m4v","mkv","avi","mts","m2ts","3gp","webm","wmv"]
+    private static let dateRegex = try! NSRegularExpression(pattern: #"^\s*(\d{4})[:\-](\d{2})[:\-](\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:\s*(Z|[+\-]\d{2}:?\d{2}))?\s*$"#)
+
+    private static func parsed(_ text: String) -> (wall: Date, offset: Int?)? {
+        let input = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let range = NSRange(input.startIndex..<input.endIndex, in: input)
+        guard let match = dateRegex.firstMatch(in: input, range: range) else { return nil }
+        func part(_ n: Int) -> String? {
+            let ns = match.range(at: n)
+            guard ns.location != NSNotFound, let r = Range(ns, in: input) else { return nil }
+            return String(input[r])
+        }
+        guard let yy = part(1).flatMap(Int.init), let mo = part(2).flatMap(Int.init),
+              let dd = part(3).flatMap(Int.init), let h = part(4).flatMap(Int.init),
+              let m = part(5).flatMap(Int.init), let s = part(6).flatMap(Int.init),
+              (1900...2100).contains(yy), (1...12).contains(mo), (0...23).contains(h),
+              (0...59).contains(m), (0...59).contains(s) else { return nil }
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(secondsFromGMT: 0)!
+        let dc = DateComponents(timeZone: cal.timeZone, year: yy, month: mo, day: dd, hour: h, minute: m, second: s)
+        guard let wall = cal.date(from: dc),
+              cal.dateComponents([.year,.month,.day], from: wall).year == yy,
+              cal.dateComponents([.year,.month,.day], from: wall).month == mo,
+              cal.dateComponents([.year,.month,.day], from: wall).day == dd else { return nil }
+        var offset: Int? = nil
+        if let zone = part(7) {
+            if zone.uppercased() == "Z" { offset = 0 }
+            else {
+                let digits = String(zone.dropFirst()).replacingOccurrences(of: ":", with: "")
+                guard digits.count == 4, let hh = Int(digits.prefix(2)), let mm = Int(digits.suffix(2)),
+                      hh <= 14, mm < 60, !(hh == 14 && mm != 0) else { return nil }
+                offset = (zone.hasPrefix("-") ? -1 : 1) * (hh * 60 + mm)
+            }
+        }
+        return (wall, offset)
+    }
+
+    private static func dateText(_ date: Date) -> String {
+        let df = DateFormatter()
+        df.locale = Locale(identifier: "en_US_POSIX")
+        df.timeZone = TimeZone(secondsFromGMT: 0)
+        df.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        return df.string(from: date)
+    }
+    static func displayDate(_ date: Date?) -> String { date.map(dateText) ?? "촬영일 미확인" }
+
+    private static func imageTags(_ url: URL) -> [String: String] {
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
+              let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [String: Any] else { return [:] }
+        var result: [String: String] = [:]
+        if let exif = props[kCGImagePropertyExifDictionary as String] as? [String: Any] {
+            for (key, val) in exif { result["ExifIFD:" + key] = "\(val)" }
+        }
+        if let tiff = props[kCGImagePropertyTIFFDictionary as String] as? [String: Any] {
+            for (key, val) in tiff { result["IFD0:" + key] = "\(val)" }
+        }
+        return result
+    }
+
+    // Camera DateShift와 마찬가지로 원본 카메라 태그를 읽습니다.
+    // macOS 기본 API만으로 읽히지 않는 카메라 RAW/QuickTime 계열을 위해 ExifTool을 앱에 동봉합니다.
+    private static func exifTags(_ url: URL) -> [String: String]? {
+        guard let script = Bundle.main.path(forResource: "exiftool", ofType: "pl"),
+              let resources = Bundle.main.resourceURL else { return nil }
+        let lib = resources.appendingPathComponent("exiftool-lib", isDirectory:true).path
+        guard FileManager.default.fileExists(atPath:lib) else { return nil }
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/perl")
+        task.arguments = [script, "-j", "-G1", "-a", "-s", "-api", "QuickTimeUTC=0", "-api", "LargeFileSupport=1", url.path]
+        var env = ProcessInfo.processInfo.environment
+        env["PERL5LIB"] = lib
+        task.environment = env
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = FileHandle.nullDevice
+        do {
+            try task.run()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            task.waitUntilExit()
+            guard task.terminationStatus == 0,
+                  let arr = try JSONSerialization.jsonObject(with: data) as? [[String: Any]],
+                  let obj = arr.first else { return nil }
+            var tags: [String: String] = [:]
+            for (key, value) in obj {
+                if let s = value as? String { tags[key] = s }
+                else if let n = value as? NSNumber { tags[key] = n.stringValue }
+            }
+            return tags
+        } catch { return nil }
+    }
+
+    private static func candidate(_ tags: [String: String], names: [String]) -> (tag: String, raw: String, wall: Date, offset: Int?)? {
+        for name in names {
+            // 완전 일치 우선, 그다음 ExifTool의 그룹이 붙은 동명이인 태그 탐색.
+            let keys = tags.keys.filter { $0 == name || $0.hasSuffix(":" + name) }
+                .filter { !$0.hasPrefix("File:") && !$0.hasPrefix("System:") && !$0.hasPrefix("Composite:") }
+                .sorted { ($0 == name ? 0 : 1, $0) < ($1 == name ? 0 : 1, $1) }
+            for key in keys {
+                guard let raw = tags[key], let dt = parsed(raw) else { continue }
+                return (key, raw, dt.wall, dt.offset)
+            }
+        }
+        return nil
+    }
+    private static func named(_ tags: [String: String], _ names: [String]) -> (tag: String, raw: String, wall: Date, offset: Int?)? {
+        for name in names { if let raw = tags[name], let dt = parsed(raw) { return (name,raw,dt.wall,dt.offset) } }
+        return nil
+    }
+    private static func sonyXML(_ url: URL) -> (raw: String, wall: Date, offset: Int?)? {
+        let folder = url.deletingLastPathComponent()
+        let stem = url.deletingPathExtension().lastPathComponent
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: folder.path),
+              let filename = names.first(where: { $0.caseInsensitiveCompare(stem + "M01.XML") == .orderedSame }) else { return nil }
+        let file = folder.appendingPathComponent(filename)
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: file.path),
+              let size = attributes[.size] as? NSNumber, size.int64Value < 1_048_576,
+              let xml = try? String(contentsOf: file, encoding: .utf8),
+              xml.contains("NonRealTimeMeta"), xml.contains("schemas-professionalDisc:nonRealTimeMeta") else { return nil }
+        let regex = try! NSRegularExpression(pattern: #"<CreationDate\s+value=\"([^\"]+)\""#)
+        let range = NSRange(xml.startIndex..<xml.endIndex, in: xml)
+        guard let match = regex.firstMatch(in: xml, range: range),
+              let r = Range(match.range(at: 1), in: xml) else { return nil }
+        let raw = String(xml[r])
+        guard let dt = parsed(raw), dt.offset != nil else { return nil }
+        return (raw,dt.wall,dt.offset)
+    }
+
+    static func inspect(_ url: URL, quickTimeMode: String = "utc") -> CaptureDateEvidence {
+        let ext = url.pathExtension.lowercased()
+        guard photos.contains(ext) || videos.contains(ext) else {
+            return CaptureDateEvidence(date:nil,camera:"",state:"missing",source:"지원 대상 아님",confidence:"없음",raw:"",note:"카메라 사진·영상이 아닙니다. 파일 생성일을 촬영일로 대체하지 않습니다.")
+        }
+        let externalTags = exifTags(url)
+        if videos.contains(ext) && externalTags == nil {
+            return CaptureDateEvidence(date:nil,camera:"",state:"error",source:"ExifTool 촬영일시 판독 실패",confidence:"확인 불가",raw:"",note:"영상 메타데이터를 읽지 못했습니다. 앱에 동봉한 ExifTool 설치·실행 상태 또는 파일 손상을 확인하세요.")
+        }
+        let tags = externalTags ?? (photos.contains(ext) ? imageTags(url) : [:])
+        let camera = tags["IFD0:Model"] ?? tags["ExifIFD:Model"] ?? tags["QuickTime:Model"] ?? ""
+        func result(_ dt: (tag: String, raw: String, wall: Date, offset: Int?), state: String, source: String, confidence: String, note: String = "") -> CaptureDateEvidence {
+            CaptureDateEvidence(date:dt.wall,camera:camera,state:state,source:source,confidence:confidence,raw:dt.raw,note:note)
+        }
+        if photos.contains(ext) {
+            if let main = named(tags,["ExifIFD:SubSecDateTimeOriginal","ExifIFD:DateTimeOriginal","EXIF:DateTimeOriginal"]) {
+                return result(main,state:"ready",source:main.tag,confidence:"높음",note:"카메라 EXIF 촬영 시계값입니다. 시간대가 없으면 현지 시계값 그대로 이름에 사용합니다.")
+            }
+            if let weakOriginal = candidate(tags,["SubSecDateTimeOriginal","DateTimeOriginal"]) {
+                return result(weakOriginal,state:"review",source:weakOriginal.tag,confidence:"확인 필요",note:"ExifIFD 원본 필드가 아닌 위치의 촬영일시입니다. 편집된 XMP일 가능성을 확인해 주세요.")
+            }
+            if let alt = named(tags,["ExifIFD:CreateDate","ExifIFD:DateTimeDigitized","EXIF:CreateDate"]) {
+                return result(alt,state:"ready",source:alt.tag,confidence:"조건부",note:"원본 촬영 태그가 없어 카메라 EXIF 디지털 생성일을 사용합니다.")
+            }
+            if let weak = candidate(tags,["DateTimeDigitized","CreateDate","CreationDate","DateTime"]) {
+                return result(weak,state:"review",source:weak.tag,confidence:"확인 필요",note:"촬영 시작일 대신 이미지 생성·가공일일 수 있습니다. 확인 후 승인해 주세요.")
+            }
+            return CaptureDateEvidence(date:nil,camera:camera,state:"missing",source:"촬영일 필드 없음",confidence:"없음",raw:"",note:"파일 생성일·수정일·현재 시간은 촬영일로 사용하지 않습니다.")
+        }
+        if let xml = sonyXML(url) {
+            let movie = named(tags,["QuickTime:CreateDate","MovieHeader:CreateDate"]) ?? candidate(tags,["CreateDate"])
+            var conflict = false
+            if let m = movie, m.offset == nil, let xmlOffset = xml.offset {
+                // UTC 숫자와 XML의 +09:00 카메라 시각은 동일한 순간일 수 있습니다.
+                let xmlUTC = xml.wall.addingTimeInterval(TimeInterval(-xmlOffset * 60))
+                conflict = abs(xmlUTC.timeIntervalSince(m.wall)) > 120
+            }
+            let dt = (tag:"Sony XML:CreationDate",raw:xml.raw,wall:xml.wall,offset:xml.offset)
+            return result(dt,state: conflict ? "review" : "ready",source:dt.tag,confidence:conflict ? "확인 필요" : "높음",note:conflict ? "Sony XML과 QuickTime UTC 숫자가 일치하지 않습니다. 촬영 시간 확인 후 승인하세요." : "Sony XML의 명시적 시간대 기준. QuickTime UTC 오프셋을 추가하지 않습니다.")
+        }
+        let explicit = named(tags,["Keys:CreationDate","UserData:DateTimeOriginal","UserData:CreationDate","QuickTime:CreationDate","XMP-exif:DateTimeOriginal","XMP-xmp:CreateDate"]) ?? candidate(tags,["CreationDate","DateTimeOriginal"])
+        if let e = explicit {
+            if e.offset != nil { return result(e,state:"ready",source:e.tag,confidence:"높음",note:"영상 내부에 시간대가 명시된 원본 촬영 기록입니다.") }
+            if e.tag.hasSuffix(":DateTimeOriginal") || e.tag.hasSuffix(":CreationDate") {
+                return result(e,state:"ready",source:e.tag,confidence:"시계값",note:"녹화 시계값은 있으나 오프셋이 없습니다. 컴퓨터 시간대로 강제 보정하지 않았습니다.")
+            }
+            return result(e,state:"review",source:e.tag,confidence:"확인 필요",note:"영상 생성 메타데이터의 촬영일 여부를 확인해야 합니다.")
+        }
+        if let movie = named(tags,["QuickTime:CreateDate","MovieHeader:CreateDate"]) ?? candidate(tags,["TrackCreateDate","MediaCreateDate","CreateDate"]) {
+            // QuickTime 헤더의 숫자는 UTC 또는 현지 시각일 수 있어 자동 실행하지 않습니다.
+            let systemOffset = TimeZone.current.secondsFromGMT(for: movie.wall)
+            let localDisplay = movie.wall.addingTimeInterval(TimeInterval(systemOffset))
+            let useLocal = quickTimeMode == "local"
+            let chosen = useLocal ? movie.wall : localDisplay
+            let note = "원시값 \(dateText(movie.wall)) / UTC 가정 후 이 Mac 시간대 \(dateText(localDisplay)). 두 해석 중 실제 촬영 시각을 선택하세요."
+            return CaptureDateEvidence(date:chosen,camera:camera,state:"review",source:movie.tag + (useLocal ? " (현지 숫자 가정)" : " (UTC 가정)"),confidence:"시간대 미확정",raw:movie.raw,note:note)
+        }
+        return CaptureDateEvidence(date:nil,camera:camera,state:"missing",source:"촬영일 필드 없음",confidence:"없음",raw:"",note:"동반 XML이 없어도 내부 원본 촬영일이 있으면 사용합니다. 지금 파일에는 근거를 찾지 못했습니다.")
+    }
+    static func adjustQuickTime(_ candidate: RenameCandidate, mode: String) -> RenameCandidate {
+        guard candidate.state == "review", candidate.source.contains("(UTC 가정)") || candidate.source.contains("(현지 숫자 가정)"),
+              let rawDate = parsed(candidate.raw)?.wall else { return candidate }
+        var adjusted = candidate
+        adjusted.quickTimeMode = mode
+        let isLocal = mode == "local"
+        adjusted.date = isLocal ? rawDate : rawDate.addingTimeInterval(TimeInterval(TimeZone.current.secondsFromGMT(for: rawDate)))
+        let prefix = candidate.source.replacingOccurrences(of:" (UTC 가정)",with:"").replacingOccurrences(of:" (현지 숫자 가정)",with:"")
+        adjusted.source = prefix + (isLocal ? " (현지 숫자 가정)" : " (UTC 가정)")
+        return adjusted
+    }
+    static func scan(_ url: URL) -> RenameCandidate {
+        let e = inspect(url)
+        let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+        let bytes = (attrs?[.size] as? NSNumber)?.int64Value ?? -1
+        return RenameCandidate(url:url,date:e.date,camera:e.camera,state:e.state,source:e.source,confidence:e.confidence,note:e.note,raw:e.raw,fileSize:bytes,modificationTime:attrs?[.modificationDate] as? Date)
+    }
+}
+
 // MARK: - 1. 작업 진행률 매니저 (UI 스로틀링으로 수천 개 파일 처리 시 렉 방지)
 struct ActiveJob: Identifiable {
     let id: UUID
@@ -180,11 +418,11 @@ class JobProgressManager: ObservableObject {
         return id
     }
     func updateJob(id: UUID, progress: Double) {
-        let now = CACurrentMediaTime()
-        // 1초에 최대 15회까지만 메뉴바 UI를 갱신하여 수천 개 파일 처리 시 메인 스레드 부하 0% 유지
-        guard now - lastUIUpdateTime >= 0.06 || progress >= 0.99 else { return }
-        lastUIUpdateTime = now
+        // 같은 메인 큐에서 시간제한과 Published 상태를 함께 갱신하여 경쟁 상태를 피합니다.
         DispatchQueue.main.async {
+            let now = CACurrentMediaTime()
+            guard now - self.lastUIUpdateTime >= 0.06 || progress >= 0.99 else { return }
+            self.lastUIUpdateTime = now
             if let idx = self.jobs.firstIndex(where: { $0.id == id }) {
                 self.jobs[idx].progress = min(0.99, max(0.0, progress))
                 self.onUpdate?()
@@ -510,121 +748,111 @@ class FileProcessor {
         if !newAttrs.isEmpty { try? FileManager.default.setAttributes(newAttrs, ofItemAtPath: dst.path) }
     }
     
-    // 이미지 픽셀을 디코딩하지 않고 헤더 메타데이터만 초고속으로 추출 (kCGImageSourceShouldCache = false)
-    static func extractCaptureDateAndCamera(for url: URL) -> (date: Date, camera: String) {
-        var cameraModel = ""
-        let srcOpts: [CFString: Any] = [kCGImageSourceShouldCache: false]
-        
-        if let src = CGImageSourceCreateWithURL(url as CFURL, srcOpts as CFDictionary),
-           let props = CGImageSourceCopyPropertiesAtIndex(src, 0, srcOpts as CFDictionary) as? [CFString: Any] {
-            if let tiff = props[kCGImagePropertyTIFFDictionary] as? [CFString: Any],
-               let model = tiff[kCGImagePropertyTIFFModel] as? String { cameraModel = model }
-            if let exif = props[kCGImagePropertyExifDictionary] as? [CFString: Any] {
-                if let dtOrig = exif[kCGImagePropertyExifDateTimeOriginal] as? String {
-                    let cleanStr = String(dtOrig.prefix(19))
-                    if let d = exifDateFormatter.date(from: cleanStr) { return (d, cameraModel) }
-                }
-                if let dtDig = exif[kCGImagePropertyExifDateTimeDigitized] as? String {
-                    let cleanStr = String(dtDig.prefix(19))
-                    if let d = exifDateFormatter.date(from: cleanStr) { return (d, cameraModel) }
-                }
-            }
-            if let tiff = props[kCGImagePropertyTIFFDictionary] as? [CFString: Any],
-               let dtTiff = tiff[kCGImagePropertyTIFFDateTime] as? String {
-                let cleanStr = String(dtTiff.prefix(19))
-                if let d = exifDateFormatter.date(from: cleanStr) { return (d, cameraModel) }
-            }
-        }
-        if let mdItem = MDItemCreateWithURL(kCFAllocatorDefault, url as CFURL),
-           let contentDate = MDItemCopyAttribute(mdItem, kMDItemContentCreationDate) as? Date {
-            return (contentDate, cameraModel)
-        }
-        if let resVals = try? url.resourceValues(forKeys: [.creationDateKey, .contentModificationDateKey]) {
-            if let cDate = resVals.creationDate { return (cDate, cameraModel) }
-            if let mDate = resVals.contentModificationDate { return (mDate, cameraModel) }
-        }
-        return (Date(), cameraModel)
+    static func extractCaptureDateAndCamera(for url: URL) -> CaptureDateEvidence {
+        CaptureDateInspector.inspect(url)
     }
-    
-    // MARK: 핵심 해결 — 2,000개 이상의 파일도 멈춤 없이 100% 끝까지 일괄 변경하도록 백그라운드 스레드 + autoreleasepool + 메뉴바 진행률(%) 적용!
+
+    // 직접 이름 변경을 수행하기 전에 출처·확인 여부·새 파일명을 검토합니다.
     static func batchRenameFilesWithCaptureDate(files: [URL]) {
         guard !files.isEmpty else { return }
+        DispatchQueue.main.async {
+            ToolWindowManager.shared.showRenameReviewWindow(urls: files)
+        }
+    }
+
+    static func executeVerifiedRename(_ decisions: [RenameCandidate], approved: Set<String>) {
+        let selected = decisions.filter { approved.contains($0.url.path) && $0.date != nil }
+        guard !selected.isEmpty else { return }
         let pattern = ShortcutSettings.shared.renamePattern
-        let totalCount = files.count
-        let jobID = JobProgressManager.shared.startJob(title: "촬영일자 이름 변경 (\(totalCount)개)")
-        
+        let jobID = JobProgressManager.shared.startJob(title: "촬영일자 확인 후 이름 변경 (\(selected.count)개)")
         DispatchQueue.global(qos: .userInitiated).async {
-            var renamedCount = 0
-            var lastNewName = ""
             let fm = FileManager.default
-            
-            for (idx, fileURL) in files.enumerated() {
+            var renamed = 0
+            var skipped = 0
+            var failed = 0
+            var errors: [String] = []
+            for (idx, entry) in selected.enumerated() {
                 autoreleasepool {
-                    let folder = fileURL.deletingLastPathComponent()
-                    let ext = fileURL.pathExtension
-                    let origName = fileURL.deletingPathExtension().lastPathComponent
-                    let info = extractCaptureDateAndCamera(for: fileURL)
-                    
-                    let newBaseName = ShortcutSettings.formatFileName(
-                        pattern: pattern,
-                        originalName: origName,
-                        captureDate: info.date,
-                        cameraModel: info.camera,
-                        sequenceIndex: idx + 1
-                    )
-                    
-                    // 이미 해당 날짜가 파일명 앞에 붙어 있는 경우 중복 변경 방지
-                    let datePrefix = String(newBaseName.prefix(15))
-                    if !newBaseName.isEmpty && newBaseName != origName && !(origName.hasPrefix(datePrefix) && datePrefix.count >= 8) {
-                        var targetURL = ext.isEmpty ? folder.appendingPathComponent(newBaseName) : folder.appendingPathComponent("\(newBaseName).\(ext)")
-                        var dupCounter = 1
-                        while fm.fileExists(atPath: targetURL.path) && targetURL.path != fileURL.path {
-                            targetURL = ext.isEmpty ?
-                                folder.appendingPathComponent("\(newBaseName)_\(dupCounter)") :
-                                folder.appendingPathComponent("\(newBaseName)_\(dupCounter).\(ext)")
-                            dupCounter += 1
+                    do {
+                        let attrs = try fm.attributesOfItem(atPath: entry.url.path)
+                        let nowSize = (attrs[.size] as? NSNumber)?.int64Value ?? -1
+                        let nowMod = attrs[.modificationDate] as? Date
+                        guard nowSize == entry.fileSize, nowMod == entry.modificationTime else {
+                            throw NSError(domain:"Rename",code:1,userInfo:[NSLocalizedDescriptionKey:"불러온 뒤 원본 파일이 변경됨"])
                         }
-                        
+                        // Camera DateShift와 동일한 원칙: 실행 직전에 메타데이터를 다시 읽습니다.
+                        let fresh = CaptureDateInspector.inspect(entry.url,quickTimeMode:entry.quickTimeMode)
+                        guard let date = fresh.date, entry.date == date,
+                              fresh.source == entry.source, fresh.state == entry.state else {
+                            throw NSError(domain:"Rename",code:2,userInfo:[NSLocalizedDescriptionKey:"촬영일시 근거가 달라짐. 다시 확인 필요"])
+                        }
+                        let folder = entry.url.deletingLastPathComponent()
+                        let ext = entry.url.pathExtension
+                        let oldName = entry.url.deletingPathExtension().lastPathComponent
+                        let newBase = ShortcutSettings.formatFileName(pattern:pattern,originalName:oldName,captureDate:date,cameraModel:fresh.camera,sequenceIndex:idx + 1)
+                        var cameraCalendar = Calendar(identifier:.gregorian)
+                        cameraCalendar.timeZone = TimeZone(secondsFromGMT: 0)!
+                        let dc = cameraCalendar.dateComponents([.year,.month,.day,.hour,.minute,.second],from:date)
+                        let prefix = String(format:"%04d%02d%02d_%02d%02d%02d_",dc.year ?? 0,dc.month ?? 0,dc.day ?? 0,dc.hour ?? 0,dc.minute ?? 0,dc.second ?? 0)
+                        guard !newBase.isEmpty, !newBase.contains("\\"), !newBase.contains("\u{0000}"),
+                              newBase.utf8.count <= 220 else { throw NSError(domain:"Rename",code:3,userInfo:[NSLocalizedDescriptionKey:"새 파일명이 비었거나 너무 깁니다."]) }
+                        if newBase == oldName || (pattern == ShortcutSettings.defaultRenamePattern && oldName.hasPrefix(prefix)) {
+                            skipped += 1
+                            return
+                        }
+                        // Sony XML 및 XMP는 영상/사진의 이름과 연결되어 있으므로 함께 옮깁니다.
+                        let contents = try fm.contentsOfDirectory(atPath: folder.path)
+                        let companions = contents.filter {
+                            $0.caseInsensitiveCompare(oldName + ".xmp") == .orderedSame ||
+                            $0.caseInsensitiveCompare(oldName + "M01.XML") == .orderedSame
+                        }
+                        var destination: URL?
+                        var pairs: [(URL, URL)] = []
+                        for suffix in 0..<10000 {
+                            let base = suffix == 0 ? newBase : newBase + "_\(suffix)"
+                            let fileDest = folder.appendingPathComponent(ext.isEmpty ? base : base + "." + ext)
+                            if fm.fileExists(atPath:fileDest.path) { continue }
+                            let companionPairs = companions.map { name -> (URL,URL) in
+                                let isXML = name.lowercased().hasSuffix("m01.xml")
+                                let companionExt = name.hasSuffix(".XMP") ? ".XMP" : ".xmp"
+                                let targetName = isXML ? base + "M01.XML" : base + companionExt
+                                return (folder.appendingPathComponent(name),folder.appendingPathComponent(targetName))
+                            }
+                            if companionPairs.contains(where: { fm.fileExists(atPath:$0.1.path) }) { continue }
+                            destination = fileDest; pairs = companionPairs; break
+                        }
+                        guard let finalURL = destination else { throw NSError(domain:"Rename",code:4,userInfo:[NSLocalizedDescriptionKey:"중복 이름이 너무 많습니다."]) }
+                        try fm.moveItem(at:entry.url,to:finalURL)
+                        var movedCompanions: [(URL,URL)] = []
                         do {
-                            try fm.moveItem(at: fileURL, to: targetURL)
-                            renamedCount += 1
-                            lastNewName = targetURL.lastPathComponent
-                            
-                            // 동반 .xmp 사이드카 파일이 있으면 함께 이름 변경
-                            for xmpExt in ["xmp", "XMP"] {
-                                let xmpSource = fileURL.deletingPathExtension().appendingPathExtension(xmpExt)
-                                if fm.fileExists(atPath: xmpSource.path) {
-                                    let xmpTarget = targetURL.deletingPathExtension().appendingPathExtension(xmpExt)
-                                    try? fm.moveItem(at: xmpSource, to: xmpTarget)
-                                }
+                            for (source,target) in pairs {
+                                try fm.moveItem(at:source,to:target)
+                                movedCompanions.append((source,target))
                             }
                         } catch {
-                            // 권한 오류나 잠긴 파일은 건너뛰고 다음 파일 계속 진행
+                            for (source,target) in movedCompanions.reversed() { try? fm.moveItem(at:target,to:source) }
+                            try? fm.moveItem(at:finalURL,to:entry.url)
+                            throw error
                         }
+                        renamed += 1
+                    } catch {
+                        failed += 1
+                        if errors.count < 6 { errors.append("\(entry.url.lastPathComponent): \(error.localizedDescription)") }
                     }
                 }
-                
-                // 진행률(%) 업데이트
-                if idx % 10 == 0 || idx == totalCount - 1 {
-                    let prog = Double(idx + 1) / Double(totalCount)
-                    JobProgressManager.shared.updateJob(id: jobID, progress: prog)
-                }
+                JobProgressManager.shared.updateJob(id:jobID,progress:Double(idx + 1)/Double(selected.count))
             }
-            
-            JobProgressManager.shared.finishJob(id: jobID)
-            
+            JobProgressManager.shared.finishJob(id:jobID)
             DispatchQueue.main.async {
-                if renamedCount == 1 {
-                    showToast("이름 변경 완료: \(lastNewName)")
-                } else if renamedCount > 1 {
-                    showToast("총 \(renamedCount)개 파일(전체 \(totalCount)개 선택) 촬영일자 이름 변경 완료!")
-                } else {
-                    showToast("모든 파일이 이미 해당 양식으로 되어 있거나 변경할 항목이 없습니다.")
-                }
+                let alert = NSAlert()
+                alert.messageText = "촬영일시 검증 후 이름 변경 결과"
+                alert.informativeText = "완료 \(renamed)개 / 이미 적용됨 \(skipped)개 / 실패 \(failed)개" +
+                    (errors.isEmpty ? "" : "\n\n" + errors.joined(separator:"\n"))
+                alert.runModal()
             }
         }
     }
-    
+
     static func mediaDurationSeconds(for url: URL) -> Double {
         if let mdItem = MDItemCreateWithURL(kCFAllocatorDefault, url as CFURL),
            let sec = MDItemCopyAttribute(mdItem, kMDItemDurationSeconds) as? Double,
@@ -1067,8 +1295,9 @@ class FileProcessor {
         else if ext == "tiff" { data = rep.representation(using: .tiff, properties: [:]) }
         else if ext == "bmp" { data = rep.representation(using: .bmp, properties: [:]) }
         else { data = rep.representation(using: .jpeg, properties: [.compressionFactor: quality]) }
+        guard let data = data else { return false }
         do {
-            try data?.write(to: url)
+            try data.write(to: url)
             if let srcURL = sourceURLForMetadata { preserveFileDates(from: srcURL, to: url) }
             return true
         } catch { return false }
@@ -1271,6 +1500,9 @@ class ToolWindowManager {
         DispatchQueue.main.asyncAfter(deadline: .now() + 3.2) { panel.close() }
     }
     
+    func showRenameReviewWindow(urls: [URL]) {
+        openWindow(title: "촬영일시 근거 확인 후 이름 변경", view: RenameReviewView(files: urls), size: NSSize(width: 860, height: 670), minSize: NSSize(width: 690, height: 520))
+    }
     func showImageJoinWindow(urls: [URL]) {
         openWindow(title: "이미지 세로 합치기", view: ImageJoinView(files: urls), size: NSSize(width: 780, height: 660), minSize: NSSize(width: 640, height: 500))
     }
@@ -1423,7 +1655,7 @@ struct HelpAndSettingsView: View {
             VStack(alignment: .leading, spacing: 18) {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("촬영일자 기반 파일명 일괄 변환 (RENAME) 설정").font(.headline).foregroundColor(.orange)
-                    Text("수천 개의 파일도 한 번에 드래그하여 TOOLS 또는 ACTIONS 휠의 [RENAME]에 놓으면, 백그라운드에서 EXIF 촬영일시를 읽어 실시간 진행률(%)과 함께 초고속으로 일괄 변경합니다.")
+                    Text("RENAME으로 파일을 선택하면 EXIF·Sony XML·영상 내부 촬영일시를 분석해 출처와 신뢰도를 표시합니다. 촬영일이 없으면 변경하지 않으며, QuickTime 시간대가 불명확할 때는 파일별 확인 후 진행합니다.")
                         .font(.caption).foregroundColor(.secondary)
                 }
                 VStack(alignment: .leading, spacing: 12) {
@@ -1547,7 +1779,7 @@ struct HelpAndSettingsView: View {
                 ])
                 guideCard(icon: "square.stack", title: "3. 이미지 세로 합치기 (ACTIONS)", items: [
                     "파인더에서 이미지 2장 이상을 선택하여 드래그한 뒤 Control 키를 누르고 ACTIONS 휠에서 [이미지 합치기]를 선택합니다.",
-                    "열린 창에서 위아래 순서를 바꾸고 가로폭, 이미지 사이 간격, PNG/JPG 저장 형식을 선택합니다.",
+                    "열린 창에서 순서, 가로폭, 간격, PNG/JPG/TIFF 또는 자동(초장축 TIFF 전환) 형식을 선택합니다.",
                     "원본 이미지는 수정하지 않으며 첫 번째 이미지가 있는 폴더에 새 파일을 만듭니다. 매우 긴 이미지는 메모리 보호를 위해 여러 장으로 자동 분할됩니다."
                 ])
                 guideCard(icon: "character.cursor.ibeam", title: "4. 수천 개 대량 파일 촬영일자 이름 일괄 변환 (RENAME)", items: [
