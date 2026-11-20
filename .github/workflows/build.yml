@@ -1,4 +1,4 @@
-name: Build MyTangerine App
+name: Build 00Favorite App
 
 on:
   push:
@@ -23,21 +23,23 @@ jobs:
           test -s icon.png || { echo 'ERROR: icon.png 없음'; exit 1; }
           cat Part1.swift Part2.swift > combined_main.swift
           grep -q 'struct ImageJoinView: View' combined_main.swift || { echo 'ERROR: 이미지 합치기 소스 누락'; exit 1; }
+          grep -q 'final class FavoriteAwakeManager' combined_main.swift || { echo 'ERROR: 독립 잠자기 방지 기능 소스 누락'; exit 1; }
+          grep -q 'import IOKit.pwr_mgt' combined_main.swift || { echo 'ERROR: IOKit 전원관리 연동 누락'; exit 1; }
 
       - name: Create App Bundle and Icon
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p MyTangerine.app/Contents/{MacOS,Resources}
-          cat <<'EOF' > MyTangerine.app/Contents/Info.plist
+          mkdir -p 00Favorite.app/Contents/{MacOS,Resources}
+          cat <<'EOF' > 00Favorite.app/Contents/Info.plist
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
           <dict>
-            <key>CFBundleExecutable</key><string>MyTangerine</string>
+            <key>CFBundleExecutable</key><string>00Favorite</string>
             <key>CFBundleIdentifier</key><string>com.custom.mytangerine</string>
-            <key>CFBundleName</key><string>MyTangerine</string>
-            <key>CFBundleDisplayName</key><string>MyTangerine</string>
+            <key>CFBundleName</key><string>00Favorite</string>
+            <key>CFBundleDisplayName</key><string>00Favorite</string>
             <key>CFBundleIconFile</key><string>AppIcon</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleShortVersionString</key><string>4.8</string>
@@ -54,8 +56,8 @@ jobs:
           </dict>
           </plist>
           EOF
-          plutil -lint MyTangerine.app/Contents/Info.plist
-          cp icon.png MyTangerine.app/Contents/Resources/icon.png
+          plutil -lint 00Favorite.app/Contents/Info.plist
+          cp icon.png 00Favorite.app/Contents/Resources/icon.png
           mkdir -p AppIcon.iconset
           sips -z 16 16 -s format png icon.png --out AppIcon.iconset/icon_16x16.png
           sips -z 32 32 -s format png icon.png --out AppIcon.iconset/icon_16x16@2x.png
@@ -67,13 +69,13 @@ jobs:
           sips -z 512 512 -s format png icon.png --out AppIcon.iconset/icon_256x256@2x.png
           sips -z 512 512 -s format png icon.png --out AppIcon.iconset/icon_512x512.png
           sips -z 1024 1024 -s format png icon.png --out AppIcon.iconset/icon_512x512@2x.png
-          iconutil -c icns AppIcon.iconset -o MyTangerine.app/Contents/Resources/AppIcon.icns
+          iconutil -c icns AppIcon.iconset -o 00Favorite.app/Contents/Resources/AppIcon.icns
 
       - name: Bundle verified Apple Silicon FFmpeg
         shell: bash
         run: |
           set -euo pipefail
-          FF_BIN='MyTangerine.app/Contents/Resources/ffmpeg'
+          FF_BIN='00Favorite.app/Contents/Resources/ffmpeg'
           fetch_ffmpeg() {
             local url="$1"
             local entry=''
@@ -106,20 +108,21 @@ jobs:
         run: |
           set -euo pipefail
           swiftc combined_main.swift \
-            -o MyTangerine.app/Contents/MacOS/MyTangerine \
+            -framework IOKit \
+            -o 00Favorite.app/Contents/MacOS/00Favorite \
             -target arm64-apple-macos14.0 -Osize
-          strip -x MyTangerine.app/Contents/MacOS/MyTangerine
-          lipo -archs MyTangerine.app/Contents/MacOS/MyTangerine | grep -qw 'arm64'
-          xattr -cr MyTangerine.app
+          strip -x 00Favorite.app/Contents/MacOS/00Favorite
+          lipo -archs 00Favorite.app/Contents/MacOS/00Favorite | grep -qw 'arm64'
+          xattr -cr 00Favorite.app
           # 서명이 끝난 다음 앱 리소스를 다시 수정하지 않습니다.
-          codesign --force --deep --sign - MyTangerine.app
-          codesign --verify --deep --strict --verbose=2 MyTangerine.app
-          ditto -c -k --sequesterRsrc --keepParent MyTangerine.app MyTangerine.zip
-          unzip -tqq MyTangerine.zip
+          codesign --force --deep --sign - 00Favorite.app
+          codesign --verify --deep --strict --verbose=2 00Favorite.app
+          ditto -c -k --sequesterRsrc --keepParent 00Favorite.app 00Favorite.zip
+          unzip -tqq 00Favorite.zip
 
       - name: Upload Finished Mac App
         uses: actions/upload-artifact@v4
         with:
-          name: MyTangerine-4.8-Mac-ARM64
-          path: MyTangerine.zip
+          name: 00Favorite-4.8-Mac-ARM64
+          path: 00Favorite.zip
           if-no-files-found: error
