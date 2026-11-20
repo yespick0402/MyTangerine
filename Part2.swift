@@ -2467,7 +2467,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard let path = Bundle.main.path(forResource: "icon_awake", ofType: "png") else { return nil }
         return NSImage(contentsOfFile: path)
     }()
-    private let buildIdentifier = "FAV-20261120-HK6"
+    private let buildIdentifier = "FAV-20261120-HK7"
     var wheelPanel: NSPanel?
     var wheelCenterPoint: NSPoint = .zero
     
@@ -2733,11 +2733,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // 기존 휠 감시와 변환 처리 방식은 변경하지 않습니다.
     }
 
-    @objc func toggleWheelDetection() {
-        ShortcutSettings.shared.wheelDetectionEnabled.toggle()
-        if !ShortcutSettings.shared.wheelDetectionEnabled { hideWheel() }
-        updateStatusBarMenu()
-    }
     @objc func openHelpAndSettings() { ToolWindowManager.shared.showHelpAndSettingsWindow() }
     @objc func openFolderPermissions() { ToolWindowManager.shared.showFolderPermissionsWindow() }
     @objc func quitApp() { NSApp.terminate(nil) }

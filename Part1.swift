@@ -56,7 +56,8 @@ class ShortcutSettings: ObservableObject {
         let savedQual = UserDefaults.standard.integer(forKey: "tangerine_sc_quality_v44")
         let savedToggle = UserDefaults.standard.bool(forKey: "tangerine_sc_toggle_mode_v44")
         let defaults = UserDefaults.standard
-        let savedEnabled = defaults.object(forKey: "tangerine_safe_enabled_v48") as? Bool
+        // HK7: 구버전에서 진단 목적으로 꺼둔 값은 새 실행에 승계하지 않습니다.
+        // 일반 Finder 안전 모드는 항상 적용하고, 휠 입력 감지는 자동 활성화합니다.
         let savedFinderOnly = defaults.object(forKey: "tangerine_safe_finder_only_v48") as? Bool
         let savedPattern = UserDefaults.standard.string(forKey: "tangerine_rename_pattern_v40")
         
@@ -65,7 +66,8 @@ class ShortcutSettings: ObservableObject {
         self.actionsFlagsRaw = (savedActions != 0) ? UInt(savedActions) : Self.defaultActionsRaw
         self.qualityModifierRaw = (savedQual != 0) ? UInt(savedQual) : Self.defaultQualityRaw
         self.isToggleMode = savedToggle
-        self.wheelDetectionEnabled = savedEnabled ?? true
+        self.wheelDetectionEnabled = true
+        defaults.set(true, forKey: "tangerine_safe_enabled_v48")
         self.finderOnlyDetection = savedFinderOnly ?? true
         self.renamePattern = (savedPattern?.isEmpty == false) ? savedPattern! : Self.defaultRenamePattern
     }
@@ -1841,12 +1843,11 @@ struct HelpAndSettingsView: View {
                         .font(.headline).foregroundColor(.green)
                     Text("Finder의 키 입력과 마우스 드래그를 가로채거나 변경하지 않습니다. 휠 조각 위에 실제 파일을 드롭한 경우에만 00Favorite 작업이 시작됩니다. 다른 위치에 놓으면 macOS가 원래 드롭을 처리합니다.")
                         .font(.caption).foregroundColor(.secondary)
-                    Toggle("휠 감지 사용 (문제 해결 시에만 변경)", isOn: $settings.wheelDetectionEnabled)
-                        .onChange(of: settings.wheelDetectionEnabled) { enabled in
-                            let delegate = NSApp.delegate as? AppDelegate
-                            if !enabled { delegate?.hideWheel() }
-                            delegate?.updateStatusBarMenu()
-                        }
+                    HStack(spacing: 8) {
+                        Image(systemName: "checkmark.shield.fill").foregroundColor(.green)
+                        Text("휠 감지: 자동 켜짐 (설정할 필요 없음)")
+                            .font(.subheadline)
+                    }
                     Toggle("Finder에서 시작한 파일 드래그만 감지 (권장)", isOn: $settings.finderOnlyDetection)
                     HStack(spacing: 8) {
                         Text("휠 입력 감시: \(wheelMonitorStatus)")
