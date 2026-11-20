@@ -1487,6 +1487,140 @@ struct RadialWheelView: View {
     }
 }
 
+// MARK: - macOS 파일·폴더 접근 안내 (사용자 동의 우선)
+// 이 앱은 App Sandbox를 사용하지 않으므로 '보안 범위 북마크를 통한 영구 권한'을
+// 가장하지 않습니다. NSOpenPanel에서 사용자가 폴더를 고르면 macOS에 그 선택을
+// 명시적으로 전달합니다. 저장하는 경로 목록은 편의 기능이며 TCC 권한 자체가 아닙니다.
+final class FolderAccessPreferences: ObservableObject {
+    static let shared = FolderAccessPreferences()
+    private let pathsKey = "tangerine_selected_folders_v48"
+    private let introKey = "tangerine_folder_access_intro_v48"
+
+    @Published private(set) var selectedPaths: [String]
+    @Published var notice: String = "폴더를 선택하면 macOS가 해당 접근을 확인할 수 있습니다."
+
+    private init() {
+        selectedPaths = UserDefaults.standard.stringArray(forKey: pathsKey) ?? []
+    }
+
+    var shouldShowIntro: Bool {
+        !UserDefaults.standard.bool(forKey: introKey)
+    }
+    func markIntroShown() {
+        UserDefaults.standard.set(true, forKey: introKey)
+    }
+    func chooseFolders(startAt preferred: URL? = nil) {
+        let panel = NSOpenPanel()
+        panel.title = "MyTangerine에서 사용할 폴더 선택"
+        panel.message = "본인이 사용할 폴더를 선택하세요. 모든 디스크 권한을 자동으로 요청하지 않습니다."
+        panel.prompt = "이 폴더 선택"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = true
+        panel.canCreateDirectories = false
+        if let preferred = preferred { panel.directoryURL = preferred }
+        guard panel.runModal() == .OK else { return }
+        let selected = panel.urls.map { $0.standardizedFileURL.path }
+        let unique = Set(selectedPaths).union(selected)
+        selectedPaths = unique.sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+        UserDefaults.standard.set(selectedPaths, forKey: pathsKey)
+        notice = "폴더 \(selected.count)개를 선택했습니다. 실제 접근 권한은 macOS가 관리합니다."
+    }
+    func removeRecentPath(_ path: String) {
+        selectedPaths.removeAll { $0 == path }
+        UserDefaults.standard.set(selectedPaths, forKey: pathsKey)
+        notice = "최근 선택 목록에서 삭제했습니다. macOS가 승인한 권한은 시스템 설정에서 별도로 관리합니다."
+    }
+    func openFilesAndFoldersSettings() {
+        openSystemSettings("Privacy_FilesAndFolders")
+    }
+    func openFullDiskAccessSettings() {
+        openSystemSettings("Privacy_AllFiles")
+    }
+    func openAccessibilitySettings() {
+        openSystemSettings("Privacy_Accessibility")
+    }
+    private func openSystemSettings(_ target: String) {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?\(target)"),
+           NSWorkspace.shared.open(url) { return }
+        if let url = URL(string: "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension") {
+            _ = NSWorkspace.shared.open(url)
+        }
+    }
+}
+
+struct FolderPermissionView: View {
+    @ObservedObject private var permissions = FolderAccessPreferences.shared
+
+    private func suggested(_ kind: FileManager.SearchPathDirectory) -> URL? {
+        FileManager.default.urls(for: kind, in: .userDomainMask).first
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                Label("파일·폴더 접근 설정", systemImage: "folder.badge.gearshape")
+                    .font(.title3.bold()).foregroundColor(.orange)
+                Text("다운로드·문서·바탕화면 등 필요한 폴더를 미리 지정할 수 있습니다. 버튼을 누르면 macOS의 기본 폴더 선택 창이 나타납니다. 사용자가 직접 선택해야 하며, 앱이 권한을 강제로 허용하지는 않습니다.")
+                    .font(.subheadline).foregroundColor(.secondary)
+
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("1. 자주 사용하는 폴더 선택").font(.headline)
+                    HStack(spacing: 10) {
+                        Button("다운로드 폴더") { permissions.chooseFolders(startAt: suggested(.downloadsDirectory)) }
+                        Button("문서 폴더") { permissions.chooseFolders(startAt: suggested(.documentDirectory)) }
+                        Button("바탕화면 폴더") { permissions.chooseFolders(startAt: suggested(.desktopDirectory)) }
+                    }
+                    Button("다른 폴더 / 외장 디스크 선택…") { permissions.chooseFolders() }
+                    Text("폴더 선택 후에도 macOS에서 추가 승인 창이 나타날 수 있습니다. 선택한 경로의 읽기·쓰기 권한을 무조건 보장하는 기능은 아닙니다.")
+                        .font(.caption).foregroundColor(.secondary)
+                }
+                .padding(14).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+
+                VStack(alignment: .leading, spacing: 9) {
+                    Text("2. 최근 선택한 폴더").font(.headline)
+                    if permissions.selectedPaths.isEmpty {
+                        Text("아직 선택한 폴더가 없습니다.").foregroundColor(.secondary)
+                    } else {
+                        ForEach(permissions.selectedPaths, id: \.self) { path in
+                            HStack(spacing: 9) {
+                                Image(systemName: "folder").foregroundColor(.orange)
+                                Text(path).font(.system(.caption, design: .monospaced)).lineLimit(2)
+                                    .textSelection(.enabled)
+                                Spacer(minLength: 8)
+                                Button("목록에서 제거") { permissions.removeRecentPath(path) }
+                                    .font(.caption).buttonStyle(.borderless)
+                            }
+                        }
+                    }
+                    Text("이 목록은 사용자가 선택한 폴더를 기억하는 용도이며 macOS의 실제 권한 상태를 표시하지 않습니다.")
+                        .font(.caption2).foregroundColor(.secondary)
+                    Text(permissions.notice).font(.caption).foregroundColor(.secondary)
+                }
+                .padding(14).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("3. macOS 개인정보 접근 권한 관리").font(.headline)
+                    HStack(spacing: 10) {
+                        Button("파일 및 폴더 설정 열기") { permissions.openFilesAndFoldersSettings() }
+                        Button("손쉬운 사용 설정 열기") { permissions.openAccessibilitySettings() }
+                    }
+                    Button("전체 디스크 접근 설정 열기 (선택 사항)") {
+                        permissions.openFullDiskAccessSettings()
+                    }
+                    Text("전체 디스크 접근은 일반적인 이미지·영상 변환에 필요하지 않습니다. 반드시 필요한 경우에만 Mac 시스템 설정에서 직접 승인하세요. macOS 버전에 따라 설정 화면의 위치가 다를 수 있습니다.")
+                        .font(.caption).foregroundColor(.secondary)
+                }
+                .padding(14).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+
+                Text("참고: 현재 GitHub 앱은 임시 서명입니다. 앱을 새로 빌드해 설치하면 macOS가 접근 권한을 다시 요청할 수 있으며, 이 현상은 폴더 선택만으로 완전히 해결되지 않습니다.")
+                    .font(.caption).foregroundColor(.secondary)
+            }
+            .padding(22)
+        }
+    }
+}
+
 // MARK: - 6. 도구 창 매니저 및 설정 창
 class ToolWindowManager {
     static let shared = ToolWindowManager()
@@ -1534,6 +1668,9 @@ class ToolWindowManager {
     func showHelpAndSettingsWindow() {
         openWindow(title: "🍊 MyTangerine — 설명 및 설정", view: HelpAndSettingsView(), size: NSSize(width: 820, height: 700), minSize: NSSize(width: 740, height: 600))
     }
+    func showFolderPermissionsWindow() {
+        openWindow(title: "🔐 MyTangerine — 파일·폴더 접근 설정", view: FolderPermissionView(), size: NSSize(width: 760, height: 640), minSize: NSSize(width: 650, height: 540))
+    }
     func showConvertQualityWindow(urls: [URL], targetExt: String) {
         openWindow(title: "포맷 변환 퀄리티 설정 (\(targetExt.uppercased()))", view: ConvertQualityPopupView(files: urls, targetExt: targetExt), size: NSSize(width: 500, height: 390), minSize: NSSize(width: 460, height: 360))
     }
@@ -1574,22 +1711,25 @@ struct HelpAndSettingsView: View {
     
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 14) {
-                if let customIcon = FileProcessor.customAppIconImage() {
-                    Image(nsImage: customIcon).resizable().scaledToFit().frame(width: 44, height: 44)
-                } else {
-                    Image(systemName: "circle.hexagongrid.fill").font(.system(size: 36)).foregroundColor(.orange)
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 14) {
+                    if let customIcon = FileProcessor.customAppIconImage() {
+                        Image(nsImage: customIcon).resizable().scaledToFit().frame(width: 44, height: 44)
+                    } else {
+                        Image(systemName: "circle.hexagongrid.fill").font(.system(size: 36)).foregroundColor(.orange)
+                    }
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("MyTangerine 4.8 Pro").font(.system(size: 20, weight: .heavy, design: .rounded))
+                        Text("수천 개 대량 파일 일괄 처리 엔진 · 초저전력 최적화 · 무결점 3종 휠").font(.caption).foregroundColor(.secondary)
+                    }
+                    Spacer()
                 }
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("MyTangerine 4.8 Pro").font(.system(size: 20, weight: .heavy, design: .rounded))
-                    Text("수천 개 대량 파일 일괄 처리 엔진 · 초저전력 최적화 · 무결점 3종 휠").font(.caption).foregroundColor(.secondary)
-                }
-                Spacer()
-                Picker("", selection: $selectedTab) {
+                Picker("설정 항목", selection: $selectedTab) {
                     Text("⌨️ 단축키 설정").tag(0)
                     Text("🏷️ 이름 변환 양식").tag(1)
                     Text("📖 사용 설명서").tag(2)
-                }.pickerStyle(.segmented).frame(width: 380)
+                    Text("🔐 폴더 접근").tag(3)
+                }.labelsHidden().pickerStyle(.segmented)
             }
             .padding(18).background(.regularMaterial)
             Divider()
@@ -1598,6 +1738,8 @@ struct HelpAndSettingsView: View {
                 shortcutRecorderTab
             } else if selectedTab == 1 {
                 renamePatternTab
+            } else if selectedTab == 3 {
+                FolderPermissionView()
             } else {
                 usageGuideTab
             }

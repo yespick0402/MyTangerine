@@ -2049,6 +2049,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         JobProgressManager.shared.onUpdate = { [weak self] in self?.updateStatusBarMenu() }
         
         setupUltraLightEventTap()
+        // 새 설치/업데이트 시 한 번만 안내합니다. 권한 승인 창을 자동으로 누르거나
+        // 폴더를 몰래 스캔하지 않으며, 사용자가 선택할 때만 NSOpenPanel을 띄웁니다.
+        if FolderAccessPreferences.shared.shouldShowIntro {
+            FolderAccessPreferences.shared.markIntroShown()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                ToolWindowManager.shared.showFolderPermissionsWindow()
+            }
+        }
     }
     
     func applyPureTransparentCustomIconToAppBundle() {
@@ -2097,6 +2105,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         pauseItem.target = self
         menu.addItem(pauseItem)
         menu.addItem(NSMenuItem(title: "🛡️ 입력 감시 읽기 전용 · Finder 원본 드래그 보호", action: nil, keyEquivalent: ""))
+        let folderPermissionsItem = NSMenuItem(title: "🔐 파일·폴더 접근 설정…", action: #selector(openFolderPermissions), keyEquivalent: "")
+        folderPermissionsItem.target = self
+        menu.addItem(folderPermissionsItem)
         let helpItem = NSMenuItem(title: "📖 설명 및 설정 (단축키 / 홀드·토글 / 이름 양식)...", action: #selector(openHelpAndSettings), keyEquivalent: ",")
         helpItem.target = self
         menu.addItem(helpItem)
@@ -2110,6 +2121,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         updateStatusBarMenu()
     }
     @objc func openHelpAndSettings() { ToolWindowManager.shared.showHelpAndSettingsWindow() }
+    @objc func openFolderPermissions() { ToolWindowManager.shared.showFolderPermissionsWindow() }
     @objc func quitApp() { NSApp.terminate(nil) }
     
     func ensureWheelPanel() -> NSPanel {
