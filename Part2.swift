@@ -2253,6 +2253,8 @@ final class FavoriteAwakeManager {
 // 사용자가 알 수 있게 상태에 제한사항을 표시합니다. 보안 입력 상태에서는 제한됩니다.
 final class FavoriteAwakeHotKey {
     static let shared = FavoriteAwakeHotKey()
+    private static let signature: OSType = 0x30304656  // '00FV'
+    private static let identifier: UInt32 = 1
     private static let shortcutKey = "favorite_awake_toggle_hotkey_v1"
     private static let durationKey = "favorite_awake_toggle_duration_v1"
     private static let customKeyCodeKey = "favorite_awake_custom_key_code_v2"
@@ -2267,6 +2269,7 @@ final class FavoriteAwakeHotKey {
         case commandOptionControlL = 3
         case custom = 4
         case controlOptionPeriod = 5
+
         var name: String {
             switch self {
             case .disabled: return "사용 안 함"
@@ -2284,7 +2287,7 @@ final class FavoriteAwakeHotKey {
             case .commandOptionControlJ: return UInt32(kVK_ANSI_J)
             case .commandOptionControlL: return UInt32(kVK_ANSI_L)
             case .controlOptionPeriod: return UInt32(kVK_ANSI_Period)
-            case .custom: return nil
+            case .custom: return nil  // 직접 지정은 사용자 저장 코드 사용
             }
         }
     }
@@ -2295,20 +2298,18 @@ final class FavoriteAwakeHotKey {
     private var customModifiers: UInt32
     private var customKeyName: String
     private(set) var lastNotice: String = ""
-    // 모든 비단축키 이벤트는 원래 앱에 전달하며 지정한 keyDown만 선택적으로 차단합니다.
-    private var globalKeyTap: CFMachPort?
-    private var globalKeyTapCanSuppress = false
-    private var globalKeySource: CFRunLoopSource?
-    // HK12-R1: 읽기 전용 폴백 이후 권한 승인을 감지해 1회 승격 재시도.
-    private var permissionUpgradeTimer: Timer?
+    private var hotKeyRef: EventHotKeyRef?
+    private var handlerRef: EventHandlerRef?
     private var lastToggleUptime: TimeInterval = -10
     private var suspendedForRecorder = false
 
     private init() {
         let defaults = UserDefaults.standard
+        // HK2의 기본값 ⌃⌥⌘K를 처음 한 번 ⌃⌥.로 전환합니다.
+        // 사용자가 이미 J/L/직접 지정/사용 안 함을 선택했다면 보존합니다.
         let storedPreset = defaults.object(forKey: Self.shortcutKey) as? Int
         if storedPreset == Preset.commandOptionControlK.rawValue &&
-            !defaults.bool(forKey: Self.periodShortcutMigrationKey) {
+           !defaults.bool(forKey: Self.periodShortcutMigrationKey) {
             preset = .controlOptionPeriod
             defaults.set(Preset.controlOptionPeriod.rawValue, forKey: Self.shortcutKey)
         } else {
@@ -2333,6 +2334,7 @@ final class FavoriteAwakeHotKey {
         if customModifiers & UInt32(cmdKey) != 0 { flags += "⌘" }
         return flags + customKeyName
     }
+
     var toggleDurationLabel: String {
         switch toggleMinutes {
         case 5: return "5분"
@@ -2346,269 +2348,190 @@ final class FavoriteAwakeHotKey {
         }
     }
 
-    private static func flagsToCarbon(_ flags: NSEvent.ModifierFlags) -> UInt32 {
-        let f = flags.intersection([.control, .option, .shift, .command])
-        var result: UInt32 = 0
-        if f.contains(.control) { result |= UInt32(controlKey) }
-        if f.contains(.option) { result |= UInt32(optionKey) }
-        if f.contains(.shift) { result |= UInt32(shiftKey) }
-        if f.contains(.command) { result |= UInt32(cmdKey) }
-        return result
+    private static let eventCallback: EventHandlerUPP = { _, event, _ in
+        guard let event = event else { return OSStatus(eventNotHandledErr) }
+        var receivedID = EventHotKeyID()
+        let result = GetEventParameter(
+            event,
+            UInt32(kEventParamDirectObject),
+            EventParamType(typeEventHotKeyID),
+            nil,
+            MemoryLayout<EventHotKeyID>.size,
+            nil,
+            &receivedID
+        )
+        guard result == noErr,
+              receivedID.signature == FavoriteAwakeHotKey.signature,
+              receivedID.id == FavoriteAwakeHotKey.identifier else {
+            return OSStatus(eventNotHandledErr)
+        }
+        DispatchQueue.main.async { FavoriteAwakeHotKey.shared.toggle() }
+        return noErr
     }
 
-    // Finder·Chrome 등 활성 앱과 무관하게 지정된 조합만 일치 판정합니다.
-    // false면 원래 앱에 키를 전달합니다. true면 능동형 탭에서만 해당 keyDown을 소비합니다.
-    // 자동 반복도 소비하지만 잠자기 상태는 최초 keyDown에서만 전환합니다.
-    private func handleGlobalKeyDown(_ event: CGEvent) -> Bool {
-        guard !suspendedForRecorder, preset != .disabled else { return false }
+    private func ensureHandler() -> Bool {
+        if handlerRef != nil { return true }
+        var eventSpec = EventTypeSpec(
+            eventClass: UInt32(kEventClassKeyboard),
+            eventKind: UInt32(kEventHotKeyPressed)
+        )
+        let result = InstallEventHandler(
+            GetApplicationEventTarget(), Self.eventCallback, 1, &eventSpec, nil, &handlerRef
+        )
+        if result != noErr {
+            lastNotice = "단축키 이벤트 등록 실패 (\(result))"
+            return false
+        }
+        return true
+    }
 
-        let wantedKey: UInt32
-        let wantedModifiers: UInt32
-        if preset == .custom {
-            wantedKey = customKeyCode
-            wantedModifiers = customModifiers
+    private func register(_ chosen: Preset, candidate: (UInt32, UInt32)? = nil) -> Bool {
+        guard chosen != .disabled else { return true }
+        let keyCode: UInt32
+        let mods: UInt32
+        if chosen == .custom {
+            keyCode = candidate?.0 ?? customKeyCode
+            mods = candidate?.1 ?? customModifiers
         } else {
-            guard let code = preset.keyCode else { return false }
-            wantedKey = code
-            wantedModifiers = preset == .controlOptionPeriod
+            guard let presetCode = chosen.keyCode else { return false }
+            keyCode = presetCode
+            mods = chosen == .controlOptionPeriod
                 ? UInt32(controlKey | optionKey)
                 : UInt32(controlKey | optionKey | cmdKey)
         }
-        let flags = event.flags
-        var pressedModifiers: UInt32 = 0
-        if flags.contains(.maskControl) { pressedModifiers |= UInt32(controlKey) }
-        if flags.contains(.maskAlternate) { pressedModifiers |= UInt32(optionKey) }
-        if flags.contains(.maskShift) { pressedModifiers |= UInt32(shiftKey) }
-        if flags.contains(.maskCommand) { pressedModifiers |= UInt32(cmdKey) }
-
-        let pressedKey = UInt32(event.getIntegerValueField(.keyboardEventKeycode))
-        guard pressedKey == wantedKey, pressedModifiers == wantedModifiers else { return false }
-        // 이벤트 탭 콜백에서는 IOKit이나 AppKit UI를 호출하지 않고 즉시 반환합니다.
-        // 반복 키 입력은 버리지만 상태 전환은 1회만 하도록 합니다.
-        if event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
-            DispatchQueue.main.async { [weak self] in self?.toggle() }
+        guard ensureHandler() else { return false }
+        var newRef: EventHotKeyRef?
+        let id = EventHotKeyID(signature: Self.signature, id: Self.identifier)
+        let result = RegisterEventHotKey(
+            keyCode, mods, id, GetApplicationEventTarget(), 0, &newRef
+        )
+        guard result == noErr, let registeredRef = newRef else {
+            lastNotice = "해당 단축키를 등록하지 못했습니다(\(result)). macOS 또는 다른 앱과 충돌할 수 있습니다."
+            return false
         }
+        hotKeyRef = registeredRef
+        lastNotice = ""
         return true
     }
 
+    func startMonitoring() {
+        _ = register(preset)
+    }
+    // 등록형 단축키는 macOS가 지정된 키 조합을 처리합니다. 화면 키 입력을 별도 가로채지 않습니다.
     var globalShortcutMonitorStatus: String {
         if preset == .disabled { return "사용 안 함" }
-        guard let tap = globalKeyTap else { return "연결 안 됨" }
-        guard CGEvent.tapIsEnabled(tap: tap) else { return "전역 감시 중단됨" }
-        return globalKeyTapCanSuppress ? "입력 차단 활성 · 단축키 문자는 전달하지 않음" : "읽기 전용 · 단축키 문자가 입력될 수 있음"
+        if hotKeyRef != nil { return "시스템 등록형 · 문자 입력 중복 방지" }
+        return "등록 실패 · 단축키 사용 불가"
     }
-    var needsSuppressionRepair: Bool {
-        guard preset != .disabled else { return false }
-        guard let tap = globalKeyTap else { return true }
-        return !globalKeyTapCanSuppress || !CGEvent.tapIsEnabled(tap: tap)
-    }
+    var needsRegistrationRepair: Bool { preset != .disabled && hotKeyRef == nil }
 
     @discardableResult
-    private func ensurePassiveMonitors() -> Bool {
-        if let tap = globalKeyTap {
-            if !CGEvent.tapIsEnabled(tap: tap) {
-                CGEvent.tapEnable(tap: tap, enable: true)
-            }
-            if CGEvent.tapIsEnabled(tap: tap) {
-                // 이미 읽기 전용 탭이 연결되어 있다고 해서 입력 차단까지 된 것은 아닙니다.
-                if globalKeyTapCanSuppress { lastNotice = "" }
-                return true
-            }
-            stopMonitoring()
-        }
-        guard CGPreflightListenEventAccess() else {
-            lastNotice = "입력 모니터링 권한이 없습니다. 시스템 설정에서 00Favorite을 허용한 후 앱을 다시 실행하세요."
-            return false
-        }
-        // 세션 전역 읽기 전용: 특정 앱의 활성화 여부에 종속되지 않습니다.
-        let callback: CGEventTapCallBack = { _, type, event, refcon in
-            guard let refcon = refcon else { return Unmanaged.passUnretained(event) }
-            let observer = Unmanaged<FavoriteAwakeHotKey>.fromOpaque(refcon).takeUnretainedValue()
-            if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-                if let tap = observer.globalKeyTap, observer.preset != .disabled {
-                    CGEvent.tapEnable(tap: tap, enable: true)
-                }
-            } else if type == .keyDown && observer.handleGlobalKeyDown(event) {
-                // 오직 사용자 지정 잠자기 단축키만 차단합니다.
-                if observer.globalKeyTapCanSuppress { return nil }
-            }
-            return Unmanaged.passUnretained(event)
-        }
-        let keyDownMask: CGEventMask = 1 << CGEventType.keyDown.rawValue
-        let context = Unmanaged.passUnretained(self).toOpaque()
-        // 다른 앱의 문자 입력을 막으려면 listenOnly가 아닌 능동형 필터가 필요합니다.
-        let activeTap = CGEvent.tapCreate(tap: .cgSessionEventTap,
-                                           place: .headInsertEventTap,
-                                           options: .defaultTap,
-                                           eventsOfInterest: keyDownMask,
-                                           callback: callback,
-                                           userInfo: context)
-        // 능동형 탭 권한이 없는 Mac에서도 기존의 잠자기 토글은 유지합니다.
-        let tap = activeTap ?? CGEvent.tapCreate(tap: .cgSessionEventTap,
-                                                  place: .headInsertEventTap,
-                                                  options: .listenOnly,
-                                                  eventsOfInterest: keyDownMask,
-                                                  callback: callback,
-                                                  userInfo: context)
-        guard let tap else {
-            lastNotice = "macOS 전역 키 입력 감시를 연결하지 못했습니다. 입력 모니터링 및 기기 제어 권한을 확인하세요."
-            return false
-        }
-        globalKeyTapCanSuppress = activeTap != nil
-        guard let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0) else {
-            CFMachPortInvalidate(tap)
-            lastNotice = "전역 단축키 이벤트 루프를 준비하지 못했습니다."
-            return false
-        }
-        // 메뉴바 조작 및 별도 설정창이 열려도 이벤트를 계속 받을 수 있도록 공통 모드로 연결합니다.
-        CFRunLoopAddSource(CFRunLoopGetMain(), source, CFRunLoopMode.commonModes)
-        globalKeyTap = tap
-        globalKeySource = source
-        CGEvent.tapEnable(tap: tap, enable: true)
-        guard CGEvent.tapIsEnabled(tap: tap) else {
-            stopMonitoring()
-            lastNotice = "전역 단축키 감시를 활성화하지 못했습니다."
-            return false
-        }
-        if globalKeyTapCanSuppress {
-            lastNotice = ""
-        } else if !AXIsProcessTrusted() {
-            lastNotice = "입력 차단을 위한 손쉬운 사용 권한이 현재 00Favorite 프로세스에 승인되지 않았습니다."
-        } else {
-            lastNotice = "손쉬운 사용은 승인되었지만 능동형 이벤트 감시 생성이 실패했습니다. '입력 차단 재연결'을 실행해 주세요."
-        }
-        return true
-    }
-
-    // 읽기 전용 tap을 유지하는 기존 코드가 권한이 바뀌어도 능동형으로 승격하지 못하던 문제 해결.
-    // 이 메서드는 메인 스레드에서만 실행하고, 기존 tap을 정리한 다음 단 1개만 생성합니다.
-    @discardableResult
-    func reconnectForSuppression() -> Bool {
+    func retryRegistration() -> Bool {
         guard preset != .disabled else { return false }
-        if let tap = globalKeyTap, globalKeyTapCanSuppress, CGEvent.tapIsEnabled(tap: tap) {
-            lastNotice = ""
-            return true
-        }
-        guard CGPreflightListenEventAccess() else {
-            lastNotice = "입력 모니터링 권한이 없습니다. macOS 설정에서 00Favorite을 승인해 주세요."
-            return false
-        }
-        guard AXIsProcessTrusted() else {
-            lastNotice = "손쉬운 사용(기기 제어 및 데이터 접근) 권한을 00Favorite에 승인한 뒤 다시 연결해 주세요."
-            return false
-        }
-        // 이전 listenOnly tap을 남겨 두면 한 번의 keyDown을 두 번 받아 토글할 수 있습니다.
-        stopMonitoring()
-        let connected = ensurePassiveMonitors()
-        if connected && !globalKeyTapCanSuppress {
-            lastNotice = "손쉬운 사용 승인 확인 · 능동형 감시 생성 실패. 00Favorite을 완전히 종료했다가 실행하고 다시 연결해 주세요."
-        }
-        return connected && globalKeyTapCanSuppress
+        if hotKeyRef != nil { lastNotice = ""; return true }
+        return register(preset)
     }
 
-    // 실행 당시 읽기 전용이었다가 사용자가 macOS 설정에서 승인한 경우의 자동 복구.
-    // 수 초마다 승인 상태만 검사하고, 권한을 얻으면 딱 한 번 재연결을 시도합니다.
-    // 감시 실패가 계속될 때 재설치·재등록을 무한 반복하지 않습니다.
-    private func schedulePermissionUpgradeCheck() {
-        guard preset != .disabled, needsSuppressionRepair, permissionUpgradeTimer == nil else { return }
-        let timer = Timer(timeInterval: 4.0, repeats: true) { [weak self] _ in
-            guard let self = self else { return }
-            if self.preset == .disabled || !self.needsSuppressionRepair {
-                self.permissionUpgradeTimer?.invalidate()
-                self.permissionUpgradeTimer = nil
-                return
-            }
-            guard AXIsProcessTrusted(), CGPreflightListenEventAccess() else { return }
-            self.permissionUpgradeTimer?.invalidate()
-            self.permissionUpgradeTimer = nil
-            _ = self.reconnectForSuppression()
-            (NSApp.delegate as? AppDelegate)?.updateStatusBarMenu()
-        }
-        RunLoop.main.add(timer, forMode: .common)
-        permissionUpgradeTimer = timer
+    // 설정 창에서 기존 단축키를 다시 입력해도 잠자기 토글이 실행되지 않도록 잠시 정지.
+    func suspendForRecorder() {
+        guard !suspendedForRecorder else { return }
+        suspendedForRecorder = true
+        if let ref = hotKeyRef { _ = UnregisterEventHotKey(ref); hotKeyRef = nil }
     }
-    func startMonitoring() {
-        if preset != .disabled {
-            _ = ensurePassiveMonitors()
-            schedulePermissionUpgradeCheck()
-        }
+    func resumeAfterRecorder() {
+        guard suspendedForRecorder else { return }
+        suspendedForRecorder = false
+        if preset != .disabled && hotKeyRef == nil { _ = register(preset) }
     }
-    func suspendForRecorder() { suspendedForRecorder = true }
-    func resumeAfterRecorder() { suspendedForRecorder = false }
 
     @discardableResult
     func changePreset(_ chosen: Preset) -> Bool {
+        if chosen == preset {
+            return chosen == .disabled || retryRegistration()
+        }
         if chosen == .disabled {
+            if let ref = hotKeyRef { _ = UnregisterEventHotKey(ref); hotKeyRef = nil }
             preset = chosen
-            stopMonitoring()
             lastNotice = ""
             UserDefaults.standard.set(chosen.rawValue, forKey: Self.shortcutKey)
             return true
         }
-        // 소극적 모니터가 없어도 기존의 CGEventTap은 건드리지 않습니다.
-        guard ensurePassiveMonitors() else { return false }
-        preset = chosen
-        UserDefaults.standard.set(chosen.rawValue, forKey: Self.shortcutKey)
-        schedulePermissionUpgradeCheck()
-        return true
+        let old = preset
+        if let existing = hotKeyRef { _ = UnregisterEventHotKey(existing); hotKeyRef = nil }
+        if register(chosen) {
+            preset = chosen
+            UserDefaults.standard.set(chosen.rawValue, forKey: Self.shortcutKey)
+            return true
+        }
+        let failureNotice = lastNotice
+        // 새 단축키가 실패하더라도 기존 단축키를 복구합니다.
+        if !register(old) { lastNotice = failureNotice + " 기존 단축키 재등록도 실패했습니다." }
+        else { lastNotice = failureNotice }
+        return false
     }
 
+    // 설정 화면의 실시간 단축키 입력 결과를 OS에 먼저 등록한 뒤에만 저장합니다.
+    // Shift/Command 파일 드래그 감시와 전혀 연결되지 않는 Carbon 핫키입니다.
     @discardableResult
     func changeCustomShortcut(keyCode: UInt32, keyName: String, flags: NSEvent.ModifierFlags) -> Bool {
         let clean = flags.intersection([.control, .option, .shift, .command])
         let count = [NSEvent.ModifierFlags.control, .option, .shift, .command]
             .filter { clean.contains($0) }.count
-        // 기존 파일 변환 휠은 수정키만 사용하므로 반드시 일반 키 하나도 요구합니다.
         guard clean.contains(.control), count >= 2, !keyName.isEmpty else {
             lastNotice = "Control을 포함한 수정키 2개 이상 + 일반 키 하나를 눌러주세요."
             return false
         }
-        let newModifiers = Self.flagsToCarbon(clean)
-        guard ensurePassiveMonitors() else { return false }
-        customKeyCode = keyCode
-        customModifiers = newModifiers
-        customKeyName = keyName
-        preset = .custom
-        let defaults = UserDefaults.standard
-        defaults.set(Preset.custom.rawValue, forKey: Self.shortcutKey)
-        defaults.set(Int(keyCode), forKey: Self.customKeyCodeKey)
-        defaults.set(Int(newModifiers), forKey: Self.customModifiersKey)
-        defaults.set(keyName, forKey: Self.customKeyNameKey)
-        lastNotice = ""
-        schedulePermissionUpgradeCheck()
-        return true
+        var newModifiers: UInt32 = 0
+        if clean.contains(.control) { newModifiers |= UInt32(controlKey) }
+        if clean.contains(.option) { newModifiers |= UInt32(optionKey) }
+        if clean.contains(.shift) { newModifiers |= UInt32(shiftKey) }
+        if clean.contains(.command) { newModifiers |= UInt32(cmdKey) }
+        let oldPreset = preset
+        if let previousRef = hotKeyRef {
+            _ = UnregisterEventHotKey(previousRef)
+            hotKeyRef = nil
+        }
+        if register(.custom, candidate: (keyCode, newModifiers)) {
+            customKeyCode = keyCode
+            customModifiers = newModifiers
+            customKeyName = keyName
+            preset = .custom
+            let d = UserDefaults.standard
+            d.set(Preset.custom.rawValue, forKey: Self.shortcutKey)
+            d.set(Int(keyCode), forKey: Self.customKeyCodeKey)
+            d.set(Int(newModifiers), forKey: Self.customModifiersKey)
+            d.set(keyName, forKey: Self.customKeyNameKey)
+            return true
+        }
+        let registrationError = lastNotice
+        if !register(oldPreset) {
+            lastNotice = registrationError + " 기존 단축키 복구도 실패했습니다."
+        } else { lastNotice = registrationError }
+        return false
     }
+
     func setToggleMinutes(_ minutes: Int) {
         guard [5, 15, 30, 60, 120, 240, 480, -1].contains(minutes) else { return }
         toggleMinutes = minutes
         UserDefaults.standard.set(minutes, forKey: Self.durationKey)
     }
+
     func toggle() {
         let now = ProcessInfo.processInfo.systemUptime
-        // isARepeat에서 키 자동 반복을 이미 걸러내므로 0.5초 재입력 제한은 불필요하게 깁니다.
-        // 아주 가까운 중복 이벤트만 억제하며 빠른 수동 OFF 전환은 허용합니다.
+        // 누르고 있는 동안 반복 발생하는 키 이벤트로 ON/OFF가 여러 번 바뀌지 않게 보호합니다.
         guard now - lastToggleUptime > 0.15 else { return }
         lastToggleUptime = now
         let awake = FavoriteAwakeManager.shared
-        if awake.isActive { awake.stop() }
-        else if !awake.start(minutes: toggleMinutes == -1 ? nil : toggleMinutes) {
+        if awake.isActive {
+            awake.stop()
+        } else if !awake.start(minutes: toggleMinutes == -1 ? nil : toggleMinutes) {
             ToolWindowManager.shared.showBanner(message: awake.lastNotice.isEmpty ? "잠자기 방지 실행 실패" : awake.lastNotice)
         }
     }
+
     func stopMonitoring() {
-        permissionUpgradeTimer?.invalidate()
-        permissionUpgradeTimer = nil
-        if let source = globalKeySource {
-            CFRunLoopRemoveSource(CFRunLoopGetMain(), source, CFRunLoopMode.commonModes)
-            CFRunLoopSourceInvalidate(source)
-            globalKeySource = nil
-        }
-        if let tap = globalKeyTap {
-            CGEvent.tapEnable(tap: tap, enable: false)
-            CFMachPortInvalidate(tap)
-            globalKeyTap = nil
-        }
-        globalKeyTapCanSuppress = false
+        if let ref = hotKeyRef { _ = UnregisterEventHotKey(ref); hotKeyRef = nil }
+        if let ref = handlerRef { _ = RemoveEventHandler(ref); handlerRef = nil }
     }
 }
 
@@ -2618,7 +2541,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard let path = Bundle.main.path(forResource: "icon_awake", ofType: "png") else { return nil }
         return NSImage(contentsOfFile: path)
     }()
-    private let buildIdentifier = "FAV-20261121-HK12R1"
+    private let buildIdentifier = "FAV-20261121-HK13"
     var wheelPanel: NSPanel?
     var wheelCenterPoint: NSPoint = .zero
     
@@ -2687,7 +2610,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         setupUltraLightEventTap()
-        // 잠자기 방지 토글은 변환 이벤트 감시가 초기화된 뒤 독립적으로 시작합니다.
+        // Finder 휠의 읽기 전용 탭과 별도로, macOS에 잠자기 전역 단축키만 등록합니다.
         FavoriteAwakeHotKey.shared.startMonitoring()
         updateStatusBarMenu()
         // 메인 메뉴가 준비된 후 1회만 검사합니다. 권한이 이미 정상이라면 아무것도 띄우지 않습니다.
@@ -2844,8 +2767,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let hotkeyStatusItem = NSMenuItem(title: "전역 단축키: \(hotkey.globalShortcutMonitorStatus)", action: nil, keyEquivalent: "")
         hotkeyStatusItem.isEnabled = false
         submenu.addItem(hotkeyStatusItem)
-        if hotkey.needsSuppressionRepair {
-            let repair = NSMenuItem(title: "⌨️ 단축키 문자 입력 차단 재연결…", action: #selector(reconnectAwakeHotkeySuppression), keyEquivalent: "")
+        if hotkey.needsRegistrationRepair {
+            let repair = NSMenuItem(title: "⌨️ 시스템 단축키 다시 등록…", action: #selector(reconnectAwakeHotkeyRegistration), keyEquivalent: "")
             repair.target = self
             submenu.addItem(repair)
         }
@@ -2908,41 +2831,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         FavoriteAwakeHotKey.shared.toggle()
         updateStatusBarMenu()
     }
-    @objc private func reconnectAwakeHotkeySuppression() {
+    @objc private func reconnectAwakeHotkeyRegistration() {
         let hotkey = FavoriteAwakeHotKey.shared
-        if hotkey.reconnectForSuppression() {
+        if hotkey.retryRegistration() {
             updateStatusBarMenu()
             return
         }
         updateStatusBarMenu()
-        let inputGranted = CGPreflightListenEventAccess()
-        let accessibilityGranted = AXIsProcessTrusted()
         let alert = NSAlert()
         alert.alertStyle = .warning
-        alert.messageText = "단축키 입력 차단을 연결하지 못했습니다"
+        alert.messageText = "macOS 전역 단축키 등록 실패"
         alert.informativeText = """
-        입력 모니터링: \(inputGranted ? "승인" : "미승인")
-        기기 제어 및 데이터 접근(손쉬운 사용): \(accessibilityGranted ? "승인" : "미승인")
-
         \(hotkey.lastNotice)
 
-        읽기 전용 감시에서는 잠자기 토글은 작동하지만 Chrome 입력창에 마침표가 들어갈 수 있습니다.
-        설정을 변경한 뒤 00Favorite을 다시 실행하고 '입력 차단 재연결'을 선택해 주세요.
+        입력 모니터링·손쉬운 사용 승인을 반복해도 등록 충돌은 해결되지 않을 수 있습니다.
+        macOS 시스템 또는 다른 앱이 같은 단축키를 사용 중인지 확인한 후,
+        00Favorite → 설명 및 설정에서 다른 단축키로 변경해 주세요.
+        실패 상태에서는 읽기 전용 감시로 전환하지 않으므로 입력창에 문자가 중복 입력되지 않습니다.
         """
-        if !inputGranted || !accessibilityGranted {
-            alert.addButton(withTitle: inputGranted ? "기기 제어 권한 설정 열기" : "입력 모니터링 설정 열기")
-            alert.addButton(withTitle: "닫기")
-            if alert.runModal() == .alertFirstButtonReturn {
-                if !inputGranted {
-                    FolderAccessPreferences.shared.openInputMonitoringSettings()
-                } else {
-                    FolderAccessPreferences.shared.openAccessibilitySettings()
-                }
-            }
-        } else {
-            alert.addButton(withTitle: "확인")
-            alert.runModal()
-        }
+        alert.addButton(withTitle: "확인")
+        alert.runModal()
     }
     @objc private func changeAwakeHotkey(_ sender: NSMenuItem) {
         guard let choice = FavoriteAwakeHotKey.Preset(rawValue: sender.tag) else { return }
