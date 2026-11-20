@@ -2045,6 +2045,8 @@ final class FavoriteAwakeManager {
     private var activeAssertion: IOPMAssertionID?
     private(set) var expiresAt: Date?
     private var checkTimer: Timer?
+    // 만료 시점을 별도 one-shot 타이머로 예약하여 15초 상태 점검 지연을 제거합니다.
+    private var expiryTimer: Timer?
     private var shownMinutes: Int = -1
     private(set) var lastNotice: String = ""
     var onChange: (() -> Void)?
@@ -2139,6 +2141,7 @@ final class FavoriteAwakeManager {
         UserDefaults.standard.set(mode.rawValue, forKey: Keys.mode)
         if let oldID = previous { _ = IOPMAssertionRelease(oldID) }
         ensureTimer()
+        scheduleExpiryTimer()
         onChange?()
         return true
     }
@@ -2188,6 +2191,8 @@ final class FavoriteAwakeManager {
         shownMinutes = -1
         checkTimer?.invalidate()
         checkTimer = nil
+        expiryTimer?.invalidate()
+        expiryTimer = nil
         if let id = previous { _ = IOPMAssertionRelease(id) }
         lastNotice = message
         onChange?()
@@ -2204,6 +2209,20 @@ final class FavoriteAwakeManager {
         let timer = Timer(timeInterval: 15.0, repeats: true) { [weak self] _ in self?.checkStatus() }
         RunLoop.main.add(timer, forMode: .common)
         checkTimer = timer
+    }
+
+    // 변환·압축 작업과 독립된 수동 잠자기 방지의 정확한 종료 시각만 담당합니다.
+    private func scheduleExpiryTimer() {
+        expiryTimer?.invalidate()
+        expiryTimer = nil
+        guard let deadline = expiresAt else { return }
+        let remaining = deadline.timeIntervalSinceNow
+        if remaining <= 0 { checkStatus(); return }
+        let timer = Timer(timeInterval: remaining, repeats: false) { [weak self] _ in
+            self?.checkStatus()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        expiryTimer = timer
     }
 
     func checkStatus() {
@@ -2426,7 +2445,9 @@ final class FavoriteAwakeHotKey {
     }
     func toggle() {
         let now = ProcessInfo.processInfo.systemUptime
-        guard now - lastToggleUptime > 0.5 else { return }
+        // isARepeat에서 키 자동 반복을 이미 걸러내므로 0.5초 재입력 제한은 불필요하게 깁니다.
+        // 아주 가까운 중복 이벤트만 억제하며 빠른 수동 OFF 전환은 허용합니다.
+        guard now - lastToggleUptime > 0.15 else { return }
         lastToggleUptime = now
         let awake = FavoriteAwakeManager.shared
         if awake.isActive { awake.stop() }
@@ -2446,7 +2467,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard let path = Bundle.main.path(forResource: "icon_awake", ofType: "png") else { return nil }
         return NSImage(contentsOfFile: path)
     }()
-    private let buildIdentifier = "FAV-20261120-HK4"
+    private let buildIdentifier = "FAV-20261120-HK5"
     var wheelPanel: NSPanel?
     var wheelCenterPoint: NSPoint = .zero
     
@@ -2486,7 +2507,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         JobProgressManager.shared.onUpdate = { [weak self] in self?.updateStatusBarMenu() }
         // 잠자기 방지와 파일 변환의 실행/종료는 연결하지 않습니다. 메뉴 아이콘 상태만 갱신합니다.
         FavoriteAwakeManager.shared.onChange = { [weak self] in
-            DispatchQueue.main.async { self?.updateStatusBarMenu() }
+            // 상태 변화는 케이크 아이콘에 먼저 즉시 반영합니다.
+            // 메뉴 전체 재생성은 별도로 예약하여 키 입력 이벤트를 지연시키지 않습니다.
+            if Thread.isMainThread {
+                self?.refreshAwakeCakeIcon()
+                DispatchQueue.main.async { [weak self] in self?.updateStatusBarMenu() }
+            } else {
+                DispatchQueue.main.async { [weak self] in
+                    self?.refreshAwakeCakeIcon()
+                    self?.updateStatusBarMenu()
+                }
+            }
         }
 
         setupUltraLightEventTap()
@@ -2508,22 +2539,29 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Finder 아이콘은 번들에 포함된 AppIcon.icns가 담당합니다.
     }
     
-    func updateStatusBarMenu() {
-        let jobs = JobProgressManager.shared.jobs
+    // 잠자기 상태 변경 시 메뉴 전체가 갱신되기 전에 버튼 그림부터 반영합니다.
+    // 항상 AppKit 메인 스레드에서 호출합니다. 기존 Finder 휠 코드와는 연결되지 않습니다.
+    private func refreshAwakeCakeIcon() {
+        guard let btn = statusItem?.button else { return }
         let isAwake = FavoriteAwakeManager.shared.isActive
         let currentCakeIcon = (isAwake ? awakeCakeIcon : nil) ?? FileProcessor.customAppIconImage()
-        // 앱 아이콘은 시작 시 한 번 지정합니다. 메뉴 갱신은 메뉴바 아이콘만 바꿉니다.
-        if let btn = statusItem.button {
-            if let cake = currentCakeIcon {
-                let menuIcon = (cake.copy() as? NSImage) ?? cake
-                menuIcon.size = NSSize(width: 18, height: 18)
-                menuIcon.isTemplate = false
-                btn.image = menuIcon
-                btn.toolTip = isAwake ? "잠자기 방지 켜짐 · 00Favorite" : "잠자기 방지 꺼짐 · 00Favorite"
-            } else {
-                btn.image = NSImage(systemSymbolName: "circle.hexagongrid.fill", accessibilityDescription: "00Favorite")
-            }
-            // 파일 변환 작업의 진행률은 아이콘 상태와 무관하게 숫자로 표시합니다.
+        if let cake = currentCakeIcon {
+            let menuIcon = (cake.copy() as? NSImage) ?? cake
+            menuIcon.size = NSSize(width: 18, height: 18)
+            menuIcon.isTemplate = false
+            btn.image = menuIcon
+        } else {
+            btn.image = NSImage(systemSymbolName: "circle.hexagongrid.fill", accessibilityDescription: "00Favorite")
+        }
+        btn.toolTip = isAwake ? "잠자기 방지 켜짐 · 00Favorite" : "잠자기 방지 꺼짐 · 00Favorite"
+        btn.needsDisplay = true
+    }
+
+    func updateStatusBarMenu() {
+        let jobs = JobProgressManager.shared.jobs
+        refreshAwakeCakeIcon()
+        if let btn = statusItem?.button {
+            // 파일 변환 작업의 진행률은 케이크 아이콘과 무관하게 숫자로 표시합니다.
             if let overall = JobProgressManager.shared.overallProgress {
                 btn.title = " \(Int((overall * 100.0).rounded()))%"
             } else {
