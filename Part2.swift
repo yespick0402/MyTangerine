@@ -2096,12 +2096,24 @@ final class FavoriteAwakeManager {
     @discardableResult
     private func activate(mode: WakeMode, until deadline: Date?) -> Bool {
         var newID: IOPMAssertionID = 0
-        let assertionType: CFString = (mode == .keepDisplayOn)
+        // Swift에서 IOKit의 assertion 이름 상수는 String으로 전달됩니다.
+        // IOPMAssertionCreateWithName은 CFString과 UInt32 레벨을 요구하므로
+        // 경계를 명시적으로 변환합니다. 파일 변환/전역 입력 처리와는 무관합니다.
+        let assertionTypeName = (mode == .keepDisplayOn)
             ? kIOPMAssertionTypePreventUserIdleDisplaySleep
             : kIOPMAssertionTypePreventUserIdleSystemSleep
+        guard let assertionType = CFStringCreateWithCString(
+            kCFAllocatorDefault,
+            assertionTypeName,
+            CFStringBuiltInEncodings.UTF8.rawValue
+        ) else {
+            lastNotice = "잠자기 방지 요청의 타입을 준비하지 못했습니다."
+            onChange?()
+            return false
+        }
         let code = IOPMAssertionCreateWithName(
             assertionType,
-            kIOPMAssertionLevelOn,
+            IOPMAssertionLevel(kIOPMAssertionLevelOn),
             "00Favorite · 사용자 수동 잠자기 방지" as CFString,
             &newID
         )
