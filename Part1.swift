@@ -29,6 +29,13 @@ class ShortcutSettings: ObservableObject {
     @Published var isToggleMode: Bool {
         didSet { UserDefaults.standard.set(isToggleMode, forKey: "tangerine_sc_toggle_mode_v44") }
     }
+    // 4.8 안전 모드: 입력은 항상 수동 감시하고, macOS 원본 드래그는 건드리지 않습니다.
+    @Published var wheelDetectionEnabled: Bool {
+        didSet { UserDefaults.standard.set(wheelDetectionEnabled, forKey: "tangerine_safe_enabled_v48") }
+    }
+    @Published var finderOnlyDetection: Bool {
+        didSet { UserDefaults.standard.set(finderOnlyDetection, forKey: "tangerine_safe_finder_only_v48") }
+    }
     @Published var renamePattern: String {
         didSet { UserDefaults.standard.set(renamePattern, forKey: "tangerine_rename_pattern_v40") }
     }
@@ -45,6 +52,9 @@ class ShortcutSettings: ObservableObject {
         let savedActions = UserDefaults.standard.integer(forKey: "tangerine_sc_actions_v44")
         let savedQual = UserDefaults.standard.integer(forKey: "tangerine_sc_quality_v44")
         let savedToggle = UserDefaults.standard.bool(forKey: "tangerine_sc_toggle_mode_v44")
+        let defaults = UserDefaults.standard
+        let savedEnabled = defaults.object(forKey: "tangerine_safe_enabled_v48") as? Bool
+        let savedFinderOnly = defaults.object(forKey: "tangerine_safe_finder_only_v48") as? Bool
         let savedPattern = UserDefaults.standard.string(forKey: "tangerine_rename_pattern_v40")
         
         self.convertFlagsRaw = (savedConv != 0) ? UInt(savedConv) : Self.defaultConvertRaw
@@ -52,6 +62,8 @@ class ShortcutSettings: ObservableObject {
         self.actionsFlagsRaw = (savedActions != 0) ? UInt(savedActions) : Self.defaultActionsRaw
         self.qualityModifierRaw = (savedQual != 0) ? UInt(savedQual) : Self.defaultQualityRaw
         self.isToggleMode = savedToggle
+        self.wheelDetectionEnabled = savedEnabled ?? true
+        self.finderOnlyDetection = savedFinderOnly ?? true
         self.renamePattern = (savedPattern?.isEmpty == false) ? savedPattern! : Self.defaultRenamePattern
     }
     
@@ -74,6 +86,8 @@ class ShortcutSettings: ObservableObject {
         actionsFlagsRaw = Self.defaultActionsRaw
         qualityModifierRaw = Self.defaultQualityRaw
         isToggleMode = false
+        wheelDetectionEnabled = true
+        finderOnlyDetection = true
     }
     
     static func formatFlags(_ flags: NSEvent.ModifierFlags) -> String {
@@ -86,33 +100,44 @@ class ShortcutSettings: ObservableObject {
         return parts.isEmpty ? "키를 눌러주세요..." : parts.joined(separator: " + ")
     }
     
+    // 불필요한 상위 조합 인식 금지: ⌃/⌥/⇧/⌘가 함께 눌려도 정확히 설정된 조합만 동작합니다.
     func matchWheelMode(for flags: NSEvent.ModifierFlags) -> WheelMode? {
-        var clean = flags.intersection([.shift, .option, .control, .command])
+        let clean = flags.intersection([.shift, .option, .control, .command])
         guard !clean.isEmpty else { return nil }
-        
-        let tFlags = toolsFlags; let aFlags = actionsFlags; let cFlags = convertFlags; let qFlags = qualityFlags
-        if clean == tFlags { return .tools }
-        if clean == aFlags { return .actions }
-        if clean == cFlags { return .convert }
-        
-        let withoutQuality = clean.subtracting(qFlags)
-        if !withoutQuality.isEmpty {
-            if withoutQuality == tFlags { return .tools }
-            if withoutQuality == aFlags { return .actions }
-            if withoutQuality == cFlags { return .convert }
-            clean = withoutQuality
-        }
-        
-        let candidates: [(WheelMode, NSEvent.ModifierFlags)] = [
-            (.tools, tFlags), (.actions, aFlags), (.convert, cFlags)
-        ].sorted { $0.1.rawValue.nonzeroBitCount > $1.1.rawValue.nonzeroBitCount }
-        
-        for (mode, req) in candidates where !req.isEmpty {
-            if clean.isSuperset(of: req) { return mode }
+        let choices: [(WheelMode, NSEvent.ModifierFlags)] = [
+            (.tools, toolsFlags), (.actions, actionsFlags), (.convert, convertFlags)
+        ]
+        for (mode, req) in choices where !req.isEmpty && clean == req { return mode }
+        let quality = qualityFlags
+        if !quality.isEmpty && clean.isSuperset(of: quality) {
+            let withoutQuality = clean.subtracting(quality)
+            for (mode, req) in choices where !req.isEmpty && withoutQuality == req { return mode }
         }
         return nil
     }
-    
+
+    // 같은 조합이 여러 휠에 지정되거나 퀄리티 키가 휠 단축키에 포함되는 실수를 차단합니다.
+    func validationMessage(for flags: NSEvent.ModifierFlags, target: String) -> String? {
+        let clean = flags.intersection([.shift, .option, .control, .command])
+        if clean.isEmpty { return "수정키를 하나 이상 선택해 주세요." }
+        let otherWheels: [(String, NSEvent.ModifierFlags)] = [
+            ("convert", convertFlags), ("tools", toolsFlags), ("actions", actionsFlags)
+        ]
+        if target == "quality" {
+            for (_, wheelKeys) in otherWheels where wheelKeys.isSuperset(of: clean) {
+                return "퀄리티 키는 휠 단축키 안에 포함될 수 없습니다. 다른 조합을 선택하세요."
+            }
+        } else {
+            for (name, wheelKeys) in otherWheels where name != target && clean == wheelKeys {
+                return "다른 휠이 이미 사용하는 단축키입니다."
+            }
+            if clean.isSuperset(of: qualityFlags) && !qualityFlags.isEmpty {
+                return "퀄리티 옵션 키를 이미 포함하고 있습니다. 다른 단축키를 선택하세요."
+            }
+        }
+        return nil
+    }
+
     static func formatFileName(pattern: String, originalName: String, captureDate: Date, cameraModel: String, sequenceIndex: Int) -> String {
         // 촬영기기의 시계값을 GMT 기준 Date에 보관한 뒤 같은 GMT에서 추출합니다.
         // 컴퓨터의 현재 시간대로 재변환하여 촬영 시간에 9시간이 더해지지 않게 합니다.
@@ -1538,6 +1563,7 @@ struct HelpAndSettingsView: View {
     @State private var recordingTarget: String? = nil
     @State private var tempRecordedFlags: NSEvent.ModifierFlags = []
     @State private var localMonitor: Any? = nil
+    @State private var shortcutValidationWarning: String = ""
     
     let sampleDate: Date = {
         var comp = DateComponents()
@@ -1597,6 +1623,22 @@ struct HelpAndSettingsView: View {
     var shortcutRecorderTab: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
+                VStack(alignment: .leading, spacing: 9) {
+                    Label("안전 모드 (항상 적용)", systemImage: "shield.checkered")
+                        .font(.headline).foregroundColor(.green)
+                    Text("Finder의 키 입력과 마우스 드래그를 가로채거나 변경하지 않습니다. 휠 조각 위에 실제 파일을 드롭한 경우에만 MyTangerine 작업이 시작됩니다. 다른 위치에 놓으면 macOS가 원래 드롭을 처리합니다.")
+                        .font(.caption).foregroundColor(.secondary)
+                    Toggle("휠 감지 켜기 (메뉴바에서도 일시 정지 가능)", isOn: $settings.wheelDetectionEnabled)
+                        .onChange(of: settings.wheelDetectionEnabled) { enabled in
+                            let delegate = NSApp.delegate as? AppDelegate
+                            if !enabled { delegate?.hideWheel() }
+                            delegate?.updateStatusBarMenu()
+                        }
+                    Toggle("Finder에서 시작한 파일 드래그만 감지 (권장)", isOn: $settings.finderOnlyDetection)
+                    Text("기존 Shift / Option+Shift / Control 키는 유지합니다. 파일 드래그를 시작한 다음 해당 조합을 새로 눌러야만 휠이 열립니다. 평소 Finder의 Shift 선택·드래그에는 반응하지 않습니다.")
+                        .font(.caption2).foregroundColor(.secondary)
+                }
+                .padding(14).background(Color.green.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
                 VStack(alignment: .leading, spacing: 10) {
                     Text("1. 파일 드래그 시 휠 활성화 방식 선택").font(.headline).foregroundColor(.orange)
                     Picker("작동 방식", selection: $settings.isToggleMode) {
@@ -1620,6 +1662,9 @@ struct HelpAndSettingsView: View {
                         .font(.caption).foregroundColor(.secondary)
                 }
                 
+                if !shortcutValidationWarning.isEmpty {
+                    Text(shortcutValidationWarning).font(.caption.bold()).foregroundColor(.red)
+                }
                 VStack(spacing: 12) {
                     recorderCard(
                         targetID: "convert", title: "🔄 포맷 변환 휠 (CONVERT)",
@@ -1741,8 +1786,13 @@ struct HelpAndSettingsView: View {
                 
                 if isRecordingThis {
                     Button("완료") {
-                        if !tempRecordedFlags.isEmpty { onSave(tempRecordedFlags) }
-                        stopRecording()
+                        if let warning = settings.validationMessage(for: tempRecordedFlags, target: targetID) {
+                            shortcutValidationWarning = warning
+                        } else {
+                            shortcutValidationWarning = ""
+                            onSave(tempRecordedFlags)
+                            stopRecording()
+                        }
                     }.buttonStyle(.borderedProminent).tint(.green).disabled(tempRecordedFlags.isEmpty)
                     Button("취소") { stopRecording() }
                 } else {
@@ -1753,7 +1803,7 @@ struct HelpAndSettingsView: View {
     }
     
     func startRecording(for targetID: String) {
-        stopRecording(); recordingTarget = targetID; tempRecordedFlags = []
+        stopRecording(); shortcutValidationWarning = ""; recordingTarget = targetID; tempRecordedFlags = []
         localMonitor = NSEvent.addLocalMonitorForEvents(matching: [.flagsChanged, .keyDown]) { event in
             let flags = event.modifierFlags.intersection([.control, .option, .shift, .command])
             if !flags.isEmpty { self.tempRecordedFlags = flags }
@@ -1769,7 +1819,7 @@ struct HelpAndSettingsView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 guideCard(icon: "dial.high.fill", title: "1. 파일 변환 시 1~100% 퀄리티 선택 기능 & 순정 GIF 변환", items: [
-                    "파일 드래그 중 Shift를 눌러 변환(CONVERT) 휠을 띄운 뒤, 그냥 놓으면 즉시 변환됩니다.",
+                    "파일 드래그 중 Shift를 눌러 변환(CONVERT) 휠을 표시하고, 선택한 조각 위에 실제 파일을 놓으면 변환을 시작합니다. 휠 외부의 드롭은 Finder가 그대로 처리합니다.",
                     "변환 휠에서 ⌘ Command 키를 함께 누른 채로 확장자(JPG, WEBP, GIF, MP4 등)에 놓으면 1~100% 퀄리티 설정 창이 열립니다.",
                     "영상을 GIF로 변환할 때는 Apple 순정 애니메이션 GIF 엔진이 작동하여 깨짐 없이 미리보기/사파리에서 완벽히 열리는 GIF를 생성합니다."
                 ])
@@ -1778,7 +1828,7 @@ struct HelpAndSettingsView: View {
                     "[🎯 트림 구간만 꽉 차게 확대] 버튼을 누르면 현재 선택된 시작~끝 구간만 화면에 큼직하게 확대되어 1프레임 단위로 미세 조정이 가능합니다."
                 ])
                 guideCard(icon: "square.stack", title: "3. 이미지 세로 합치기 (ACTIONS)", items: [
-                    "파인더에서 이미지 2장 이상을 선택하여 드래그한 뒤 Control 키를 누르고 ACTIONS 휠에서 [이미지 합치기]를 선택합니다.",
+                    "파인더에서 이미지 2장 이상을 선택해 드래그하며 Control 키를 누른 뒤, ACTIONS 휠의 [이미지 합치기] 조각 위에 실제 파일을 놓습니다.",
                     "열린 창에서 순서, 가로폭, 간격, PNG/JPG/TIFF 또는 자동(초장축 TIFF 전환) 형식을 선택합니다.",
                     "원본 이미지는 수정하지 않으며 첫 번째 이미지가 있는 폴더에 새 파일을 만듭니다. 매우 긴 이미지는 메모리 보호를 위해 여러 장으로 자동 분할됩니다."
                 ])
