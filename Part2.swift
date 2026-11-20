@@ -2245,11 +2245,12 @@ final class FavoriteAwakeManager {
 }
 
 
-// MARK: - 잠자기 방지 키 조합 감지 — 전역 읽기 전용 Core Graphics 이벤트 감시
-// 앱 포커스에 종속된 NSEvent 글로벌/로컬 감시 대신 macOS 사용자 세션의
-// CGEventTap(keyDown, listenOnly)을 사용합니다. Finder 휠과는 별도 탭이며,
-// 입력 이벤트를 차단·변경하지 않고 기존 휠 드래그 코드도 건드리지 않습니다.
-// 보안 입력(Secure Input) 또는 화면 잠금 등 OS에서 차단하는 경우에는 작동하지 않을 수 있습니다.
+// MARK: - 잠자기 단축키: 다른 앱의 키 입력은 그대로 두고 일치한 키만 소비
+// 사용자 세션의 CGEventTap으로 지정한 단축키의 keyDown만 선택적으로 처리합니다.
+// 능동형 탭(.defaultTap)을 사용할 수 있으면 일치한 keyDown만 return nil로 소비하여
+// Chrome 등의 입력창에 문장부호가 입력되지 않게 합니다. 휠 CGEventTap과는 독립입니다.
+// 능동형 탭 생성이 거부되면 기존 읽기 전용(.listenOnly) 감시로 폴백하고
+// 사용자가 알 수 있게 상태에 제한사항을 표시합니다. 보안 입력 상태에서는 제한됩니다.
 final class FavoriteAwakeHotKey {
     static let shared = FavoriteAwakeHotKey()
     private static let shortcutKey = "favorite_awake_toggle_hotkey_v1"
@@ -2294,9 +2295,9 @@ final class FavoriteAwakeHotKey {
     private var customModifiers: UInt32
     private var customKeyName: String
     private(set) var lastNotice: String = ""
-    // 키 이벤트는 현재 앱을 포함한 사용자 세션 전체에서 수신합니다.
-    // 원래 앱 이벤트 전달과 관계없는 수동(listenOnly) 이벤트 탭입니다.
+    // 모든 비단축키 이벤트는 원래 앱에 전달하며 지정한 keyDown만 선택적으로 차단합니다.
     private var globalKeyTap: CFMachPort?
+    private var globalKeyTapCanSuppress = false
     private var globalKeySource: CFRunLoopSource?
     private var lastToggleUptime: TimeInterval = -10
     private var suspendedForRecorder = false
@@ -2353,12 +2354,11 @@ final class FavoriteAwakeHotKey {
         return result
     }
 
-    // Finder·Chrome·영상 편집 앱 등 어느 앱이 활성 상태이든, 설정한 키 조합만 비교합니다.
-    // 키 이벤트 내용은 저장/전송하지 않고, 다른 앱에 전달되는 이벤트는 수정하지 않습니다.
-    private func handleGlobalKeyDown(_ event: CGEvent) {
-        guard !suspendedForRecorder, preset != .disabled else { return }
-        // 누르고 있을 때 발생하는 자동 반복 입력으로 ON/OFF가 연속 전환되지 않게 합니다.
-        guard event.getIntegerValueField(.keyboardEventAutorepeat) == 0 else { return }
+    // Finder·Chrome 등 활성 앱과 무관하게 지정된 조합만 일치 판정합니다.
+    // false면 원래 앱에 키를 전달합니다. true면 능동형 탭에서만 해당 keyDown을 소비합니다.
+    // 자동 반복도 소비하지만 잠자기 상태는 최초 keyDown에서만 전환합니다.
+    private func handleGlobalKeyDown(_ event: CGEvent) -> Bool {
+        guard !suspendedForRecorder, preset != .disabled else { return false }
 
         let wantedKey: UInt32
         let wantedModifiers: UInt32
@@ -2366,7 +2366,7 @@ final class FavoriteAwakeHotKey {
             wantedKey = customKeyCode
             wantedModifiers = customModifiers
         } else {
-            guard let code = preset.keyCode else { return }
+            guard let code = preset.keyCode else { return false }
             wantedKey = code
             wantedModifiers = preset == .controlOptionPeriod
                 ? UInt32(controlKey | optionKey)
@@ -2380,16 +2380,20 @@ final class FavoriteAwakeHotKey {
         if flags.contains(.maskCommand) { pressedModifiers |= UInt32(cmdKey) }
 
         let pressedKey = UInt32(event.getIntegerValueField(.keyboardEventKeycode))
-        guard pressedKey == wantedKey, pressedModifiers == wantedModifiers else { return }
-        // 파일 드래그와 변환 휠의 상태값을 참조하지 않습니다.
-        // 토글은 기존 IOKit 수동 잠자기 방지 관리자에만 전달합니다.
-        toggle()
+        guard pressedKey == wantedKey, pressedModifiers == wantedModifiers else { return false }
+        // 이벤트 탭 콜백에서는 IOKit이나 AppKit UI를 호출하지 않고 즉시 반환합니다.
+        // 반복 키 입력은 버리지만 상태 전환은 1회만 하도록 합니다.
+        if event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
+            DispatchQueue.main.async { [weak self] in self?.toggle() }
+        }
+        return true
     }
 
     var globalShortcutMonitorStatus: String {
         if preset == .disabled { return "사용 안 함" }
         guard let tap = globalKeyTap else { return "연결 안 됨" }
-        return CGEvent.tapIsEnabled(tap: tap) ? "전역 감시 연결됨" : "전역 감시 중단됨"
+        guard CGEvent.tapIsEnabled(tap: tap) else { return "전역 감시 중단됨" }
+        return globalKeyTapCanSuppress ? "전역 단축키 연결됨 · 입력 중복 방지" : "읽기 전용 감시 · 단축키 문자가 입력될 수 있음"
     }
 
     @discardableResult
@@ -2416,21 +2420,33 @@ final class FavoriteAwakeHotKey {
                 if let tap = observer.globalKeyTap, observer.preset != .disabled {
                     CGEvent.tapEnable(tap: tap, enable: true)
                 }
-            } else if type == .keyDown {
-                observer.handleGlobalKeyDown(event)
+            } else if type == .keyDown && observer.handleGlobalKeyDown(event) {
+                // 오직 사용자 지정 잠자기 단축키만 차단합니다.
+                if observer.globalKeyTapCanSuppress { return nil }
             }
             return Unmanaged.passUnretained(event)
         }
         let keyDownMask: CGEventMask = 1 << CGEventType.keyDown.rawValue
-        guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap,
-                                          place: .headInsertEventTap,
-                                          options: .listenOnly,
-                                          eventsOfInterest: keyDownMask,
-                                          callback: callback,
-                                          userInfo: Unmanaged.passUnretained(self).toOpaque()) else {
-            lastNotice = "macOS 전역 키 입력 감시를 연결하지 못했습니다. 입력 모니터링 권한을 확인하세요."
+        let context = Unmanaged.passUnretained(self).toOpaque()
+        // 다른 앱의 문자 입력을 막으려면 listenOnly가 아닌 능동형 필터가 필요합니다.
+        let activeTap = CGEvent.tapCreate(tap: .cgSessionEventTap,
+                                           place: .headInsertEventTap,
+                                           options: .defaultTap,
+                                           eventsOfInterest: keyDownMask,
+                                           callback: callback,
+                                           userInfo: context)
+        // 능동형 탭 권한이 없는 Mac에서도 기존의 잠자기 토글은 유지합니다.
+        let tap = activeTap ?? CGEvent.tapCreate(tap: .cgSessionEventTap,
+                                                  place: .headInsertEventTap,
+                                                  options: .listenOnly,
+                                                  eventsOfInterest: keyDownMask,
+                                                  callback: callback,
+                                                  userInfo: context)
+        guard let tap else {
+            lastNotice = "macOS 전역 키 입력 감시를 연결하지 못했습니다. 입력 모니터링 및 기기 제어 권한을 확인하세요."
             return false
         }
+        globalKeyTapCanSuppress = activeTap != nil
         guard let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0) else {
             CFMachPortInvalidate(tap)
             lastNotice = "전역 단축키 이벤트 루프를 준비하지 못했습니다."
@@ -2446,7 +2462,7 @@ final class FavoriteAwakeHotKey {
             lastNotice = "전역 단축키 감시를 활성화하지 못했습니다."
             return false
         }
-        lastNotice = ""
+        lastNotice = globalKeyTapCanSuppress ? "" : "읽기 전용으로 연결됨: ⌃⌥. 입력 시 다른 앱에 마침표가 입력될 수 있습니다."
         return true
     }
     func startMonitoring() {
@@ -2523,6 +2539,7 @@ final class FavoriteAwakeHotKey {
             CFMachPortInvalidate(tap)
             globalKeyTap = nil
         }
+        globalKeyTapCanSuppress = false
     }
 }
 
@@ -2532,7 +2549,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard let path = Bundle.main.path(forResource: "icon_awake", ofType: "png") else { return nil }
         return NSImage(contentsOfFile: path)
     }()
-    private let buildIdentifier = "FAV-20261121-HK11"
+    private let buildIdentifier = "FAV-20261121-HK12"
     var wheelPanel: NSPanel?
     var wheelCenterPoint: NSPoint = .zero
     
