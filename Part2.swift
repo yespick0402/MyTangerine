@@ -2245,9 +2245,11 @@ final class FavoriteAwakeManager {
 }
 
 
-// MARK: - 잠자기 방지 키 조합 감지 — 별도 읽기 전용 AppKit 이벤트 감시
-// Carbon RegisterEventHotKey를 호출하지 않습니다. Finder에 전달되는 키·마우스 입력은
-// 절대 변경하지 않으며, 휠 CGEventTap과 공유하지 않는 별도 감시입니다.
+// MARK: - 잠자기 방지 키 조합 감지 — 전역 읽기 전용 Core Graphics 이벤트 감시
+// 앱 포커스에 종속된 NSEvent 글로벌/로컬 감시 대신 macOS 사용자 세션의
+// CGEventTap(keyDown, listenOnly)을 사용합니다. Finder 휠과는 별도 탭이며,
+// 입력 이벤트를 차단·변경하지 않고 기존 휠 드래그 코드도 건드리지 않습니다.
+// 보안 입력(Secure Input) 또는 화면 잠금 등 OS에서 차단하는 경우에는 작동하지 않을 수 있습니다.
 final class FavoriteAwakeHotKey {
     static let shared = FavoriteAwakeHotKey()
     private static let shortcutKey = "favorite_awake_toggle_hotkey_v1"
@@ -2292,8 +2294,10 @@ final class FavoriteAwakeHotKey {
     private var customModifiers: UInt32
     private var customKeyName: String
     private(set) var lastNotice: String = ""
-    private var globalKeyMonitor: Any?
-    private var localKeyMonitor: Any?
+    // 키 이벤트는 현재 앱을 포함한 사용자 세션 전체에서 수신합니다.
+    // 원래 앱 이벤트 전달과 관계없는 수동(listenOnly) 이벤트 탭입니다.
+    private var globalKeyTap: CFMachPort?
+    private var globalKeySource: CFRunLoopSource?
     private var lastToggleUptime: TimeInterval = -10
     private var suspendedForRecorder = false
 
@@ -2349,11 +2353,13 @@ final class FavoriteAwakeHotKey {
         return result
     }
 
-    // 다른 앱에 전달되는 keyDown을 읽기만 합니다. 복사/이동 또는 Finder 이벤트를 가로채지 않습니다.
-    private func handleKey(_ event: NSEvent) {
-        guard !suspendedForRecorder, preset != .disabled, !event.isARepeat else { return }
-        // 마우스로 파일을 드래그 중에는 잠자기 토글과 변환 휠이 서로 관여하지 않습니다.
-        if (NSApp.delegate as? AppDelegate)?.mouseIsDownInTap == true || AppState.shared.isDragging { return }
+    // Finder·Chrome·영상 편집 앱 등 어느 앱이 활성 상태이든, 설정한 키 조합만 비교합니다.
+    // 키 이벤트 내용은 저장/전송하지 않고, 다른 앱에 전달되는 이벤트는 수정하지 않습니다.
+    private func handleGlobalKeyDown(_ event: CGEvent) {
+        guard !suspendedForRecorder, preset != .disabled else { return }
+        // 누르고 있을 때 발생하는 자동 반복 입력으로 ON/OFF가 연속 전환되지 않게 합니다.
+        guard event.getIntegerValueField(.keyboardEventAutorepeat) == 0 else { return }
+
         let wantedKey: UInt32
         let wantedModifiers: UInt32
         if preset == .custom {
@@ -2366,27 +2372,78 @@ final class FavoriteAwakeHotKey {
                 ? UInt32(controlKey | optionKey)
                 : UInt32(controlKey | optionKey | cmdKey)
         }
-        guard UInt32(event.keyCode) == wantedKey,
-              Self.flagsToCarbon(event.modifierFlags) == wantedModifiers else { return }
+        let flags = event.flags
+        var pressedModifiers: UInt32 = 0
+        if flags.contains(.maskControl) { pressedModifiers |= UInt32(controlKey) }
+        if flags.contains(.maskAlternate) { pressedModifiers |= UInt32(optionKey) }
+        if flags.contains(.maskShift) { pressedModifiers |= UInt32(shiftKey) }
+        if flags.contains(.maskCommand) { pressedModifiers |= UInt32(cmdKey) }
+
+        let pressedKey = UInt32(event.getIntegerValueField(.keyboardEventKeycode))
+        guard pressedKey == wantedKey, pressedModifiers == wantedModifiers else { return }
+        // 파일 드래그와 변환 휠의 상태값을 참조하지 않습니다.
+        // 토글은 기존 IOKit 수동 잠자기 방지 관리자에만 전달합니다.
         toggle()
+    }
+
+    var globalShortcutMonitorStatus: String {
+        if preset == .disabled { return "사용 안 함" }
+        guard let tap = globalKeyTap else { return "연결 안 됨" }
+        return CGEvent.tapIsEnabled(tap: tap) ? "전역 감시 연결됨" : "전역 감시 중단됨"
     }
 
     @discardableResult
     private func ensurePassiveMonitors() -> Bool {
-        if globalKeyMonitor == nil {
-            globalKeyMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
-                self?.handleKey(event)
+        if let tap = globalKeyTap {
+            if !CGEvent.tapIsEnabled(tap: tap) {
+                CGEvent.tapEnable(tap: tap, enable: true)
             }
-        }
-        if localKeyMonitor == nil {
-            localKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
-                self?.handleKey(event)
-                return event // 사용자/앱의 키 입력을 절대 차단하지 않습니다.
+            if CGEvent.tapIsEnabled(tap: tap) {
+                lastNotice = ""
+                return true
             }
-        }
-        if globalKeyMonitor == nil || localKeyMonitor == nil {
             stopMonitoring()
-            lastNotice = "수동 키 감시를 시작하지 못했습니다. 입력 모니터링 권한을 확인하세요. 휠은 독립적으로 작동합니다."
+        }
+        guard CGPreflightListenEventAccess() else {
+            lastNotice = "입력 모니터링 권한이 없습니다. 시스템 설정에서 00Favorite을 허용한 후 앱을 다시 실행하세요."
+            return false
+        }
+        // 세션 전역 읽기 전용: 특정 앱의 활성화 여부에 종속되지 않습니다.
+        let callback: CGEventTapCallBack = { _, type, event, refcon in
+            guard let refcon = refcon else { return Unmanaged.passUnretained(event) }
+            let observer = Unmanaged<FavoriteAwakeHotKey>.fromOpaque(refcon).takeUnretainedValue()
+            if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                if let tap = observer.globalKeyTap, observer.preset != .disabled {
+                    CGEvent.tapEnable(tap: tap, enable: true)
+                }
+            } else if type == .keyDown {
+                observer.handleGlobalKeyDown(event)
+            }
+            return Unmanaged.passUnretained(event)
+        }
+        let keyDownMask: CGEventMask = 1 << CGEventType.keyDown.rawValue
+        guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap,
+                                          place: .headInsertEventTap,
+                                          options: .listenOnly,
+                                          eventsOfInterest: keyDownMask,
+                                          callback: callback,
+                                          userInfo: Unmanaged.passUnretained(self).toOpaque()) else {
+            lastNotice = "macOS 전역 키 입력 감시를 연결하지 못했습니다. 입력 모니터링 권한을 확인하세요."
+            return false
+        }
+        guard let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0) else {
+            CFMachPortInvalidate(tap)
+            lastNotice = "전역 단축키 이벤트 루프를 준비하지 못했습니다."
+            return false
+        }
+        // 메뉴바 조작 및 별도 설정창이 열려도 이벤트를 계속 받을 수 있도록 공통 모드로 연결합니다.
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, kCFRunLoopCommonModes)
+        globalKeyTap = tap
+        globalKeySource = source
+        CGEvent.tapEnable(tap: tap, enable: true)
+        guard CGEvent.tapIsEnabled(tap: tap) else {
+            stopMonitoring()
+            lastNotice = "전역 단축키 감시를 활성화하지 못했습니다."
             return false
         }
         lastNotice = ""
@@ -2456,8 +2513,16 @@ final class FavoriteAwakeHotKey {
         }
     }
     func stopMonitoring() {
-        if let monitor = globalKeyMonitor { NSEvent.removeMonitor(monitor); globalKeyMonitor = nil }
-        if let monitor = localKeyMonitor { NSEvent.removeMonitor(monitor); localKeyMonitor = nil }
+        if let source = globalKeySource {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), source, kCFRunLoopCommonModes)
+            CFRunLoopSourceInvalidate(source)
+            globalKeySource = nil
+        }
+        if let tap = globalKeyTap {
+            CGEvent.tapEnable(tap: tap, enable: false)
+            CFMachPortInvalidate(tap)
+            globalKeyTap = nil
+        }
     }
 }
 
@@ -2467,7 +2532,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard let path = Bundle.main.path(forResource: "icon_awake", ofType: "png") else { return nil }
         return NSImage(contentsOfFile: path)
     }()
-    private let buildIdentifier = "FAV-20261121-HK10"
+    private let buildIdentifier = "FAV-20261121-HK11"
     var wheelPanel: NSPanel?
     var wheelCenterPoint: NSPoint = .zero
     
@@ -2690,6 +2755,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         stopItem.isEnabled = awake.isActive
         submenu.addItem(stopItem)
         let hotkey = FavoriteAwakeHotKey.shared
+        let hotkeyStatusItem = NSMenuItem(title: "전역 단축키: \(hotkey.globalShortcutMonitorStatus)", action: nil, keyEquivalent: "")
+        hotkeyStatusItem.isEnabled = false
+        submenu.addItem(hotkeyStatusItem)
         let toggleItem = NSMenuItem(title: "⏻ 잠자기 방지 토글 (\(hotkey.shortcutLabel))", action: #selector(toggleAwakeByMenu), keyEquivalent: "")
         toggleItem.target = self
         submenu.addItem(toggleItem)
