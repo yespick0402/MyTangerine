@@ -1540,6 +1540,9 @@ final class FolderAccessPreferences: ObservableObject {
     func openFullDiskAccessSettings() {
         openSystemSettings("Privacy_AllFiles")
     }
+    func openInputMonitoringSettings() {
+        openSystemSettings("Privacy_ListenEvent")
+    }
     func openAccessibilitySettings() {
         openSystemSettings("Privacy_Accessibility")
     }
@@ -1704,6 +1707,15 @@ struct HelpAndSettingsView: View {
     @State private var tempRecordedFlags: NSEvent.ModifierFlags = []
     @State private var localMonitor: Any? = nil
     @State private var shortcutValidationWarning: String = ""
+    @State private var awakePresetRaw: Int = FavoriteAwakeHotKey.shared.preset.rawValue
+    @State private var awakeMinutes: Int = FavoriteAwakeHotKey.shared.toggleMinutes
+    @State private var awakeHotkeyNotice: String = ""
+    @State private var awakeIsRecording = false
+    @State private var awakeKeyCode: UInt32? = nil
+    @State private var awakeKeyName: String = ""
+    @State private var awakeKeyFlags: NSEvent.ModifierFlags = []
+    @State private var awakeKeyMonitor: Any? = nil
+    @State private var wheelMonitorStatus = "확인 전"
     
     let sampleDate: Date = {
         var comp = DateComponents()
@@ -1756,13 +1768,20 @@ struct HelpAndSettingsView: View {
                     stopRecording()
                     settings.resetToFavoriteDefaults()
                     settings.renamePattern = ShortcutSettings.defaultRenamePattern
+                    _ = FavoriteAwakeHotKey.shared.changePreset(.commandOptionControlK)
+                    FavoriteAwakeHotKey.shared.setToggleMinutes(60)
+                    awakePresetRaw = FavoriteAwakeHotKey.shared.preset.rawValue
+                    awakeMinutes = FavoriteAwakeHotKey.shared.toggleMinutes
+                    (NSApp.delegate as? AppDelegate)?.updateStatusBarMenu()
                     FileProcessor.showToast("단축키 및 작동 방식이 기본값으로 복원되었습니다.")
                 }
                 Button("닫기") { stopRecording(); NSApp.keyWindow?.close() }
                     .buttonStyle(.borderedProminent).tint(.orange)
             }
             .padding(14).background(.regularMaterial)
-        }.onDisappear { stopRecording() }
+        }.onAppear { refreshWheelMonitorStatus() }
+         .onChange(of: selectedTab) { _ in stopRecording(); stopAwakeRecording() }
+         .onDisappear { stopRecording(); stopAwakeRecording() }
     }
     
     var shortcutRecorderTab: some View {
@@ -1780,8 +1799,26 @@ struct HelpAndSettingsView: View {
                             delegate?.updateStatusBarMenu()
                         }
                     Toggle("Finder에서 시작한 파일 드래그만 감지 (권장)", isOn: $settings.finderOnlyDetection)
-                    Text("잠자기 방지 토글은 기본 ⌃ Control + ⌥ Option + ⌘ Command + K입니다. 메뉴바의 [잠자기 방지 → 단축키 설정]에서 다른 조합 또는 해제를 선택할 수 있으며, 파일 드래그 단축키와 독립적으로 작동합니다.")
+                    HStack(spacing: 8) {
+                        Text("휠 입력 감시: \(wheelMonitorStatus)")
+                            .font(.caption.bold())
+                        Spacer()
+                        Button("상태 새로고침") { refreshWheelMonitorStatus() }
+                        Button("감시 재연결") {
+                            guard let delegate = NSApp.delegate as? AppDelegate else { return }
+                            let connected = delegate.reconnectWheelMonitor()
+                            refreshWheelMonitorStatus()
+                            if !connected {
+                                awakeHotkeyNotice = "휠 감시 연결 실패: macOS 개인정보 보호 및 보안 → 입력 모니터링·손쉬운 사용에서 00Favorite 권한을 확인하고 앱을 재시작해 주세요."
+                            }
+                        }
+                    }
+                    Text("앱 이름 변경·임시 서명 재빌드 후 Shift 변환 휠이 보이지 않으면 입력 모니터링 권한을 다시 확인하세요. 기존 Finder 드래그는 그대로 유지합니다.")
                         .font(.caption2).foregroundColor(.secondary)
+                    HStack(spacing: 8) {
+                        Button("입력 모니터링 설정") { FolderAccessPreferences.shared.openInputMonitoringSettings() }
+                        Button("손쉬운 사용 설정") { FolderAccessPreferences.shared.openAccessibilitySettings() }
+                    }
                     Text("기존 Shift / Option+Shift / Control 키는 유지합니다. 파일 드래그를 시작한 다음 해당 조합을 새로 눌러야만 휠이 열립니다. 평소 Finder의 Shift 선택·드래그에는 반응하지 않습니다.")
                         .font(.caption2).foregroundColor(.secondary)
                 }
@@ -1838,10 +1875,91 @@ struct HelpAndSettingsView: View {
                         onSave: { newFlags in settings.actionsFlagsRaw = newFlags.rawValue; FileProcessor.showToast("빠른 액션(ACTIONS) 단축키가 저장되었습니다.") }
                     )
                 }
+                awakeHotkeySettingsCard
+
             }.padding(20)
         }
     }
     
+    // 독립된 컴포넌트로 분리해 SwiftUI 타입 검사 부담을 줄입니다.
+    var awakeHotkeySettingsCard: some View {
+        // 파일 드래그와 독립적인 잠자기 방지 전역 핫키 설정
+        VStack(alignment: .leading, spacing: 10) {
+            Text("3. 잠자기 방지 토글 단축키")
+                .font(.headline).foregroundColor(.orange)
+            Text("파일 변환 단축키와 독립적입니다. 아래에서 기본 조합을 선택하거나 원하는 영문 키 조합을 직접 입력할 수 있습니다.")
+                .font(.caption).foregroundColor(.secondary)
+            HStack(spacing: 10) {
+                Text("현재: \(FavoriteAwakeHotKey.shared.shortcutLabel)")
+                    .font(.subheadline.bold())
+                Spacer()
+                Picker("토글 단축키", selection: $awakePresetRaw) {
+                    Text("사용 안 함").tag(0)
+                    Text("⌃⌥⌘K").tag(1)
+                    Text("⌃⌥⌘J").tag(2)
+                    Text("⌃⌥⌘L").tag(3)
+                    if FavoriteAwakeHotKey.shared.preset == .custom {
+                        Text("직접 지정: \(FavoriteAwakeHotKey.shared.shortcutLabel)").tag(4)
+                    }
+                }
+                .frame(width: 240)
+                .onChange(of: awakePresetRaw) { proposed in
+                    guard let preset = FavoriteAwakeHotKey.Preset(rawValue: proposed),
+                          preset != .custom else { return }
+                    if !FavoriteAwakeHotKey.shared.changePreset(preset) {
+                        awakeHotkeyNotice = FavoriteAwakeHotKey.shared.lastNotice
+                        awakePresetRaw = FavoriteAwakeHotKey.shared.preset.rawValue
+                    } else {
+                        awakeHotkeyNotice = "잠자기 방지 단축키를 저장했습니다."
+                        (NSApp.delegate as? AppDelegate)?.updateStatusBarMenu()
+                    }
+                }
+            }
+            HStack(spacing: 10) {
+                if awakeIsRecording {
+                    Text(awakeKeyCode == nil ? "Control을 포함한 수정키 2개 이상 + 영문 A~Z 입력" : "입력: \(ShortcutSettings.formatFlags(awakeKeyFlags)) + \(awakeKeyName)")
+                        .font(.caption.bold()).foregroundColor(.orange)
+                    Button("저장") {
+                        guard let code = awakeKeyCode else { return }
+                        if FavoriteAwakeHotKey.shared.changeCustomShortcut(keyCode: code, keyName: awakeKeyName, flags: awakeKeyFlags) {
+                            awakePresetRaw = FavoriteAwakeHotKey.shared.preset.rawValue
+                            awakeHotkeyNotice = "직접 지정한 잠자기 방지 단축키가 저장되었습니다."
+                            stopAwakeRecording()
+                            (NSApp.delegate as? AppDelegate)?.updateStatusBarMenu()
+                        } else {
+                            awakeHotkeyNotice = FavoriteAwakeHotKey.shared.lastNotice
+                        }
+                    }.disabled(awakeKeyCode == nil)
+                    Button("취소") { stopAwakeRecording() }
+                } else {
+                    Button("단축키 직접 입력") { startAwakeRecording() }
+                }
+            }
+            HStack(spacing: 8) {
+                Text("단축키로 켰을 때 유지 시간")
+                Picker("지속 시간", selection: $awakeMinutes) {
+                    Text("5분").tag(5)
+                    Text("15분").tag(15)
+                    Text("30분").tag(30)
+                    Text("1시간").tag(60)
+                    Text("2시간").tag(120)
+                    Text("4시간").tag(240)
+                    Text("8시간").tag(480)
+                    Text("직접 해제").tag(-1)
+                }
+                .frame(width: 190)
+                .onChange(of: awakeMinutes) { minutes in
+                    FavoriteAwakeHotKey.shared.setToggleMinutes(minutes)
+                    (NSApp.delegate as? AppDelegate)?.updateStatusBarMenu()
+                }
+            }
+            if !awakeHotkeyNotice.isEmpty {
+                Text(awakeHotkeyNotice).font(.caption).foregroundColor(.secondary)
+            }
+        }
+        .padding(14).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+    }
+
     var renamePatternTab: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
@@ -1949,7 +2067,58 @@ struct HelpAndSettingsView: View {
         }.padding(12).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
     }
     
+    private func refreshWheelMonitorStatus() {
+        if let app = NSApp.delegate as? AppDelegate {
+            wheelMonitorStatus = app.isWheelMonitorConnected ? "정상 연결" : "연결되지 않음"
+        } else { wheelMonitorStatus = "앱 상태 확인 불가" }
+    }
+
+    // 영문 자판의 물리 키 위치를 사용해 한글 키보드 레이아웃에서도 단축키를 지정합니다.
+    private func awakeKeyLetter(_ code: UInt16) -> String? {
+        let letters: [UInt16: String] = [
+            UInt16(kVK_ANSI_A): "A", UInt16(kVK_ANSI_B): "B", UInt16(kVK_ANSI_C): "C",
+            UInt16(kVK_ANSI_D): "D", UInt16(kVK_ANSI_E): "E", UInt16(kVK_ANSI_F): "F",
+            UInt16(kVK_ANSI_G): "G", UInt16(kVK_ANSI_H): "H", UInt16(kVK_ANSI_I): "I",
+            UInt16(kVK_ANSI_J): "J", UInt16(kVK_ANSI_K): "K", UInt16(kVK_ANSI_L): "L",
+            UInt16(kVK_ANSI_M): "M", UInt16(kVK_ANSI_N): "N", UInt16(kVK_ANSI_O): "O",
+            UInt16(kVK_ANSI_P): "P", UInt16(kVK_ANSI_Q): "Q", UInt16(kVK_ANSI_R): "R",
+            UInt16(kVK_ANSI_S): "S", UInt16(kVK_ANSI_T): "T", UInt16(kVK_ANSI_U): "U",
+            UInt16(kVK_ANSI_V): "V", UInt16(kVK_ANSI_W): "W", UInt16(kVK_ANSI_X): "X",
+            UInt16(kVK_ANSI_Y): "Y", UInt16(kVK_ANSI_Z): "Z"
+        ]
+        return letters[code]
+    }
+    private func startAwakeRecording() {
+        stopRecording()
+        stopAwakeRecording()
+        awakeHotkeyNotice = ""
+        awakeIsRecording = true
+        FavoriteAwakeHotKey.shared.suspendForRecorder()
+        awakeKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { event in
+            guard self.awakeIsRecording else { return event }
+            let flags = event.modifierFlags.intersection([.control, .option, .shift, .command])
+            if let label = self.awakeKeyLetter(event.keyCode) {
+                self.awakeKeyCode = UInt32(event.keyCode)
+                self.awakeKeyName = label
+                self.awakeKeyFlags = flags
+                self.awakeHotkeyNotice = "설정에서 Control을 포함한 수정키 2개 이상을 사용합니다."
+            } else {
+                self.awakeHotkeyNotice = "영문 A~Z 키로 설정할 수 있습니다."
+            }
+            return nil
+        }
+    }
+    private func stopAwakeRecording() {
+        if let m = awakeKeyMonitor { NSEvent.removeMonitor(m); awakeKeyMonitor = nil }
+        awakeIsRecording = false
+        awakeKeyCode = nil
+        awakeKeyName = ""
+        awakeKeyFlags = []
+        FavoriteAwakeHotKey.shared.resumeAfterRecorder()
+    }
+
     func startRecording(for targetID: String) {
+        stopAwakeRecording()
         stopRecording(); shortcutValidationWarning = ""; recordingTarget = targetID; tempRecordedFlags = []
         localMonitor = NSEvent.addLocalMonitorForEvents(matching: [.flagsChanged, .keyDown]) { event in
             let flags = event.modifierFlags.intersection([.control, .option, .shift, .command])

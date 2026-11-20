@@ -2227,12 +2227,16 @@ final class FavoriteAwakeHotKey {
     private static let identifier: UInt32 = 1
     private static let shortcutKey = "favorite_awake_toggle_hotkey_v1"
     private static let durationKey = "favorite_awake_toggle_duration_v1"
+    private static let customKeyCodeKey = "favorite_awake_custom_key_code_v2"
+    private static let customModifiersKey = "favorite_awake_custom_modifiers_v2"
+    private static let customKeyNameKey = "favorite_awake_custom_key_name_v2"
 
     enum Preset: Int, CaseIterable {
         case disabled = 0
         case commandOptionControlK = 1
         case commandOptionControlJ = 2
         case commandOptionControlL = 3
+        case custom = 4
 
         var name: String {
             switch self {
@@ -2240,6 +2244,7 @@ final class FavoriteAwakeHotKey {
             case .commandOptionControlK: return "⌃⌥⌘K (권장)"
             case .commandOptionControlJ: return "⌃⌥⌘J"
             case .commandOptionControlL: return "⌃⌥⌘L"
+            case .custom: return "직접 지정"
             }
         }
         var keyCode: UInt32? {
@@ -2248,16 +2253,21 @@ final class FavoriteAwakeHotKey {
             case .commandOptionControlK: return UInt32(kVK_ANSI_K)
             case .commandOptionControlJ: return UInt32(kVK_ANSI_J)
             case .commandOptionControlL: return UInt32(kVK_ANSI_L)
+            case .custom: return nil  // 직접 지정은 사용자 저장 코드 사용
             }
         }
     }
 
     private(set) var preset: Preset
     private(set) var toggleMinutes: Int
+    private var customKeyCode: UInt32
+    private var customModifiers: UInt32
+    private var customKeyName: String
     private(set) var lastNotice: String = ""
     private var hotKeyRef: EventHotKeyRef?
     private var handlerRef: EventHandlerRef?
     private var lastToggleUptime: TimeInterval = -10
+    private var suspendedForRecorder = false
 
     private init() {
         let defaults = UserDefaults.standard
@@ -2268,6 +2278,21 @@ final class FavoriteAwakeHotKey {
         }
         let saved = defaults.object(forKey: Self.durationKey) as? Int ?? 60
         toggleMinutes = [5, 15, 30, 60, 120, 240, 480, -1].contains(saved) ? saved : 60
+        let storedKey = defaults.integer(forKey: Self.customKeyCodeKey)
+        let storedMods = defaults.integer(forKey: Self.customModifiersKey)
+        customKeyCode = storedKey > 0 ? UInt32(storedKey) : UInt32(kVK_ANSI_K)
+        customModifiers = storedMods > 0 ? UInt32(storedMods) : UInt32(controlKey | optionKey | cmdKey)
+        customKeyName = defaults.string(forKey: Self.customKeyNameKey) ?? "K"
+    }
+
+    var shortcutLabel: String {
+        if preset != .custom { return preset.name }
+        var flags = ""
+        if customModifiers & UInt32(controlKey) != 0 { flags += "⌃" }
+        if customModifiers & UInt32(optionKey) != 0 { flags += "⌥" }
+        if customModifiers & UInt32(shiftKey) != 0 { flags += "⇧" }
+        if customModifiers & UInt32(cmdKey) != 0 { flags += "⌘" }
+        return flags + customKeyName
     }
 
     var toggleDurationLabel: String {
@@ -2320,17 +2345,26 @@ final class FavoriteAwakeHotKey {
         return true
     }
 
-    private func register(_ chosen: Preset) -> Bool {
-        guard let keyCode = chosen.keyCode else { return true }
+    private func register(_ chosen: Preset, candidate: (UInt32, UInt32)? = nil) -> Bool {
+        guard chosen != .disabled else { return true }
+        let keyCode: UInt32
+        let mods: UInt32
+        if chosen == .custom {
+            keyCode = candidate?.0 ?? customKeyCode
+            mods = candidate?.1 ?? customModifiers
+        } else {
+            guard let presetCode = chosen.keyCode else { return false }
+            keyCode = presetCode
+            mods = UInt32(controlKey | optionKey | cmdKey)
+        }
         guard ensureHandler() else { return false }
         var newRef: EventHotKeyRef?
-        let mods = UInt32(controlKey | optionKey | cmdKey)
         let id = EventHotKeyID(signature: Self.signature, id: Self.identifier)
         let result = RegisterEventHotKey(
             keyCode, mods, id, GetApplicationEventTarget(), 0, &newRef
         )
         guard result == noErr, let registeredRef = newRef else {
-            lastNotice = "⌃⌥⌘ 조합을 등록하지 못했습니다(\(result)). 다른 앱의 단축키와 충돌할 수 있습니다."
+            lastNotice = "해당 단축키를 등록하지 못했습니다(\(result)). macOS 또는 다른 앱과 충돌할 수 있습니다."
             return false
         }
         hotKeyRef = registeredRef
@@ -2340,6 +2374,17 @@ final class FavoriteAwakeHotKey {
 
     func startMonitoring() {
         _ = register(preset)
+    }
+    // 설정 창에서 기존 단축키를 다시 입력해도 잠자기 토글이 실행되지 않도록 잠시 정지.
+    func suspendForRecorder() {
+        guard !suspendedForRecorder else { return }
+        suspendedForRecorder = true
+        if let ref = hotKeyRef { _ = UnregisterEventHotKey(ref); hotKeyRef = nil }
+    }
+    func resumeAfterRecorder() {
+        guard suspendedForRecorder else { return }
+        suspendedForRecorder = false
+        if hotKeyRef == nil { _ = register(preset) }
     }
 
     @discardableResult
@@ -2356,6 +2401,47 @@ final class FavoriteAwakeHotKey {
         // 새 단축키가 실패하더라도 기존 단축키를 복구합니다.
         if !register(old) { lastNotice = failureNotice + " 기존 단축키 재등록도 실패했습니다." }
         else { lastNotice = failureNotice }
+        return false
+    }
+
+    // 설정 화면의 실시간 단축키 입력 결과를 OS에 먼저 등록한 뒤에만 저장합니다.
+    // Shift/Command 파일 드래그 감시와 전혀 연결되지 않는 Carbon 핫키입니다.
+    @discardableResult
+    func changeCustomShortcut(keyCode: UInt32, keyName: String, flags: NSEvent.ModifierFlags) -> Bool {
+        let clean = flags.intersection([.control, .option, .shift, .command])
+        let count = [NSEvent.ModifierFlags.control, .option, .shift, .command]
+            .filter { clean.contains($0) }.count
+        guard clean.contains(.control), count >= 2, keyName.count == 1,
+              keyName.range(of: "^[A-Z]$", options: .regularExpression) != nil else {
+            lastNotice = "안전을 위해 Control을 포함한 수정키 2개 이상과 영문 A~Z 한 글자를 입력하세요."
+            return false
+        }
+        var newModifiers: UInt32 = 0
+        if clean.contains(.control) { newModifiers |= UInt32(controlKey) }
+        if clean.contains(.option) { newModifiers |= UInt32(optionKey) }
+        if clean.contains(.shift) { newModifiers |= UInt32(shiftKey) }
+        if clean.contains(.command) { newModifiers |= UInt32(cmdKey) }
+        let oldPreset = preset
+        if let previousRef = hotKeyRef {
+            _ = UnregisterEventHotKey(previousRef)
+            hotKeyRef = nil
+        }
+        if register(.custom, candidate: (keyCode, newModifiers)) {
+            customKeyCode = keyCode
+            customModifiers = newModifiers
+            customKeyName = keyName
+            preset = .custom
+            let d = UserDefaults.standard
+            d.set(Preset.custom.rawValue, forKey: Self.shortcutKey)
+            d.set(Int(keyCode), forKey: Self.customKeyCodeKey)
+            d.set(Int(newModifiers), forKey: Self.customModifiersKey)
+            d.set(keyName, forKey: Self.customKeyNameKey)
+            return true
+        }
+        let registrationError = lastNotice
+        if !register(oldPreset) {
+            lastNotice = registrationError + " 기존 단축키 복구도 실패했습니다."
+        } else { lastNotice = registrationError }
         return false
     }
 
@@ -2390,7 +2476,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard let path = Bundle.main.path(forResource: "icon_awake", ofType: "png") else { return nil }
         return NSImage(contentsOfFile: path)
     }()
-    private let buildIdentifier = "FAV-20261120-HK1"
+    private let buildIdentifier = "FAV-20261120-HK2"
     var wheelPanel: NSPanel?
     var wheelCenterPoint: NSPoint = .zero
     
@@ -2429,6 +2515,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         setupUltraLightEventTap()
+        updateStatusBarMenu()
         // 새 설치/업데이트 시 한 번만 안내합니다. 권한 승인 창을 자동으로 누르거나
         // 폴더를 몰래 스캔하지 않으며, 사용자가 선택할 때만 NSOpenPanel을 띄웁니다.
         if FolderAccessPreferences.shared.shouldShowIntro {
@@ -2450,7 +2537,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let jobs = JobProgressManager.shared.jobs
         let isAwake = FavoriteAwakeManager.shared.isActive
         let currentCakeIcon = (isAwake ? awakeCakeIcon : nil) ?? FileProcessor.customAppIconImage()
-        if let appIcon = currentCakeIcon { NSApp.applicationIconImage = appIcon }
+        // 앱 아이콘은 시작 시 한 번 지정합니다. 메뉴 갱신은 메뉴바 아이콘만 바꿉니다.
         if let btn = statusItem.button {
             if let cake = currentCakeIcon {
                 let menuIcon = (cake.copy() as? NSImage) ?? cake
@@ -2490,7 +2577,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let pauseItem = NSMenuItem(title: paused ? "▶ 안전 모드 휠 감지 재개" : "⏸ 안전 모드 휠 감지 일시 정지", action: #selector(toggleWheelDetection), keyEquivalent: "")
         pauseItem.target = self
         menu.addItem(pauseItem)
-        menu.addItem(NSMenuItem(title: "🛡️ 입력 감시 읽기 전용 · Finder 원본 드래그 보호", action: nil, keyEquivalent: ""))
+        let tapStatus = isWheelMonitorConnected ? "휠 감시 연결됨" : "휠 감시 연결되지 않음 · 설정에서 재연결"
+        menu.addItem(NSMenuItem(title: "🛡️ 읽기 전용 입력 감시 · " + tapStatus, action: nil, keyEquivalent: ""))
         let folderPermissionsItem = NSMenuItem(title: "🔐 파일·폴더 접근 설정…", action: #selector(openFolderPermissions), keyEquivalent: "")
         folderPermissionsItem.target = self
         menu.addItem(folderPermissionsItem)
@@ -2526,21 +2614,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         stopItem.isEnabled = awake.isActive
         submenu.addItem(stopItem)
         let hotkey = FavoriteAwakeHotKey.shared
-        let toggleItem = NSMenuItem(title: "⏻ 잠자기 방지 토글 (\(hotkey.preset.name))", action: #selector(toggleAwakeByMenu), keyEquivalent: "")
+        let toggleItem = NSMenuItem(title: "⏻ 잠자기 방지 토글 (\(hotkey.shortcutLabel))", action: #selector(toggleAwakeByMenu), keyEquivalent: "")
         toggleItem.target = self
         submenu.addItem(toggleItem)
         submenu.addItem(NSMenuItem.separator())
-        let hotkeyRoot = NSMenuItem(title: "⌨️ 토글 단축키 설정", action: nil, keyEquivalent: "")
-        let hotkeyOptions = NSMenu(title: "토글 단축키")
-        for choice in FavoriteAwakeHotKey.Preset.allCases {
-            let option = NSMenuItem(title: choice.name, action: #selector(changeAwakeHotkey(_:)), keyEquivalent: "")
-            option.target = self
-            option.tag = choice.rawValue
-            option.state = choice == hotkey.preset ? .on : .off
-            hotkeyOptions.addItem(option)
-        }
-        hotkeyRoot.submenu = hotkeyOptions
-        submenu.addItem(hotkeyRoot)
+        let hotkeySettings = NSMenuItem(title: "⌨️ 토글 단축키 변경 → 설명 및 설정…", action: #selector(openHelpAndSettings), keyEquivalent: "")
+        hotkeySettings.target = self
+        submenu.addItem(hotkeySettings)
         if !hotkey.lastNotice.isEmpty {
             submenu.addItem(NSMenuItem(title: "단축키 상태: \(hotkey.lastNotice)", action: nil, keyEquivalent: ""))
         }
@@ -2674,7 +2754,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     
     // 입출력 이벤트를 절대 변경·차단할 수 없는 Core Graphics 수동 감시 모드.
     // Finder가 파일 복사·이동을 처리할 기회를 항상 보존합니다.
+    var isWheelMonitorConnected: Bool {
+        guard let tap = eventTap else { return false }
+        return CGEvent.tapIsEnabled(tap: tap)
+    }
+
+    // 최초 실행 시 macOS 권한이 아직 없었다면 사용자가 허용한 후 수동으로 재시도합니다.
+    // listenOnly 이벤트 탭 외의 다른 입력 변경·차단 코드는 실행하지 않습니다.
+    @discardableResult
+    func reconnectWheelMonitor() -> Bool {
+        if let tap = eventTap {
+            CGEvent.tapEnable(tap: tap, enable: true)
+        } else {
+            setupUltraLightEventTap()
+        }
+        updateStatusBarMenu()
+        return isWheelMonitorConnected
+    }
+
     func setupUltraLightEventTap() {
+        guard eventTap == nil else { return }
         let mask = (1 << CGEventType.leftMouseDown.rawValue) |
                    (1 << CGEventType.leftMouseUp.rawValue) |
                    (1 << CGEventType.leftMouseDragged.rawValue) |
