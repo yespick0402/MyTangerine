@@ -41,14 +41,14 @@ jobs:
           <plist version="1.0">
           <dict>
             <key>CFBundleExecutable</key><string>00Favorite</string>
-            <key>CFBundleIdentifier</key><string>com.custom.mytangerine</string>
+            <key>CFBundleIdentifier</key><string>win.yespick.00favorite</string>
             <key>CFBundleName</key><string>00Favorite</string>
             <key>CFBundleDisplayName</key><string>00Favorite</string>
             <key>CFBundleIconFile</key><string>AppIcon</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleShortVersionString</key><string>4.8</string>
-            <key>CFBundleVersion</key><string>4.8</string>
-            <key>FavoriteBuildID</key><string>FAV-20261120-HK7</string>
+            <key>CFBundleVersion</key><string>4808</string>
+            <key>FavoriteBuildID</key><string>FAV-20261121-HK8</string>
             <key>LSMinimumSystemVersion</key><string>14.0</string>
             <key>LSArchitecturePriority</key><array><string>arm64</string></array>
             <key>LSUIElement</key><true/>
@@ -129,6 +129,6 @@ jobs:
       - name: Upload Finished Mac App
         uses: actions/upload-artifact@v4
         with:
-          name: 00Favorite-4.8-FAV-20261120-HK7-Mac-ARM64
+          name: 00Favorite-4.8-FAV-20261121-HK8-Mac-ARM64
           path: 00Favorite.zip
           if-no-files-found: error
