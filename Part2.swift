@@ -2467,7 +2467,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard let path = Bundle.main.path(forResource: "icon_awake", ofType: "png") else { return nil }
         return NSImage(contentsOfFile: path)
     }()
-    private let buildIdentifier = "FAV-20261121-HK9"
+    private let buildIdentifier = "FAV-20261121-HK10"
     var wheelPanel: NSPanel?
     var wheelCenterPoint: NSPoint = .zero
     
@@ -2512,9 +2512,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.accessory)
         applyPureTransparentCustomIconToAppBundle()
         
-        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-        _ = AXIsProcessTrustedWithOptions(options)
-        
+        // 실행만으로 광범위한 손쉬운 사용 권한을 요청하지 않습니다.
+        // Finder 휠은 읽기 전용 입력 감시를 사용하므로 입력 모니터링을 우선 검사합니다.
+        // (macOS 27.2의 '기기 제어 및 데이터 접근'은 기존 손쉬운 사용 권한의 UI 명칭입니다.)
+
         FavoritePreferencesMigration.runOnce()
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         updateStatusBarMenu()
@@ -2538,16 +2539,70 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // 잠자기 방지 토글은 변환 이벤트 감시가 초기화된 뒤 독립적으로 시작합니다.
         FavoriteAwakeHotKey.shared.startMonitoring()
         updateStatusBarMenu()
-        // 새 설치/업데이트 시 한 번만 안내합니다. 권한 승인 창을 자동으로 누르거나
-        // 폴더를 몰래 스캔하지 않으며, 사용자가 선택할 때만 NSOpenPanel을 띄웁니다.
-        if FolderAccessPreferences.shared.shouldShowIntro {
-            FolderAccessPreferences.shared.markIntroShown()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+        // 메인 메뉴가 준비된 후 1회만 검사합니다. 권한이 이미 정상이라면 아무것도 띄우지 않습니다.
+        // 최초 폴더 안내와 겹쳐 두 창이 동시에 열리는 것도 방지합니다.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { [weak self] in
+            guard let self = self else { return }
+            if self.showStartupWheelAccessWarningIfNeeded() { return }
+            if FolderAccessPreferences.shared.shouldShowIntro {
+                FolderAccessPreferences.shared.markIntroShown()
                 ToolWindowManager.shared.showFolderPermissionsWindow()
             }
         }
     }
-    
+
+    // 입력 모니터링은 읽기 전용 전역 키/마우스 감시에 필요합니다.
+    // macOS 27의 '기기 제어 및 데이터 접근'은 종전 '손쉬운 사용' 권한과 별도인
+    // 세 번째 권한이 아닙니다. 휠이 정상이라면 이 넓은 권한을 무조건 요구하지 않습니다.
+    // 팝업은 실행 시 필수 조건이 부족할 때 한 번만 표시하고, 잠자기 방지는 독립 사용 가능합니다.
+    @discardableResult
+    private func showStartupWheelAccessWarningIfNeeded() -> Bool {
+        let inputGranted = CGPreflightListenEventAccess()
+        let accessGranted = AXIsProcessTrusted() // 정보 표시만: 읽기 전용 감시의 강제 필수 권한 아님
+        let tapReady = isWheelMonitorConnected || (inputGranted && reconnectWheelMonitor())
+        guard !inputGranted || !tapReady else { return false }
+
+        let accessLabel = ProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 27
+            ? "기기 제어 및 데이터 접근(손쉬운 사용)" : "손쉬운 사용"
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "00Favorite의 파일 휠 입력 권한을 확인해 주세요"
+        let inputLine = inputGranted ? "승인 확인" : "미승인 · 승인 필요"
+        let accessLine = accessGranted ? "승인 확인" : "미승인 · 필요할 때만 사용자가 승인"
+        let tapLine = tapReady ? "정상 연결" : "연결되지 않음"
+        alert.informativeText = """
+        입력 모니터링: \(inputLine)
+        \(accessLabel): \(accessLine)
+        휠 이벤트 감시: \(tapLine)
+
+        Shift·Control 등으로 파일 휠을 사용하려면 입력 모니터링 권한이 필요합니다.
+        기기 제어 및 데이터 접근은 입력 모니터링과 다른 권한이며, 휠이 정상 작동할 때 강제로 요구하지 않습니다.
+
+        권한을 변경했다면 00Favorite을 완전히 종료한 뒤 다시 실행해 주세요.
+        잠자기 방지 기능은 파일 휠과 독립적으로 사용할 수 있습니다.
+        """
+        alert.addButton(withTitle: inputGranted ? "입력 감시 재연결" : "입력 모니터링 권한 설정")
+        alert.addButton(withTitle: "나중에")
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertFirstButtonReturn {
+            if !inputGranted {
+                // OS 권한 대화상자/목록 등록은 사용자가 버튼을 누른 경우에만 요청합니다.
+                _ = CGRequestListenEventAccess()
+                if CGPreflightListenEventAccess() {
+                    _ = reconnectWheelMonitor()
+                } else {
+                    FolderAccessPreferences.shared.openInputMonitoringSettings()
+                }
+            } else {
+                _ = reconnectWheelMonitor()
+                if !isWheelMonitorConnected {
+                    FolderAccessPreferences.shared.openInputMonitoringSettings()
+                }
+            }
+        }
+        return true
+    }
+
     func applyPureTransparentCustomIconToAppBundle() {
         guard let rawIcon = FileProcessor.customAppIconImage() else { return }
         NSApp.applicationIconImage = rawIcon
