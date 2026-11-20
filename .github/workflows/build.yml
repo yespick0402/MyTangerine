@@ -35,6 +35,7 @@ jobs:
           grep -q 'tap: .cgSessionEventTap' combined_main.swift || { echo 'ERROR: 앱 전환 후 동작하는 세션 전역 단축키 감시 누락'; exit 1; }
           grep -q 'private func handleGlobalKeyDown' combined_main.swift || { echo 'ERROR: 전역 잠자기 토글 처리 누락'; exit 1; }
           grep -q 'options: .defaultTap' combined_main.swift || { echo 'ERROR: 선택 단축키 입력 중복 방지 코드 누락'; exit 1; }
+          grep -q 'func reconnectForSuppression() -> Bool' combined_main.swift || { echo 'ERROR: 읽기 전용에서 입력 차단 승격 코드 누락'; exit 1; }
           if grep -Fq 'NSEvent.addGlobalMonitorForEvents(matching: [.keyDown])' combined_main.swift; then echo 'ERROR: 구형 전역 AppKit 키 감시 재도입 금지'; exit 1; fi
           if grep -q 'RegisterEventHotKey(' combined_main.swift; then echo 'ERROR: 위험한 전역 핫키 선점 방식 재도입 금지'; exit 1; fi
           grep -q 'canObserveActionRelease' combined_main.swift || { echo 'ERROR: Control 액션 드롭 보완 소스 누락'; exit 1; }
@@ -71,8 +72,8 @@ jobs:
             <key>CFBundleIconFile</key><string>AppIcon</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleShortVersionString</key><string>4.8</string>
-            <key>CFBundleVersion</key><string>4813</string>
-            <key>FavoriteBuildID</key><string>FAV-20261121-HK12</string>
+            <key>CFBundleVersion</key><string>4814</string>
+            <key>FavoriteBuildID</key><string>FAV-20261121-HK12R1</string>
             <key>LSMinimumSystemVersion</key><string>14.0</string>
             <key>LSArchitecturePriority</key><array><string>arm64</string></array>
             <key>LSUIElement</key><true/>
@@ -154,7 +155,7 @@ jobs:
           [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleName' "$INFO")" = '00Favorite' ]
           [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' "$INFO")" = '00Favorite' ]
           [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$INFO")" = '00Favorite' ]
-          [ "$(/usr/libexec/PlistBuddy -c 'Print :FavoriteBuildID' "$INFO")" = 'FAV-20261121-HK12' ]
+          [ "$(/usr/libexec/PlistBuddy -c 'Print :FavoriteBuildID' "$INFO")" = 'FAV-20261121-HK12R1' ]
           test -x "$APP/Contents/MacOS/00Favorite"
           # FFmpeg는 앞 단계에서 별도 서명됐으므로 main app만 별도 서명합니다.
           # --deep으로 내부 실행 도구에 동일 앱 식별자가 부여되는 일을 방지합니다.
@@ -177,6 +178,6 @@ jobs:
       - name: Upload Finished Mac App
         uses: actions/upload-artifact@v4
         with:
-          name: 00Favorite-4.8-FAV-20261121-HK12-Mac-ARM64
+          name: 00Favorite-4.8-FAV-20261121-HK12R1-Mac-ARM64
           path: 00Favorite.zip
           if-no-files-found: error
