@@ -2014,6 +2014,197 @@ final class SafeWheelDropTarget: NSView {
 }
 
 // MARK: - 13. 초경량·대용량(2,000개+) 무누락 앱 델리게이트
+// MARK: - 00Favorite 독립 잠자기 방지 기능 (파일 작업과 완전히 무관)
+// Apple IOKit의 전원 관리 assertion만 사용합니다. 마우스·키보드 이벤트를 발생시키지 않습니다.
+// 수동으로 켠 기능은 사용자가 끄거나 지정 시간이 끝날 때까지 유지됩니다.
+final class FavoriteAwakeManager {
+    static let shared = FavoriteAwakeManager()
+
+    enum WakeMode: String {
+        case systemOnly = "system"
+        case keepDisplayOn = "display"
+    }
+
+    private enum Keys {
+        static let mode = "favorite_awake_mode_v1"
+        static let batterySafetyEnabled = "favorite_awake_battery_guard_v1"
+        static let batteryThreshold = "favorite_awake_battery_threshold_v1"
+    }
+
+    private(set) var wakeMode: WakeMode
+    private(set) var batterySafetyEnabled: Bool
+    private(set) var batteryThreshold: Int
+    private var activeAssertion: IOPMAssertionID?
+    private(set) var expiresAt: Date?
+    private var checkTimer: Timer?
+    private var shownMinutes: Int = -1
+    private(set) var lastNotice: String = ""
+    var onChange: (() -> Void)?
+
+    private init() {
+        let defaults = UserDefaults.standard
+        wakeMode = WakeMode(rawValue: defaults.string(forKey: Keys.mode) ?? "system") ?? .systemOnly
+        batterySafetyEnabled = defaults.object(forKey: Keys.batterySafetyEnabled) as? Bool ?? true
+        let stored = defaults.integer(forKey: Keys.batteryThreshold)
+        batteryThreshold = [10, 20, 30].contains(stored) ? stored : 20
+    }
+
+    var isActive: Bool { activeAssertion != nil }
+
+    var remainingMinutes: Int? {
+        guard isActive, let deadline = expiresAt else { return nil }
+        return max(0, Int(ceil(deadline.timeIntervalSinceNow / 60.0)))
+    }
+
+    var statusText: String {
+        guard isActive else { return "꺼짐" }
+        let modeLabel = wakeMode == .keepDisplayOn ? "화면도 유지" : "화면 꺼짐 허용"
+        if let m = remainingMinutes { return "켜짐 · \(m)분 남음 · \(modeLabel)" }
+        return "켜짐 · 직접 해제할 때까지 · \(modeLabel)"
+    }
+
+    private struct BatterySnapshot {
+        let percent: Int
+        let onBattery: Bool
+    }
+
+    // 내부 배터리 정보가 있는 MacBook에서만 적용합니다. 데스크톱 Mac이나
+    // 측정 실패 상황에서 배터리 부족이라고 추측하여 사용자를 방해하지 않습니다.
+    private func readBattery() -> BatterySnapshot? {
+        guard let info = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
+              let sources = IOPSCopyPowerSourcesList(info)?.takeRetainedValue() as? [CFTypeRef] else { return nil }
+        for source in sources {
+            guard let d = IOPSGetPowerSourceDescription(info, source)?.takeUnretainedValue() as? [String: Any],
+                  (d[kIOPSTypeKey] as? String) == kIOPSInternalBatteryType,
+                  let current = d[kIOPSCurrentCapacityKey] as? Int,
+                  let maximum = d[kIOPSMaxCapacityKey] as? Int,
+                  maximum > 0 else { continue }
+            let percent = max(0, min(100, Int((Double(current) / Double(maximum) * 100).rounded())))
+            let onBattery = (d[kIOPSPowerSourceStateKey] as? String) == kIOPSBatteryPowerValue
+            return BatterySnapshot(percent: percent, onBattery: onBattery)
+        }
+        return nil
+    }
+
+    private func batteryLimitReached() -> Bool {
+        guard batterySafetyEnabled, let battery = readBattery() else { return false }
+        return battery.onBattery && battery.percent <= batteryThreshold
+    }
+
+    // 새 assertion의 생성이 성공한 다음에만 기존 assertion을 해제합니다.
+    // 모드 전환에 실패해도 이미 실행 중인 잠자기 방지가 갑자기 중단되지 않습니다.
+    @discardableResult
+    private func activate(mode: WakeMode, until deadline: Date?) -> Bool {
+        var newID: IOPMAssertionID = 0
+        let assertionType: CFString = (mode == .keepDisplayOn)
+            ? kIOPMAssertionTypePreventUserIdleDisplaySleep
+            : kIOPMAssertionTypePreventUserIdleSystemSleep
+        let code = IOPMAssertionCreateWithName(
+            assertionType,
+            kIOPMAssertionLevelOn,
+            "00Favorite · 사용자 수동 잠자기 방지" as CFString,
+            &newID
+        )
+        guard code == kIOReturnSuccess else {
+            lastNotice = "macOS가 잠자기 방지 요청을 허용하지 않았습니다. 오류 코드: \(code)"
+            onChange?()
+            return false
+        }
+        let previous = activeAssertion
+        activeAssertion = newID
+        wakeMode = mode
+        expiresAt = deadline
+        lastNotice = ""
+        shownMinutes = remainingMinutes ?? -1
+        UserDefaults.standard.set(mode.rawValue, forKey: Keys.mode)
+        if let oldID = previous { _ = IOPMAssertionRelease(oldID) }
+        ensureTimer()
+        onChange?()
+        return true
+    }
+
+    @discardableResult
+    func start(minutes: Int?) -> Bool {
+        // nil은 사용자가 직접 끌 때까지. 0 이하 시간은 받지 않습니다.
+        if let minutes = minutes, minutes <= 0 { return false }
+        guard !batteryLimitReached() else {
+            lastNotice = "배터리가 \(batteryThreshold)% 이하입니다. 전원 연결 후 다시 실행해 주세요."
+            onChange?()
+            return false
+        }
+        let end = minutes.map { Date().addingTimeInterval(TimeInterval($0) * 60.0) }
+        return activate(mode: wakeMode, until: end)
+    }
+
+    @discardableResult
+    func setMode(_ mode: WakeMode) -> Bool {
+        guard mode != wakeMode else { return true }
+        if isActive { return activate(mode: mode, until: expiresAt) }
+        wakeMode = mode
+        UserDefaults.standard.set(mode.rawValue, forKey: Keys.mode)
+        onChange?()
+        return true
+    }
+
+    func setBatterySafetyEnabled(_ enabled: Bool) {
+        batterySafetyEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: Keys.batterySafetyEnabled)
+        checkStatus()
+        onChange?()
+    }
+
+    func setBatteryThreshold(_ percent: Int) {
+        guard [10, 20, 30].contains(percent) else { return }
+        batteryThreshold = percent
+        UserDefaults.standard.set(percent, forKey: Keys.batteryThreshold)
+        checkStatus()
+        onChange?()
+    }
+
+    func stop(message: String = "") {
+        let previous = activeAssertion
+        activeAssertion = nil
+        expiresAt = nil
+        shownMinutes = -1
+        checkTimer?.invalidate()
+        checkTimer = nil
+        if let id = previous { _ = IOPMAssertionRelease(id) }
+        lastNotice = message
+        onChange?()
+    }
+
+    func shutdown() {
+        // 앱 종료 시 알림/메뉴 갱신 없이 시스템 요청을 반드시 해제합니다.
+        onChange = nil
+        stop()
+    }
+
+    private func ensureTimer() {
+        guard checkTimer == nil else { return }
+        let timer = Timer(timeInterval: 15.0, repeats: true) { [weak self] _ in self?.checkStatus() }
+        RunLoop.main.add(timer, forMode: .common)
+        checkTimer = timer
+    }
+
+    func checkStatus() {
+        guard isActive else { return }
+        if let deadline = expiresAt, Date() >= deadline {
+            stop(message: "설정한 시간이 종료되어 자동 해제했습니다.")
+            return
+        }
+        if batteryLimitReached() {
+            stop(message: "배터리 보호 기준(\(batteryThreshold)%)에 도달하여 자동 해제했습니다.")
+            return
+        }
+        // 메뉴를 불필요하게 자주 다시 만들지 않고, 분 단위 변화에만 갱신합니다.
+        let minute = remainingMinutes ?? -1
+        if minute != shownMinutes {
+            shownMinutes = minute
+            onChange?()
+        }
+    }
+}
+
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var wheelPanel: NSPanel?
@@ -2047,7 +2238,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         updateStatusBarMenu()
         JobProgressManager.shared.onUpdate = { [weak self] in self?.updateStatusBarMenu() }
-        
+        // 수동 잠자기 방지는 파일 변환 상태와 완전히 독립적으로 관리합니다.
+        FavoriteAwakeManager.shared.onChange = { [weak self] in
+            DispatchQueue.main.async { self?.updateStatusBarMenu() }
+        }
+
         setupUltraLightEventTap()
         // 새 설치/업데이트 시 한 번만 안내합니다. 권한 승인 창을 자동으로 누르거나
         // 폴더를 몰래 스캔하지 않으며, 사용자가 선택할 때만 NSOpenPanel을 띄웁니다.
@@ -2080,13 +2275,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     menuIcon.isTemplate = false
                     btn.image = menuIcon
                 } else {
-                    btn.image = NSImage(systemSymbolName: "circle.hexagongrid.fill", accessibilityDescription: "MyTangerine")
+                    btn.image = NSImage(systemSymbolName: "circle.hexagongrid.fill", accessibilityDescription: "00Favorite")
                 }
                 btn.title = ""
             }
         }
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "🍊 MyTangerine 4.8 Pro (대용량 초고속 최적화)", action: nil, keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "⭐ 00Favorite 4.8 Pro (대용량 초고속 최적화)", action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         if jobs.isEmpty {
             menu.addItem(NSMenuItem(title: "대기 중 (현재 진행 중인 변환 작업 없음)", action: nil, keyEquivalent: ""))
@@ -2099,6 +2294,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 menu.addItem(NSMenuItem(title: "[\(bar)] \(pct)% — \(job.title)", action: nil, keyEquivalent: ""))
             }
         }
+        menu.addItem(NSMenuItem.separator())
+        menu.addItem(makeAwakeMenu())
         menu.addItem(NSMenuItem.separator())
         let paused = !ShortcutSettings.shared.wheelDetectionEnabled
         let pauseItem = NSMenuItem(title: paused ? "▶ 안전 모드 휠 감지 재개" : "⏸ 안전 모드 휠 감지 일시 정지", action: #selector(toggleWheelDetection), keyEquivalent: "")
@@ -2115,6 +2312,103 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem(title: "종료 (Quit)", action: #selector(quitApp), keyEquivalent: "q"))
         statusItem.menu = menu
     }
+    // MARK: 독립 잠자기 방지 메뉴 (작업 진행률·변환 이벤트와 무관)
+    private func makeAwakeMenu() -> NSMenuItem {
+        let awake = FavoriteAwakeManager.shared
+        let parent = NSMenuItem(title: "🦉 잠자기 방지 · \(awake.statusText)", action: nil, keyEquivalent: "")
+        let submenu = NSMenu(title: "잠자기 방지")
+        submenu.addItem(NSMenuItem(title: "현재 상태: \(awake.statusText)", action: nil, keyEquivalent: ""))
+        if !awake.lastNotice.isEmpty {
+            submenu.addItem(NSMenuItem(title: "알림: \(awake.lastNotice)", action: nil, keyEquivalent: ""))
+        }
+        submenu.addItem(NSMenuItem.separator())
+        let durations: [(Int, String)] = [
+            (5, "5분"), (15, "15분"), (30, "30분"), (60, "1시간"),
+            (120, "2시간"), (240, "4시간"), (480, "8시간"), (-1, "직접 해제할 때까지")
+        ]
+        for (minutes, title) in durations {
+            let item = NSMenuItem(title: "▶ \(title) 동안 켜기", action: #selector(startAwake(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = minutes
+            submenu.addItem(item)
+        }
+        let stopItem = NSMenuItem(title: "■ 잠자기 방지 끄기", action: #selector(stopAwake), keyEquivalent: "")
+        stopItem.target = self
+        stopItem.isEnabled = awake.isActive
+        submenu.addItem(stopItem)
+        submenu.addItem(NSMenuItem.separator())
+
+        let computerOnly = NSMenuItem(title: "Mac만 깨어 있기 (화면 자동 꺼짐 허용)", action: #selector(useSystemOnlyAwake), keyEquivalent: "")
+        computerOnly.target = self
+        computerOnly.state = awake.wakeMode == .systemOnly ? .on : .off
+        submenu.addItem(computerOnly)
+        let keepScreen = NSMenuItem(title: "Mac과 화면 모두 켜두기", action: #selector(useDisplayAwake), keyEquivalent: "")
+        keepScreen.target = self
+        keepScreen.state = awake.wakeMode == .keepDisplayOn ? .on : .off
+        submenu.addItem(keepScreen)
+        submenu.addItem(NSMenuItem.separator())
+
+        let guardItem = NSMenuItem(title: "배터리 부족 시 자동 해제", action: #selector(toggleAwakeBatteryGuard), keyEquivalent: "")
+        guardItem.target = self
+        guardItem.state = awake.batterySafetyEnabled ? .on : .off
+        submenu.addItem(guardItem)
+        for percent in [10, 20, 30] {
+            let item = NSMenuItem(title: "  배터리 \(percent)% 이하일 때 해제", action: #selector(setAwakeBatteryThreshold(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = percent
+            item.state = awake.batteryThreshold == percent ? .on : .off
+            item.isEnabled = awake.batterySafetyEnabled
+            submenu.addItem(item)
+        }
+        submenu.addItem(NSMenuItem.separator())
+        submenu.addItem(NSMenuItem(title: "ℹ︎ 파일 변환과 연동되지 않는 수동 기능", action: nil, keyEquivalent: ""))
+        submenu.addItem(NSMenuItem(title: "Mac 덮개 닫기·직접 잠자기는 막지 않음", action: nil, keyEquivalent: ""))
+        parent.submenu = submenu
+        return parent
+    }
+
+    @objc private func startAwake(_ sender: NSMenuItem) {
+        if !FavoriteAwakeManager.shared.start(minutes: sender.tag == -1 ? nil : sender.tag) {
+            showAwakeErrorIfNeeded()
+        }
+        updateStatusBarMenu()
+    }
+    @objc private func stopAwake() {
+        FavoriteAwakeManager.shared.stop()
+        updateStatusBarMenu()
+    }
+    @objc private func useSystemOnlyAwake() {
+        if !FavoriteAwakeManager.shared.setMode(.systemOnly) { showAwakeErrorIfNeeded() }
+        updateStatusBarMenu()
+    }
+    @objc private func useDisplayAwake() {
+        if !FavoriteAwakeManager.shared.setMode(.keepDisplayOn) { showAwakeErrorIfNeeded() }
+        updateStatusBarMenu()
+    }
+    @objc private func toggleAwakeBatteryGuard() {
+        let awake = FavoriteAwakeManager.shared
+        awake.setBatterySafetyEnabled(!awake.batterySafetyEnabled)
+        updateStatusBarMenu()
+    }
+    @objc private func setAwakeBatteryThreshold(_ sender: NSMenuItem) {
+        FavoriteAwakeManager.shared.setBatteryThreshold(sender.tag)
+        updateStatusBarMenu()
+    }
+    private func showAwakeErrorIfNeeded() {
+        let message = FavoriteAwakeManager.shared.lastNotice
+        guard !message.isEmpty else { return }
+        let alert = NSAlert()
+        alert.messageText = "00Favorite 잠자기 방지"
+        alert.informativeText = message
+        alert.alertStyle = .warning
+        alert.runModal()
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        FavoriteAwakeManager.shared.shutdown()
+        // 기존 휠 감시와 변환 처리 방식은 변경하지 않습니다.
+    }
+
     @objc func toggleWheelDetection() {
         ShortcutSettings.shared.wheelDetectionEnabled.toggle()
         if !ShortcutSettings.shared.wheelDetectionEnabled { hideWheel() }

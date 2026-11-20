@@ -9,6 +9,8 @@ import Vision
 import UniformTypeIdentifiers
 import AudioToolbox
 import ImageIO
+import IOKit.pwr_mgt
+import IOKit.ps
 
 // MARK: - 0. 단축키, 홀드/토글 방식, 퀄리티 옵션 키 및 파일명 패턴 설정 매니저
 class ShortcutSettings: ObservableObject {
@@ -80,7 +82,7 @@ class ShortcutSettings: ObservableObject {
         NSEvent.ModifierFlags(rawValue: qualityModifierRaw).intersection([.shift, .option, .control, .command])
     }
     
-    func resetToTangerineDefaults() {
+    func resetToFavoriteDefaults() {
         convertFlagsRaw = Self.defaultConvertRaw
         toolsFlagsRaw = Self.defaultToolsRaw
         actionsFlagsRaw = Self.defaultActionsRaw
@@ -1511,7 +1513,7 @@ final class FolderAccessPreferences: ObservableObject {
     }
     func chooseFolders(startAt preferred: URL? = nil) {
         let panel = NSOpenPanel()
-        panel.title = "MyTangerine에서 사용할 폴더 선택"
+        panel.title = "00Favorite에서 사용할 폴더 선택"
         panel.message = "본인이 사용할 폴더를 선택하세요. 모든 디스크 권한을 자동으로 요청하지 않습니다."
         panel.prompt = "이 폴더 선택"
         panel.canChooseDirectories = true
@@ -1666,10 +1668,10 @@ class ToolWindowManager {
         openWindow(title: "이미지 세로 합치기", view: ImageJoinView(files: urls), size: NSSize(width: 780, height: 660), minSize: NSSize(width: 640, height: 500))
     }
     func showHelpAndSettingsWindow() {
-        openWindow(title: "🍊 MyTangerine — 설명 및 설정", view: HelpAndSettingsView(), size: NSSize(width: 820, height: 700), minSize: NSSize(width: 740, height: 600))
+        openWindow(title: "⭐ 00Favorite — 설명 및 설정", view: HelpAndSettingsView(), size: NSSize(width: 820, height: 700), minSize: NSSize(width: 740, height: 600))
     }
     func showFolderPermissionsWindow() {
-        openWindow(title: "🔐 MyTangerine — 파일·폴더 접근 설정", view: FolderPermissionView(), size: NSSize(width: 760, height: 640), minSize: NSSize(width: 650, height: 540))
+        openWindow(title: "🔐 00Favorite — 파일·폴더 접근 설정", view: FolderPermissionView(), size: NSSize(width: 760, height: 640), minSize: NSSize(width: 650, height: 540))
     }
     func showConvertQualityWindow(urls: [URL], targetExt: String) {
         openWindow(title: "포맷 변환 퀄리티 설정 (\(targetExt.uppercased()))", view: ConvertQualityPopupView(files: urls, targetExt: targetExt), size: NSSize(width: 500, height: 390), minSize: NSSize(width: 460, height: 360))
@@ -1719,7 +1721,7 @@ struct HelpAndSettingsView: View {
                         Image(systemName: "circle.hexagongrid.fill").font(.system(size: 36)).foregroundColor(.orange)
                     }
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("MyTangerine 4.8 Pro").font(.system(size: 20, weight: .heavy, design: .rounded))
+                        Text("00Favorite 4.8 Pro").font(.system(size: 20, weight: .heavy, design: .rounded))
                         Text("수천 개 대량 파일 일괄 처리 엔진 · 초저전력 최적화 · 무결점 3종 휠").font(.caption).foregroundColor(.secondary)
                     }
                     Spacer()
@@ -1751,7 +1753,7 @@ struct HelpAndSettingsView: View {
                 Spacer()
                 Button("기본 설정 복원") {
                     stopRecording()
-                    settings.resetToTangerineDefaults()
+                    settings.resetToFavoriteDefaults()
                     settings.renamePattern = ShortcutSettings.defaultRenamePattern
                     FileProcessor.showToast("단축키 및 작동 방식이 기본값으로 복원되었습니다.")
                 }
@@ -1768,7 +1770,7 @@ struct HelpAndSettingsView: View {
                 VStack(alignment: .leading, spacing: 9) {
                     Label("안전 모드 (항상 적용)", systemImage: "shield.checkered")
                         .font(.headline).foregroundColor(.green)
-                    Text("Finder의 키 입력과 마우스 드래그를 가로채거나 변경하지 않습니다. 휠 조각 위에 실제 파일을 드롭한 경우에만 MyTangerine 작업이 시작됩니다. 다른 위치에 놓으면 macOS가 원래 드롭을 처리합니다.")
+                    Text("Finder의 키 입력과 마우스 드래그를 가로채거나 변경하지 않습니다. 휠 조각 위에 실제 파일을 드롭한 경우에만 00Favorite 작업이 시작됩니다. 다른 위치에 놓으면 macOS가 원래 드롭을 처리합니다.")
                         .font(.caption).foregroundColor(.secondary)
                     Toggle("휠 감지 켜기 (메뉴바에서도 일시 정지 가능)", isOn: $settings.wheelDetectionEnabled)
                         .onChange(of: settings.wheelDetectionEnabled) { enabled in
