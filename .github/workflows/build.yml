@@ -47,8 +47,8 @@ jobs:
             <key>CFBundleIconFile</key><string>AppIcon</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleShortVersionString</key><string>4.8</string>
-            <key>CFBundleVersion</key><string>4808</string>
-            <key>FavoriteBuildID</key><string>FAV-20261121-HK8</string>
+            <key>CFBundleVersion</key><string>4809</string>
+            <key>FavoriteBuildID</key><string>FAV-20261121-HK9</string>
             <key>LSMinimumSystemVersion</key><string>14.0</string>
             <key>LSArchitecturePriority</key><array><string>arm64</string></array>
             <key>LSUIElement</key><true/>
@@ -121,14 +121,38 @@ jobs:
           lipo -archs 00Favorite.app/Contents/MacOS/00Favorite | grep -qw 'arm64'
           xattr -cr 00Favorite.app
           # 서명이 끝난 다음 앱 리소스를 다시 수정하지 않습니다.
-          codesign --force --deep --sign - 00Favorite.app
-          codesign --verify --deep --strict --verbose=2 00Favorite.app
-          ditto -c -k --sequesterRsrc --keepParent 00Favorite.app 00Favorite.zip
+          # 이름·실행 파일·식별자는 앱 내부와 코드 서명에서 반드시 같아야 합니다.
+          # 기존 MyTangerine 서명·ID가 들어 있는 산출물은 배포하지 않습니다.
+          APP="00Favorite.app"
+          ID="win.yespick.00favorite"
+          INFO="$APP/Contents/Info.plist"
+          [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$INFO")" = "$ID" ]
+          [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleName' "$INFO")" = '00Favorite' ]
+          [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' "$INFO")" = '00Favorite' ]
+          [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$INFO")" = '00Favorite' ]
+          [ "$(/usr/libexec/PlistBuddy -c 'Print :FavoriteBuildID' "$INFO")" = 'FAV-20261121-HK9' ]
+          test -x "$APP/Contents/MacOS/00Favorite"
+          # FFmpeg는 앞 단계에서 별도 서명됐으므로 main app만 별도 서명합니다.
+          # --deep으로 내부 실행 도구에 동일 앱 식별자가 부여되는 일을 방지합니다.
+          # Ad-hoc 서명이므로 업데이트마다 TCC 권한 재승인이 필요할 수 있습니다.
+          codesign --force --sign - --identifier "$ID" "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          SIGN_INFO="$(codesign -dv --verbose=4 "$APP" 2>&1)"
+          printf '%s\n' "$SIGN_INFO" | grep -Fx 'Identifier=win.yespick.00favorite'
+          printf '%s\n' "$SIGN_INFO" | grep -q '^Signature=adhoc$'
+          echo '00Favorite bundle identity: VERIFIED'
+          echo '00Favorite display name: VERIFIED'
+          echo '00Favorite signing identifier: VERIFIED'
+          ditto -c -k --sequesterRsrc --keepParent "$APP" 00Favorite.zip
           unzip -tqq 00Favorite.zip
+          # 완성된 압축에도 실제 새 Info.plist가 들어있는지 검사합니다.
+          unzip -p 00Favorite.zip '00Favorite.app/Contents/Info.plist' > packaged-Info.plist
+          [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' packaged-Info.plist)" = "$ID" ]
+          [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleName' packaged-Info.plist)" = '00Favorite' ]
 
       - name: Upload Finished Mac App
         uses: actions/upload-artifact@v4
         with:
-          name: 00Favorite-4.8-FAV-20261121-HK8-Mac-ARM64
+          name: 00Favorite-4.8-FAV-20261121-HK9-Mac-ARM64
           path: 00Favorite.zip
           if-no-files-found: error
