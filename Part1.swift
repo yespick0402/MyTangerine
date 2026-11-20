@@ -1,4 +1,5 @@
 import Cocoa
+import Carbon
 import SwiftUI
 import AVFoundation
 import AVKit
@@ -1779,6 +1780,8 @@ struct HelpAndSettingsView: View {
                             delegate?.updateStatusBarMenu()
                         }
                     Toggle("Finder에서 시작한 파일 드래그만 감지 (권장)", isOn: $settings.finderOnlyDetection)
+                    Text("잠자기 방지 토글은 기본 ⌃ Control + ⌥ Option + ⌘ Command + K입니다. 메뉴바의 [잠자기 방지 → 단축키 설정]에서 다른 조합 또는 해제를 선택할 수 있으며, 파일 드래그 단축키와 독립적으로 작동합니다.")
+                        .font(.caption2).foregroundColor(.secondary)
                     Text("기존 Shift / Option+Shift / Control 키는 유지합니다. 파일 드래그를 시작한 다음 해당 조합을 새로 눌러야만 휠이 열립니다. 평소 Finder의 Shift 선택·드래그에는 반응하지 않습니다.")
                         .font(.caption2).foregroundColor(.secondary)
                 }

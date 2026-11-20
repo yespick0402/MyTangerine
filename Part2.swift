@@ -2217,8 +2217,180 @@ final class FavoriteAwakeManager {
     }
 }
 
+
+// MARK: - 독립 잠자기 방지 전역 토글 단축키
+// Carbon의 정식 RegisterEventHotKey로 설정된 조합만 수신합니다.
+// Finder/다른 앱의 키 이벤트를 감시·변조하거나 파일 드래그 입력에 관여하지 않습니다.
+final class FavoriteAwakeHotKey {
+    static let shared = FavoriteAwakeHotKey()
+    private static let signature: OSType = 0x30304656  // '00FV'
+    private static let identifier: UInt32 = 1
+    private static let shortcutKey = "favorite_awake_toggle_hotkey_v1"
+    private static let durationKey = "favorite_awake_toggle_duration_v1"
+
+    enum Preset: Int, CaseIterable {
+        case disabled = 0
+        case commandOptionControlK = 1
+        case commandOptionControlJ = 2
+        case commandOptionControlL = 3
+
+        var name: String {
+            switch self {
+            case .disabled: return "사용 안 함"
+            case .commandOptionControlK: return "⌃⌥⌘K (권장)"
+            case .commandOptionControlJ: return "⌃⌥⌘J"
+            case .commandOptionControlL: return "⌃⌥⌘L"
+            }
+        }
+        var keyCode: UInt32? {
+            switch self {
+            case .disabled: return nil
+            case .commandOptionControlK: return UInt32(kVK_ANSI_K)
+            case .commandOptionControlJ: return UInt32(kVK_ANSI_J)
+            case .commandOptionControlL: return UInt32(kVK_ANSI_L)
+            }
+        }
+    }
+
+    private(set) var preset: Preset
+    private(set) var toggleMinutes: Int
+    private(set) var lastNotice: String = ""
+    private var hotKeyRef: EventHotKeyRef?
+    private var handlerRef: EventHandlerRef?
+    private var lastToggleUptime: TimeInterval = -10
+
+    private init() {
+        let defaults = UserDefaults.standard
+        if defaults.object(forKey: Self.shortcutKey) != nil {
+            preset = Preset(rawValue: defaults.integer(forKey: Self.shortcutKey)) ?? .commandOptionControlK
+        } else {
+            preset = .commandOptionControlK
+        }
+        let saved = defaults.object(forKey: Self.durationKey) as? Int ?? 60
+        toggleMinutes = [5, 15, 30, 60, 120, 240, 480, -1].contains(saved) ? saved : 60
+    }
+
+    var toggleDurationLabel: String {
+        switch toggleMinutes {
+        case 5: return "5분"
+        case 15: return "15분"
+        case 30: return "30분"
+        case 60: return "1시간"
+        case 120: return "2시간"
+        case 240: return "4시간"
+        case 480: return "8시간"
+        default: return "직접 해제할 때까지"
+        }
+    }
+
+    private static let eventCallback: EventHandlerUPP = { _, event, _ in
+        guard let event = event else { return OSStatus(eventNotHandledErr) }
+        var receivedID = EventHotKeyID()
+        let result = GetEventParameter(
+            event,
+            UInt32(kEventParamDirectObject),
+            EventParamType(typeEventHotKeyID),
+            nil,
+            MemoryLayout<EventHotKeyID>.size,
+            nil,
+            &receivedID
+        )
+        guard result == noErr,
+              receivedID.signature == FavoriteAwakeHotKey.signature,
+              receivedID.id == FavoriteAwakeHotKey.identifier else {
+            return OSStatus(eventNotHandledErr)
+        }
+        DispatchQueue.main.async { FavoriteAwakeHotKey.shared.toggle() }
+        return noErr
+    }
+
+    private func ensureHandler() -> Bool {
+        if handlerRef != nil { return true }
+        var eventSpec = EventTypeSpec(
+            eventClass: UInt32(kEventClassKeyboard),
+            eventKind: UInt32(kEventHotKeyPressed)
+        )
+        let result = InstallEventHandler(
+            GetApplicationEventTarget(), Self.eventCallback, 1, &eventSpec, nil, &handlerRef
+        )
+        if result != noErr {
+            lastNotice = "단축키 이벤트 등록 실패 (\(result))"
+            return false
+        }
+        return true
+    }
+
+    private func register(_ chosen: Preset) -> Bool {
+        guard let keyCode = chosen.keyCode else { return true }
+        guard ensureHandler() else { return false }
+        var newRef: EventHotKeyRef?
+        let mods = UInt32(controlKey | optionKey | cmdKey)
+        let id = EventHotKeyID(signature: Self.signature, id: Self.identifier)
+        let result = RegisterEventHotKey(
+            keyCode, mods, id, GetApplicationEventTarget(), 0, &newRef
+        )
+        guard result == noErr, let registeredRef = newRef else {
+            lastNotice = "⌃⌥⌘ 조합을 등록하지 못했습니다(\(result)). 다른 앱의 단축키와 충돌할 수 있습니다."
+            return false
+        }
+        hotKeyRef = registeredRef
+        lastNotice = ""
+        return true
+    }
+
+    func startMonitoring() {
+        _ = register(preset)
+    }
+
+    @discardableResult
+    func changePreset(_ chosen: Preset) -> Bool {
+        guard chosen != preset else { return true }
+        let old = preset
+        if let existing = hotKeyRef { _ = UnregisterEventHotKey(existing); hotKeyRef = nil }
+        if register(chosen) {
+            preset = chosen
+            UserDefaults.standard.set(chosen.rawValue, forKey: Self.shortcutKey)
+            return true
+        }
+        let failureNotice = lastNotice
+        // 새 단축키가 실패하더라도 기존 단축키를 복구합니다.
+        if !register(old) { lastNotice = failureNotice + " 기존 단축키 재등록도 실패했습니다." }
+        else { lastNotice = failureNotice }
+        return false
+    }
+
+    func setToggleMinutes(_ minutes: Int) {
+        guard [5, 15, 30, 60, 120, 240, 480, -1].contains(minutes) else { return }
+        toggleMinutes = minutes
+        UserDefaults.standard.set(minutes, forKey: Self.durationKey)
+    }
+
+    func toggle() {
+        let now = ProcessInfo.processInfo.systemUptime
+        // 누르고 있는 동안 반복 발생하는 키 이벤트로 ON/OFF가 여러 번 바뀌지 않게 보호합니다.
+        guard now - lastToggleUptime > 0.5 else { return }
+        lastToggleUptime = now
+        let awake = FavoriteAwakeManager.shared
+        if awake.isActive {
+            awake.stop()
+        } else if !awake.start(minutes: toggleMinutes == -1 ? nil : toggleMinutes) {
+            ToolWindowManager.shared.showBanner(message: awake.lastNotice.isEmpty ? "잠자기 방지 실행 실패" : awake.lastNotice)
+        }
+    }
+
+    func stopMonitoring() {
+        if let ref = hotKeyRef { _ = UnregisterEventHotKey(ref); hotKeyRef = nil }
+        if let ref = handlerRef { _ = RemoveEventHandler(ref); handlerRef = nil }
+    }
+}
+
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
+    private lazy var awakeCakeIcon: NSImage? = {
+        guard let path = Bundle.main.path(forResource: "icon_awake", ofType: "png") else { return nil }
+        return NSImage(contentsOfFile: path)
+    }()
+    private let buildIdentifier = "FAV-20261120-HK1"
     var wheelPanel: NSPanel?
     var wheelCenterPoint: NSPoint = .zero
     
@@ -2247,10 +2419,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
         _ = AXIsProcessTrustedWithOptions(options)
         
+        FavoriteAwakeHotKey.shared.startMonitoring()
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         updateStatusBarMenu()
         JobProgressManager.shared.onUpdate = { [weak self] in self?.updateStatusBarMenu() }
-        // 수동 잠자기 방지는 파일 변환 상태와 완전히 독립적으로 관리합니다.
+        // 잠자기 방지와 파일 변환의 실행/종료는 연결하지 않습니다. 메뉴 아이콘 상태만 갱신합니다.
         FavoriteAwakeManager.shared.onChange = { [weak self] in
             DispatchQueue.main.async { self?.updateStatusBarMenu() }
         }
@@ -2275,25 +2448,29 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     
     func updateStatusBarMenu() {
         let jobs = JobProgressManager.shared.jobs
+        let isAwake = FavoriteAwakeManager.shared.isActive
+        let currentCakeIcon = (isAwake ? awakeCakeIcon : nil) ?? FileProcessor.customAppIconImage()
+        if let appIcon = currentCakeIcon { NSApp.applicationIconImage = appIcon }
         if let btn = statusItem.button {
-            if let overall = JobProgressManager.shared.overallProgress {
-                let pct = Int((overall * 100.0).rounded())
-                btn.image = NSImage(systemSymbolName: "gearshape.arrow.triangle.2.circlepath", accessibilityDescription: "Processing")
-                btn.title = " \(pct)%"
+            if let cake = currentCakeIcon {
+                let menuIcon = (cake.copy() as? NSImage) ?? cake
+                menuIcon.size = NSSize(width: 18, height: 18)
+                menuIcon.isTemplate = false
+                btn.image = menuIcon
+                btn.toolTip = isAwake ? "잠자기 방지 켜짐 · 00Favorite" : "잠자기 방지 꺼짐 · 00Favorite"
             } else {
-                if let customIcon = FileProcessor.customAppIconImage() {
-                    let menuIcon = (customIcon.copy() as? NSImage) ?? customIcon
-                    menuIcon.size = NSSize(width: 18, height: 18)
-                    menuIcon.isTemplate = false
-                    btn.image = menuIcon
-                } else {
-                    btn.image = NSImage(systemSymbolName: "circle.hexagongrid.fill", accessibilityDescription: "00Favorite")
-                }
+                btn.image = NSImage(systemSymbolName: "circle.hexagongrid.fill", accessibilityDescription: "00Favorite")
+            }
+            // 파일 변환 작업의 진행률은 아이콘 상태와 무관하게 숫자로 표시합니다.
+            if let overall = JobProgressManager.shared.overallProgress {
+                btn.title = " \(Int((overall * 100.0).rounded()))%"
+            } else {
                 btn.title = ""
             }
         }
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "⭐ 00Favorite 4.8 Pro (대용량 초고속 최적화)", action: nil, keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "빌드 확인: \(buildIdentifier)", action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         if jobs.isEmpty {
             menu.addItem(NSMenuItem(title: "대기 중 (현재 진행 중인 변환 작업 없음)", action: nil, keyEquivalent: ""))
@@ -2348,6 +2525,39 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         stopItem.target = self
         stopItem.isEnabled = awake.isActive
         submenu.addItem(stopItem)
+        let hotkey = FavoriteAwakeHotKey.shared
+        let toggleItem = NSMenuItem(title: "⏻ 잠자기 방지 토글 (\(hotkey.preset.name))", action: #selector(toggleAwakeByMenu), keyEquivalent: "")
+        toggleItem.target = self
+        submenu.addItem(toggleItem)
+        submenu.addItem(NSMenuItem.separator())
+        let hotkeyRoot = NSMenuItem(title: "⌨️ 토글 단축키 설정", action: nil, keyEquivalent: "")
+        let hotkeyOptions = NSMenu(title: "토글 단축키")
+        for choice in FavoriteAwakeHotKey.Preset.allCases {
+            let option = NSMenuItem(title: choice.name, action: #selector(changeAwakeHotkey(_:)), keyEquivalent: "")
+            option.target = self
+            option.tag = choice.rawValue
+            option.state = choice == hotkey.preset ? .on : .off
+            hotkeyOptions.addItem(option)
+        }
+        hotkeyRoot.submenu = hotkeyOptions
+        submenu.addItem(hotkeyRoot)
+        if !hotkey.lastNotice.isEmpty {
+            submenu.addItem(NSMenuItem(title: "단축키 상태: \(hotkey.lastNotice)", action: nil, keyEquivalent: ""))
+        }
+        let durationRoot = NSMenuItem(title: "⏱️ 토글 켤 때 유지 시간 · \(hotkey.toggleDurationLabel)", action: nil, keyEquivalent: "")
+        let durationMenu = NSMenu(title: "토글 유지 시간")
+        for (minutes, label) in [
+            (5, "5분"), (15, "15분"), (30, "30분"), (60, "1시간"),
+            (120, "2시간"), (240, "4시간"), (480, "8시간"), (-1, "직접 해제할 때까지")
+        ] {
+            let item = NSMenuItem(title: label, action: #selector(changeAwakeHotkeyDuration(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = minutes
+            item.state = minutes == hotkey.toggleMinutes ? .on : .off
+            durationMenu.addItem(item)
+        }
+        durationRoot.submenu = durationMenu
+        submenu.addItem(durationRoot)
         submenu.addItem(NSMenuItem.separator())
 
         let computerOnly = NSMenuItem(title: "Mac만 깨어 있기 (화면 자동 꺼짐 허용)", action: #selector(useSystemOnlyAwake), keyEquivalent: "")
@@ -2377,6 +2587,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         submenu.addItem(NSMenuItem(title: "Mac 덮개 닫기·직접 잠자기는 막지 않음", action: nil, keyEquivalent: ""))
         parent.submenu = submenu
         return parent
+    }
+
+    @objc private func toggleAwakeByMenu() {
+        FavoriteAwakeHotKey.shared.toggle()
+        updateStatusBarMenu()
+    }
+    @objc private func changeAwakeHotkey(_ sender: NSMenuItem) {
+        guard let choice = FavoriteAwakeHotKey.Preset(rawValue: sender.tag) else { return }
+        if !FavoriteAwakeHotKey.shared.changePreset(choice) {
+            ToolWindowManager.shared.showBanner(message: FavoriteAwakeHotKey.shared.lastNotice)
+        }
+        updateStatusBarMenu()
+    }
+    @objc private func changeAwakeHotkeyDuration(_ sender: NSMenuItem) {
+        FavoriteAwakeHotKey.shared.setToggleMinutes(sender.tag)
+        updateStatusBarMenu()
     }
 
     @objc private func startAwake(_ sender: NSMenuItem) {
@@ -2417,6 +2643,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        FavoriteAwakeHotKey.shared.stopMonitoring()
         FavoriteAwakeManager.shared.shutdown()
         // 기존 휠 감시와 변환 처리 방식은 변경하지 않습니다.
     }
