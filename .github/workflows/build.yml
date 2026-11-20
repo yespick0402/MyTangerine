@@ -46,6 +46,11 @@ jobs:
             <key>LSArchitecturePriority</key><array><string>arm64</string></array>
             <key>LSUIElement</key><true/>
             <key>NSHighResolutionCapable</key><true/>
+            <key>NSDesktopFolderUsageDescription</key><string>사용자가 선택한 바탕화면 파일을 변환하고 결과 파일을 원본 폴더에 저장하기 위해 필요합니다.</string>
+            <key>NSDocumentsFolderUsageDescription</key><string>사용자가 선택한 문서 파일을 읽고 변환 결과를 저장하기 위해 필요합니다.</string>
+            <key>NSDownloadsFolderUsageDescription</key><string>사용자가 선택한 다운로드 파일을 변환하고 결과 파일을 저장하기 위해 필요합니다.</string>
+            <key>NSRemovableVolumesUsageDescription</key><string>사용자가 선택한 외장 저장장치의 파일을 처리하기 위해 필요합니다.</string>
+            <key>NSNetworkVolumesUsageDescription</key><string>사용자가 선택한 네트워크 폴더의 파일을 처리하기 위해 필요합니다.</string>
           </dict>
           </plist>
           EOF
@@ -95,22 +100,6 @@ jobs:
             exit 1
           fi
           "$FF_BIN" -version | head -n 1
-
-      - name: Bundle camera metadata analyzer (ExifTool)
-        shell: bash
-        run: |
-          set -euo pipefail
-          if ! brew list --versions exiftool >/dev/null 2>&1; then brew install exiftool; fi
-          TOOL_ROOT="$(brew --prefix exiftool)/libexec"
-          test -f "$TOOL_ROOT/bin/exiftool"
-          test -d "$TOOL_ROOT/lib/perl5"
-          cp "$TOOL_ROOT/bin/exiftool" MyTangerine.app/Contents/Resources/exiftool.pl
-          cp -R "$TOOL_ROOT/lib/perl5" MyTangerine.app/Contents/Resources/exiftool-lib
-          chmod 644 MyTangerine.app/Contents/Resources/exiftool.pl
-          PERL5LIB="$PWD/MyTangerine.app/Contents/Resources/exiftool-lib" /usr/bin/perl MyTangerine.app/Contents/Resources/exiftool.pl -ver
-          # Mac에서 영상 메타데이터 분석 기능이 조용히 누락되지 않도록 JPEG/PNG 읽기까지 확인
-          PERL5LIB="$PWD/MyTangerine.app/Contents/Resources/exiftool-lib" /usr/bin/perl MyTangerine.app/Contents/Resources/exiftool.pl -j -G1 -s icon.png > exiftool-smoke.json
-          python3 -c 'import json; x=json.load(open("exiftool-smoke.json")); assert len(x)==1 and "SourceFile" in x[0]'
 
       - name: Compile and verify native macOS app
         shell: bash
