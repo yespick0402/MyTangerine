@@ -1952,7 +1952,8 @@ final class SafeWheelDropTarget: NSView {
 
     private func permits(_ sender: NSDraggingInfo) -> Bool {
         guard let owner = owner, owner.isNativeWheelReady else { return false }
-        // 이동(move)은 절대로 수락하지 않고, 원본 파일을 변경하지 않는 복사(copy) 드롭만 수락합니다.
+        // Finder가 현재 복사 드롭을 허용할 때만 네이티브 파일 드롭을 수락합니다.
+        // Command 상태에서 .move만 제공하더라도 이를 .copy로 속이지 않습니다.
         guard sender.draggingSourceOperationMask.contains(.copy) else { return false }
         let types = sender.draggingPasteboard.types ?? []
         return types.contains(.fileURL) || types.contains(NSPasteboard.PasteboardType("NSFilenamesPboardType"))
@@ -1962,16 +1963,41 @@ final class SafeWheelDropTarget: NSView {
         draggingUpdated(sender)
     }
     override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
-        guard permits(sender), let owner = owner else {
-            if AppState.shared.hoveredIndex != nil { AppState.shared.hoveredIndex = nil }
+        guard let owner = owner, owner.isNativeWheelReady else {
+            owner?.isNativeDragTracking = false
+            owner?.qualityNoCopyHover = false
+            AppState.shared.hoveredIndex = nil
             return []
         }
-        // draggingLocation은 NSWindow 좌표계(위쪽이 +Y)로 제공됩니다.
-        let idx = owner.wheelIndexAtWindowPoint(sender.draggingLocation)
-        if AppState.shared.hoveredIndex != idx { AppState.shared.hoveredIndex = idx }
-        return idx == nil ? [] : .copy
+        let types = sender.draggingPasteboard.types ?? []
+        guard types.contains(.fileURL) || types.contains(NSPasteboard.PasteboardType("NSFilenamesPboardType")) else {
+            owner.isNativeDragTracking = false
+            owner.qualityNoCopyHover = false
+            AppState.shared.hoveredIndex = nil
+            return []
+        }
+        owner.isNativeDragTracking = true
+        let index = owner.wheelIndexAtWindowPoint(sender.draggingLocation)
+        let canCopy = sender.draggingSourceOperationMask.contains(.copy)
+        // Finder는 Command를 누르는 동안 드래그 연산을 .move로 제한할 수 있습니다.
+        // 그 상태의 .move를 '수락'하지 않고, 퀄리티 변환에 한하여 마우스 해제 후
+        // 원본 파일이 그대로 존재하는 경우에만 별도 변환 처리를 준비합니다.
+        let canObserveQualityRelease = !canCopy &&
+            !sender.draggingSourceOperationMask.isEmpty &&
+            owner.dragStartedInFinder &&
+            owner.requestedWheelDuringThisDrag &&
+            AppState.shared.wheelMode == .convert &&
+            AppState.shared.isQualityOptionActive &&
+            index != nil
+        owner.qualityNoCopyHover = canObserveQualityRelease
+        // 드롭을 수락하지 못하더라도 사용자가 선택 중인 조각은 안정적으로 강조합니다.
+        let visualIndex = (canCopy || canObserveQualityRelease) ? index : nil
+        if AppState.shared.hoveredIndex != visualIndex { AppState.shared.hoveredIndex = visualIndex }
+        return canCopy && index != nil ? .copy : []
     }
     override func draggingExited(_ sender: NSDraggingInfo?) {
+        owner?.isNativeDragTracking = false
+        owner?.qualityNoCopyHover = false
         AppState.shared.hoveredIndex = nil
     }
     override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool {
@@ -2000,6 +2026,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var previousRawFlags: NSEvent.ModifierFlags = []
     var dragStartedInFinder: Bool = false
     var safeDropWasAccepted: Bool = false
+    // 실제 NSDraggingDestination이 커서를 추적할 때 전역 이벤트 콜백이
+    // hoveredIndex를 덮어쓰지 않게 하여 조각의 강조 표시 깜빡임을 방지합니다.
+    var isNativeDragTracking: Bool = false
+    // Command로 인해 .copy가 사라진 경우에도 원본 Finder 이동을 수락하지 않습니다.
+    // 이 값은 네이티브 드롭 대상 위에서 퀄리티 모드를 보고 있을 때만 참입니다.
+    var qualityNoCopyHover: Bool = false
     var dragSequence: UInt64 = 0
     // 드래그가 시작된 뒤 사용자가 직접 호출 조합을 눌러야만 휠을 띄웁니다.
     var requestedWheelDuringThisDrag: Bool = false
@@ -2118,22 +2150,62 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 owner.isCurrentMouseStrokeValidFileDrag = false
                 owner.previousRawFlags = []
                 owner.safeDropWasAccepted = false
+                owner.isNativeDragTracking = false
+                owner.qualityNoCopyHover = false
                 owner.dragSequence &+= 1
                 owner.dragStartedInFinder = (NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.apple.finder")
                 owner.requestedWheelDuringThisDrag = false
                 return Unmanaged.passUnretained(event)
             }
             if type == .leftMouseUp {
+                // Command는 macOS Finder의 '이동' 드롭 연산을 지정할 수 있습니다.
+                // 따라서 .move를 복사로 속이거나 mouseUp을 차단하지 않습니다.
+                // 실제 네이티브 대상 위에서 거부된 품질 드래그에 한하여,
+                // Finder가 취소할 시간을 준 후 별도 변환 명령만 시작합니다.
+                let settingsAtRelease = ShortcutSettings.shared
+                let releaseFlags = NSEvent.ModifierFlags(rawValue: UInt(event.flags.rawValue))
+                    .intersection([.shift, .option, .control, .command])
+                let qualityKeys = settingsAtRelease.qualityFlags
+                let isQualityHeld = !qualityKeys.isEmpty && releaseFlags.isSuperset(of: qualityKeys)
+                let pointerAtRelease = NSEvent.mouseLocation
+                let releaseIndex = owner.wheelIndexForGlobalPointer(pointerAtRelease)
+                let shouldUseQualityFallback = owner.qualityNoCopyHover &&
+                    owner.isNativeDragTracking &&
+                    owner.isCurrentMouseStrokeValidFileDrag &&
+                    owner.dragStartedInFinder &&
+                    owner.requestedWheelDuringThisDrag &&
+                    owner.isNativeWheelReady &&
+                    AppState.shared.wheelMode == .convert &&
+                    isQualityHeld &&
+                    settingsAtRelease.matchWheelMode(for: releaseFlags) == .convert &&
+                    releaseIndex != nil
+                let qualityFiles = shouldUseQualityFallback ? AppState.shared.draggedFiles : []
+                let qualityAction = releaseIndex.flatMap { index -> String? in
+                    guard shouldUseQualityFallback, index >= 0, index < AppState.shared.items.count else { return nil }
+                    let action = AppState.shared.items[index].actionKey
+                    guard action.hasPrefix("conv_"), action != "conv_zip", action != "conv_targz" else { return nil }
+                    return action
+                }
                 owner.isCurrentMouseStrokeValidFileDrag = false
                 owner.previousRawFlags = []
                 owner.requestedWheelDuringThisDrag = false
-                // 네이티브 AppKit performDragOperation이 처리할 여유를 준 뒤 휠을 닫습니다.
-                // mouseUp을 삼키거나 가짜 Escape/마우스 이벤트를 만들지 않습니다.
+                // 네이티브 드롭 완료 여부를 먼저 확인합니다. 이 콜백은 입력을
+                // 읽기만 하며 Finder의 mouseUp/수정키 상태를 전혀 수정하지 않습니다.
                 let sequenceAtRelease = owner.dragSequence
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak owner] in
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) { [weak owner] in
                     guard let owner = owner, owner.dragSequence == sequenceAtRelease,
                           !owner.safeDropWasAccepted else { return }
+                    guard let action = qualityAction, !qualityFiles.isEmpty,
+                          qualityFiles.allSatisfy({ FileManager.default.fileExists(atPath: $0.path) }) else {
+                        owner.hideWheel()
+                        return
+                    }
+                    // 원본 파일의 이동 또는 삭제를 수행하지 않는 '변환' 액션만 실행합니다.
+                    owner.safeDropWasAccepted = true
                     owner.hideWheel()
+                    DispatchQueue.main.async {
+                        FileProcessor.execute(actionKey: action, files: qualityFiles, openQualityPopup: true)
+                    }
                 }
                 return Unmanaged.passUnretained(event)
             }
@@ -2188,7 +2260,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             } else if type == .leftMouseDragged {
                 if let mode = matched, !settings.isToggleMode, owner.requestedWheelDuringThisDrag {
                     owner.showOrSwitchWheel(mode: mode, mouseLocation: NSEvent.mouseLocation)
-                } else if AppState.shared.isDragging {
+                } else if AppState.shared.isDragging && !owner.isNativeDragTracking {
                     owner.updateHoveredSliceLightweight(mouseLocation: NSEvent.mouseLocation)
                 }
             }
@@ -2234,6 +2306,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return Int(((degrees + step / 2.0).truncatingRemainder(dividingBy: 360.0)) / step) % count
     }
 
+    // AppKit 창의 원점과 동일한 전역 macOS 좌표계로 드롭 조각을 계산합니다.
+    func wheelIndexForGlobalPointer(_ point: NSPoint) -> Int? {
+        guard let panel = wheelPanel, panel.isVisible else { return nil }
+        return wheelIndexAtWindowPoint(NSPoint(x: point.x - panel.frame.minX,
+                                               y: point.y - panel.frame.minY))
+    }
+
     func completeSafeWheelDrop(at index: Int, files: [URL]) -> Bool {
         guard isNativeWheelReady, index >= 0, index < AppState.shared.items.count, !files.isEmpty else {
             return false
@@ -2271,7 +2350,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // 뒤늦게 발견된 추가 드래그 파일도 ACTIONS 휠의 이미지 합치기 항목에 반영합니다.
             AppState.shared.updateItems()
         }
-        updateHoveredSliceLightweight(mouseLocation: mouseLocation)
+        if !isNativeDragTracking { updateHoveredSliceLightweight(mouseLocation: mouseLocation) }
     }
     
     // MARK: 핵심 해결 — 파인더에서 2,000개 이상의 파일을 드래그할 때 33개에서 잘리지 않도록 3가지 경로(readObjects + pasteboardItems + NSFilenamesPboardType)를 모두 취합하여 100% 전수 추출!
@@ -2363,6 +2442,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         AppState.shared.isDragging = false
         AppState.shared.isQualityOptionActive = false
         AppState.shared.hoveredIndex = nil
+        isNativeDragTracking = false
+        qualityNoCopyHover = false
         wheelPanel?.orderOut(nil)
         wheelPanel?.contentView = nil
     }
@@ -2391,8 +2472,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
     
-    // mouseUp을 바꿔 실행하던 기존 방식은 제거했습니다.
-    // 파일 작업은 NSDraggingDestination.performDragOperation에서만 시작됩니다.
+    // mouseUp을 바꾸거나 차단하지 않습니다. 일반 파일 드롭은 NSDraggingDestination만 처리합니다.
+    // Command가 .copy 권한을 제거하는 퀄리티 변환에는 원본 이동을 수락하지 않는
+    // 별도의 수동 감시 경로만 사용합니다.
 
 }
 

@@ -1472,7 +1472,7 @@ struct RadialWheelView: View {
                 .foregroundColor(.secondary)
             
             if state.wheelMode == .convert && state.isQualityOptionActive {
-                Text("🎯 퀄리티 지정 모드")
+                Text("🎯 퀄리티 선택 · 키 떼면 일반")
                     .font(.system(size: 9, weight: .heavy, design: .rounded))
                     .foregroundColor(.white)
                     .padding(.horizontal, 6).padding(.vertical, 1.5)
@@ -1674,7 +1674,7 @@ struct HelpAndSettingsView: View {
                     )
                     recorderCard(
                         targetID: "quality", title: "🎯 변환 시 1~100% 퀄리티 선택 옵션 키 (기본: ⌘ Command)",
-                        subtitle: "변환 휠에서 이 키를 누른 채로 확장자에 드롭하면 1~100% 퀄리티(100%=원본 동일 화질)를 직접 지정할 수 있는 창이 뜹니다.",
+                        subtitle: "변환 휠에서 이 키를 누른 채 확장자에 놓으면 퀄리티 창이 열립니다. 키를 떼면 즉시 일반 변환으로 돌아옵니다. Finder의 원본 파일 이동/복사 이벤트는 변경하지 않습니다.",
                         currentFlags: settings.qualityFlags,
                         onSave: { newFlags in settings.qualityModifierRaw = newFlags.rawValue; FileProcessor.showToast("퀄리티 옵션 단축키가 저장되었습니다.") }
                     )
