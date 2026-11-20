@@ -2437,7 +2437,7 @@ final class FavoriteAwakeHotKey {
             return false
         }
         // 메뉴바 조작 및 별도 설정창이 열려도 이벤트를 계속 받을 수 있도록 공통 모드로 연결합니다.
-        CFRunLoopAddSource(CFRunLoopGetMain(), source, kCFRunLoopCommonModes)
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, CFRunLoopMode.commonModes)
         globalKeyTap = tap
         globalKeySource = source
         CGEvent.tapEnable(tap: tap, enable: true)
@@ -2514,7 +2514,7 @@ final class FavoriteAwakeHotKey {
     }
     func stopMonitoring() {
         if let source = globalKeySource {
-            CFRunLoopRemoveSource(CFRunLoopGetMain(), source, kCFRunLoopCommonModes)
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), source, CFRunLoopMode.commonModes)
             CFRunLoopSourceInvalidate(source)
             globalKeySource = nil
         }
