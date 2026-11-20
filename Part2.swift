@@ -2467,7 +2467,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard let path = Bundle.main.path(forResource: "icon_awake", ofType: "png") else { return nil }
         return NSImage(contentsOfFile: path)
     }()
-    private let buildIdentifier = "FAV-20261120-HK7"
+    private let buildIdentifier = "FAV-20261121-HK8"
     var wheelPanel: NSPanel?
     var wheelCenterPoint: NSPoint = .zero
     
@@ -2490,6 +2490,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var mouseIsDownInTap: Bool = false
     var wheelWasShownDuringDrag: Bool = false
     var lastWheelDiagnostic: String = "아직 파일 드래그 시도 없음"
+    // '탭 활성'과 '실제 이벤트 수신'을 구분하기 위한 수신 건수.
+    // 키 내용, 파일 이름, 마우스 위치는 기록하지 않습니다.
+    var wheelMouseDownCount: UInt64 = 0
+    var wheelMouseDraggedCount: UInt64 = 0
+    var wheelFlagsChangedCount: UInt64 = 0
+    var wheelEventsDisabledCount: UInt64 = 0
+    var hadDraggedMouseInStroke: Bool = false
+    var wheelTapLocationName: String = "설치되지 않음"
+    var wheelEventCountersText: String {
+        "누름 \(wheelMouseDownCount) · 드래그 \(wheelMouseDraggedCount) · 수정키 \(wheelFlagsChangedCount) · 중단 \(wheelEventsDisabledCount)"
+    }
+    var wheelPrivacyStatusText: String {
+        "입력 모니터링 \(CGPreflightListenEventAccess() ? "승인 확인" : "승인 필요/미확인") · 손쉬운 사용 \(AXIsProcessTrusted() ? "승인 확인" : "미승인")"
+    }
     // 드래그가 시작된 뒤 사용자가 직접 호출 조합을 눌러야만 휠을 띄웁니다.
     var requestedWheelDuringThisDrag: Bool = false
     
@@ -2501,7 +2515,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
         _ = AXIsProcessTrustedWithOptions(options)
         
-        FavoriteAwakeHotKey.shared.startMonitoring()
+        FavoritePreferencesMigration.runOnce()
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         updateStatusBarMenu()
         JobProgressManager.shared.onUpdate = { [weak self] in self?.updateStatusBarMenu() }
@@ -2521,6 +2535,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         setupUltraLightEventTap()
+        // 잠자기 방지 토글은 변환 이벤트 감시가 초기화된 뒤 독립적으로 시작합니다.
+        FavoriteAwakeHotKey.shared.startMonitoring()
         updateStatusBarMenu()
         // 새 설치/업데이트 시 한 번만 안내합니다. 권한 승인 창을 자동으로 누르거나
         // 폴더를 몰래 스캔하지 않으며, 사용자가 선택할 때만 NSOpenPanel을 띄웁니다.
@@ -2759,6 +2775,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return CGEvent.tapIsEnabled(tap: tap)
     }
 
+    // 최초 마우스 누름 시 Finder 활성화 알림 지연과 CG 이벤트 대상 PID를 함께 참고합니다.
+    // PID가 일치하지 않더라도 이후 실제 드래그 중 재확인할 수 있습니다.
+    private func isFinderTarget(_ event: CGEvent) -> Bool {
+        if NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.apple.finder" { return true }
+        let targetPID = event.getIntegerValueField(.eventTargetUnixProcessID)
+        if targetPID > 0,
+           let finder = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.finder").first,
+           Int64(finder.processIdentifier) == targetPID {
+            return true
+        }
+        return false
+    }
+
     // 최초 실행 시 macOS 권한이 아직 없었다면 사용자가 허용한 후 수동으로 재시도합니다.
     // listenOnly 이벤트 탭 외의 다른 입력 변경·차단 코드는 실행하지 않습니다.
     @discardableResult
@@ -2782,6 +2811,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let callback: CGEventTapCallBack = { _, type, event, refcon in
             guard let refcon = refcon else { return Unmanaged.passUnretained(event) }
             let owner = Unmanaged<AppDelegate>.fromOpaque(refcon).takeUnretainedValue()
+            switch type {
+            case .leftMouseDown: owner.wheelMouseDownCount &+= 1
+            case .leftMouseDragged: owner.wheelMouseDraggedCount &+= 1
+            case .flagsChanged: owner.wheelFlagsChangedCount &+= 1
+            case .tapDisabledByTimeout, .tapDisabledByUserInput: owner.wheelEventsDisabledCount &+= 1
+            default: break
+            }
             if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
                 owner.hideWheel()
                 if let tap = owner.eventTap, ShortcutSettings.shared.wheelDetectionEnabled {
@@ -2794,6 +2830,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 if AppState.shared.isDragging { owner.hideWheel() }
                 owner.mouseIsDownInTap = true
                 owner.wheelWasShownDuringDrag = false
+                owner.hadDraggedMouseInStroke = false
                 owner.dragCountAtMouseDown = owner.dragPboard.changeCount
                 owner.isCurrentMouseStrokeValidFileDrag = false
                 owner.previousRawFlags = []
@@ -2801,16 +2838,29 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 owner.isNativeDragTracking = false
                 owner.deferredNoCopyHover = false
                 owner.dragSequence &+= 1
-                owner.dragStartedInFinder = (NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.apple.finder")
-                owner.lastWheelDiagnostic = owner.dragStartedInFinder
-                    ? "Finder 마우스 누름 감지 · 파일 드래그 시작 확인 중"
-                    : "마우스 누름 감지 · Finder 활성화 확인 중"
+                owner.dragStartedInFinder = owner.isFinderTarget(event)
+                // 일반 UI 클릭의 진단 덮어쓰기는 금지합니다.
+                // 아래서 실제 파일 드래그가 확인됐을 때만 lastWheelDiagnostic을 바꿉니다.
                 owner.requestedWheelDuringThisDrag = false
                 return Unmanaged.passUnretained(event)
             }
+            if type == .leftMouseDragged {
+                owner.hadDraggedMouseInStroke = true
+                // 감시 재시작/권한 반영 시 mouseDown이 누락되더라도 실제 드래그 이벤트로 재진입.
+                // 새 파일은 반드시 실제 드래그 pasteboard에서 다시 확인합니다.
+                if !owner.mouseIsDownInTap {
+                    owner.mouseIsDownInTap = true
+                    owner.dragCountAtMouseDown = -1
+                    owner.isCurrentMouseStrokeValidFileDrag = false
+                    owner.requestedWheelDuringThisDrag = false
+                    owner.previousRawFlags = []
+                    owner.dragStartedInFinder = owner.isFinderTarget(event)
+                }
+            }
             if type == .leftMouseUp {
                 owner.mouseIsDownInTap = false
-                if !owner.safeDropWasAccepted {
+                // 설정창/메뉴 클릭은 기존 파일 드래그 진단 기록을 지우지 않습니다.
+                if owner.hadDraggedMouseInStroke && !owner.safeDropWasAccepted {
                     if owner.wheelWasShownDuringDrag {
                         owner.lastWheelDiagnostic = "휠은 표시됨 · 네이티브 드롭 미수락 (마우스 놓은 위치/항목 확인)"
                     } else if !owner.dragStartedInFinder {
@@ -2893,7 +2943,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // 최초 down 이벤트 시점에는 Finder 활성화 알림이 아직 도착하지 않을 수 있습니다.
             // 진짜 드래그를 진행하는 동안 Finder를 다시 확인합니다 (타 앱 드래그는 제외).
             if owner.mouseIsDownInTap && !owner.dragStartedInFinder &&
-               NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.apple.finder" {
+               owner.isFinderTarget(event) {
                 owner.dragStartedInFinder = true
             }
             guard settings.wheelDetectionEnabled,
@@ -2959,11 +3009,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let pointer = Unmanaged.passUnretained(self).toOpaque()
-        for location: CGEventTapLocation in [.cghidEventTap, .cgSessionEventTap] {
+        for location: CGEventTapLocation in [.cgSessionEventTap, .cghidEventTap] {
             if let tap = CGEvent.tapCreate(tap: location, place: .headInsertEventTap,
                                            options: .listenOnly, eventsOfInterest: CGEventMask(mask),
                                            callback: callback, userInfo: pointer) {
                 eventTap = tap
+                wheelTapLocationName = (location == .cgSessionEventTap) ? "세션 읽기 전용" : "HID 읽기 전용"
                 let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
                 CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
                 CGEvent.tapEnable(tap: tap, enable: true)

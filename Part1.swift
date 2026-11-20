@@ -13,6 +13,42 @@ import ImageIO
 import IOKit.pwr_mgt
 import IOKit.ps
 
+// HK8: 기존 MyTangerine의 설정을 새 00Favorite 식별자로 한 번만 복사합니다.
+// 접근 권한(TCC)은 복사할 수 없으며 사용자가 새 앱에 직접 허용해야 합니다.
+enum FavoritePreferencesMigration {
+    private static let completedKey = "favorite_legacy_settings_migrated_hk8"
+    static func runOnce() {
+        let current = UserDefaults.standard
+        guard !current.bool(forKey: completedKey) else { return }
+        if let legacy = UserDefaults(suiteName: "com.custom.mytangerine") {
+            let keys = [
+            "favorite_awake_custom_key_code_v2",
+            "favorite_awake_custom_key_name_v2",
+            "favorite_awake_custom_modifiers_v2",
+            "favorite_awake_period_default_migrated_hk3",
+            "favorite_awake_toggle_duration_v1",
+            "favorite_awake_toggle_hotkey_v1",
+            "tangerine_folder_access_intro_v48",
+            "tangerine_rename_pattern_v40",
+            "tangerine_safe_enabled_v48",
+            "tangerine_safe_finder_only_v48",
+            "tangerine_sc_actions_v44",
+            "tangerine_sc_convert_v44",
+            "tangerine_sc_quality_v44",
+            "tangerine_sc_toggle_mode_v44",
+            "tangerine_sc_tools_v44",
+            "tangerine_selected_folders_v48"
+            ]
+            for key in keys {
+                if current.object(forKey: key) == nil, let value = legacy.object(forKey: key) {
+                    current.set(value, forKey: key)
+                }
+            }
+        }
+        current.set(true, forKey: completedKey)
+    }
+}
+
 // MARK: - 0. 단축키, 홀드/토글 방식, 퀄리티 옵션 키 및 파일명 패턴 설정 매니저
 class ShortcutSettings: ObservableObject {
     static let shared = ShortcutSettings()
@@ -1866,7 +1902,7 @@ struct HelpAndSettingsView: View {
                     Text("최근 드래그 진단: \(wheelRecentDiagnostic)")
                         .font(.caption2).foregroundColor(.secondary)
                         .textSelection(.enabled)
-                    Text("휠 감시 '정상 연결'은 이벤트 탭 활성화만 뜻합니다. 변환이 안 되면 Finder에서 드래그→수정키를 누른 뒤 '상태 새로고침'을 눌러 위 진단을 확인하세요.")
+                    Text("탭 활성은 실제 이벤트 수신을 보장하지 않습니다. 누름/드래그/수정키 건수가 증가하는지 확인하세요. 진단 기록은 설정창 클릭으로 덮어쓰지 않습니다.")
                         .font(.caption2).foregroundColor(.secondary)
                         .font(.caption2).foregroundColor(.secondary)
                     HStack(spacing: 8) {
@@ -2154,8 +2190,11 @@ struct HelpAndSettingsView: View {
     
     private func refreshWheelMonitorStatus() {
         if let app = NSApp.delegate as? AppDelegate {
-            wheelMonitorStatus = app.isWheelMonitorConnected ? "정상 연결" : "연결되지 않음"
-            wheelRecentDiagnostic = app.lastWheelDiagnostic
+            wheelMonitorStatus = (app.isWheelMonitorConnected ? "탭 활성" : "탭 비활성") +
+                " · " + app.wheelPrivacyStatusText
+            wheelRecentDiagnostic = app.lastWheelDiagnostic + "\n" +
+                "실제 이벤트 수신: " + app.wheelEventCountersText +
+                " · " + app.wheelTapLocationName
         } else { wheelMonitorStatus = "앱 상태 확인 불가" }
     }
 
