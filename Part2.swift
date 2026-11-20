@@ -2230,6 +2230,7 @@ final class FavoriteAwakeHotKey {
     private static let customKeyCodeKey = "favorite_awake_custom_key_code_v2"
     private static let customModifiersKey = "favorite_awake_custom_modifiers_v2"
     private static let customKeyNameKey = "favorite_awake_custom_key_name_v2"
+    private static let periodShortcutMigrationKey = "favorite_awake_period_default_migrated_hk3"
 
     enum Preset: Int, CaseIterable {
         case disabled = 0
@@ -2237,13 +2238,15 @@ final class FavoriteAwakeHotKey {
         case commandOptionControlJ = 2
         case commandOptionControlL = 3
         case custom = 4
+        case controlOptionPeriod = 5
 
         var name: String {
             switch self {
             case .disabled: return "사용 안 함"
-            case .commandOptionControlK: return "⌃⌥⌘K (권장)"
+            case .commandOptionControlK: return "⌃⌥⌘K"
             case .commandOptionControlJ: return "⌃⌥⌘J"
             case .commandOptionControlL: return "⌃⌥⌘L"
+            case .controlOptionPeriod: return "⌃⌥. (권장)"
             case .custom: return "직접 지정"
             }
         }
@@ -2253,6 +2256,7 @@ final class FavoriteAwakeHotKey {
             case .commandOptionControlK: return UInt32(kVK_ANSI_K)
             case .commandOptionControlJ: return UInt32(kVK_ANSI_J)
             case .commandOptionControlL: return UInt32(kVK_ANSI_L)
+            case .controlOptionPeriod: return UInt32(kVK_ANSI_Period)
             case .custom: return nil  // 직접 지정은 사용자 저장 코드 사용
             }
         }
@@ -2271,11 +2275,17 @@ final class FavoriteAwakeHotKey {
 
     private init() {
         let defaults = UserDefaults.standard
-        if defaults.object(forKey: Self.shortcutKey) != nil {
-            preset = Preset(rawValue: defaults.integer(forKey: Self.shortcutKey)) ?? .commandOptionControlK
+        // HK2의 기본값 ⌃⌥⌘K를 처음 한 번 ⌃⌥.로 전환합니다.
+        // 사용자가 이미 J/L/직접 지정/사용 안 함을 선택했다면 보존합니다.
+        let storedPreset = defaults.object(forKey: Self.shortcutKey) as? Int
+        if storedPreset == Preset.commandOptionControlK.rawValue &&
+           !defaults.bool(forKey: Self.periodShortcutMigrationKey) {
+            preset = .controlOptionPeriod
+            defaults.set(Preset.controlOptionPeriod.rawValue, forKey: Self.shortcutKey)
         } else {
-            preset = .commandOptionControlK
+            preset = Preset(rawValue: storedPreset ?? Preset.controlOptionPeriod.rawValue) ?? .controlOptionPeriod
         }
+        defaults.set(true, forKey: Self.periodShortcutMigrationKey)
         let saved = defaults.object(forKey: Self.durationKey) as? Int ?? 60
         toggleMinutes = [5, 15, 30, 60, 120, 240, 480, -1].contains(saved) ? saved : 60
         let storedKey = defaults.integer(forKey: Self.customKeyCodeKey)
@@ -2355,7 +2365,9 @@ final class FavoriteAwakeHotKey {
         } else {
             guard let presetCode = chosen.keyCode else { return false }
             keyCode = presetCode
-            mods = UInt32(controlKey | optionKey | cmdKey)
+            mods = chosen == .controlOptionPeriod
+                ? UInt32(controlKey | optionKey)
+                : UInt32(controlKey | optionKey | cmdKey)
         }
         guard ensureHandler() else { return false }
         var newRef: EventHotKeyRef?
@@ -2411,9 +2423,11 @@ final class FavoriteAwakeHotKey {
         let clean = flags.intersection([.control, .option, .shift, .command])
         let count = [NSEvent.ModifierFlags.control, .option, .shift, .command]
             .filter { clean.contains($0) }.count
+        let isLetter = keyName.range(of: "^[A-Z]$", options: .regularExpression) != nil
+        let isPeriod = keyName == "." && keyCode == UInt32(kVK_ANSI_Period)
         guard clean.contains(.control), count >= 2, keyName.count == 1,
-              keyName.range(of: "^[A-Z]$", options: .regularExpression) != nil else {
-            lastNotice = "안전을 위해 Control을 포함한 수정키 2개 이상과 영문 A~Z 한 글자를 입력하세요."
+              (isLetter || isPeriod) else {
+            lastNotice = "Control을 포함한 수정키 2개 이상 + 영문 A~Z 또는 마침표(.)를 입력하세요."
             return false
         }
         var newModifiers: UInt32 = 0
@@ -2476,7 +2490,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard let path = Bundle.main.path(forResource: "icon_awake", ofType: "png") else { return nil }
         return NSImage(contentsOfFile: path)
     }()
-    private let buildIdentifier = "FAV-20261120-HK2"
+    private let buildIdentifier = "FAV-20261120-HK3"
     var wheelPanel: NSPanel?
     var wheelCenterPoint: NSPoint = .zero
     
@@ -2494,6 +2508,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // 이 값은 네이티브 드롭 대상 위에서 퀄리티 모드를 보고 있을 때만 참입니다.
     var qualityNoCopyHover: Bool = false
     var dragSequence: UInt64 = 0
+    // NSEvent.pressedMouseButtons는 전역 CGEvent 탭 콜백 순간에 최신 상태가 아닐 수 있습니다.
+    // 마우스 down/up을 수동 감시해 드래그 중 여부를 직접 추적합니다.
+    var mouseIsDownInTap: Bool = false
+    var wheelWasShownDuringDrag: Bool = false
+    var lastWheelDiagnostic: String = "아직 파일 드래그 시도 없음"
     // 드래그가 시작된 뒤 사용자가 직접 호출 조합을 눌러야만 휠을 띄웁니다.
     var requestedWheelDuringThisDrag: Bool = false
     
@@ -2790,6 +2809,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 return Unmanaged.passUnretained(event)
             }
             if type == .leftMouseDown {
+                // 이전 드래그가 예상치 않게 끝났어도 다음 파일 드래그를 깨끗하게 시작합니다.
+                if AppState.shared.isDragging { owner.hideWheel() }
+                owner.mouseIsDownInTap = true
+                owner.wheelWasShownDuringDrag = false
                 owner.dragCountAtMouseDown = owner.dragPboard.changeCount
                 owner.isCurrentMouseStrokeValidFileDrag = false
                 owner.previousRawFlags = []
@@ -2798,10 +2821,27 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 owner.qualityNoCopyHover = false
                 owner.dragSequence &+= 1
                 owner.dragStartedInFinder = (NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.apple.finder")
+                owner.lastWheelDiagnostic = owner.dragStartedInFinder
+                    ? "Finder 마우스 누름 감지 · 파일 드래그 시작 확인 중"
+                    : "마우스 누름 감지 · Finder 활성화 확인 중"
                 owner.requestedWheelDuringThisDrag = false
                 return Unmanaged.passUnretained(event)
             }
             if type == .leftMouseUp {
+                owner.mouseIsDownInTap = false
+                if !owner.safeDropWasAccepted {
+                    if owner.wheelWasShownDuringDrag {
+                        owner.lastWheelDiagnostic = "휠은 표시됨 · 네이티브 드롭 미수락 (마우스 놓은 위치/항목 확인)"
+                    } else if !owner.dragStartedInFinder {
+                        owner.lastWheelDiagnostic = "휠 미표시 · Finder에서 시작한 드래그로 확인되지 않음"
+                    } else if !owner.isCurrentMouseStrokeValidFileDrag {
+                        owner.lastWheelDiagnostic = "휠 미표시 · 파일 드래그 보드 인식 실패"
+                    } else if !owner.requestedWheelDuringThisDrag {
+                        owner.lastWheelDiagnostic = "휠 미표시 · 드래그 중 새 수정키 입력이 감지되지 않음"
+                    } else {
+                        owner.lastWheelDiagnostic = "휠 미표시 · 단축키 조합/모드 확인 필요"
+                    }
+                }
                 // Command는 macOS Finder의 '이동' 드롭 연산을 지정할 수 있습니다.
                 // 따라서 .move를 복사로 속이거나 mouseUp을 차단하지 않습니다.
                 // 실제 네이티브 대상 위에서 거부된 품질 드래그에 한하여,
@@ -2855,23 +2895,32 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
             let settings = ShortcutSettings.shared
+            // 최초 down 이벤트 시점에는 Finder 활성화 알림이 아직 도착하지 않을 수 있습니다.
+            // 진짜 드래그를 진행하는 동안 Finder를 다시 확인합니다 (타 앱 드래그는 제외).
+            if owner.mouseIsDownInTap && !owner.dragStartedInFinder &&
+               NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.apple.finder" {
+                owner.dragStartedInFinder = true
+            }
             guard settings.wheelDetectionEnabled,
                   (!settings.finderOnlyDetection || owner.dragStartedInFinder),
-                  (NSEvent.pressedMouseButtons & 1) != 0 else {
+                  owner.mouseIsDownInTap else {
                 if AppState.shared.isDragging { owner.hideWheel() }
                 return Unmanaged.passUnretained(event)
             }
             if !owner.isCurrentMouseStrokeValidFileDrag {
                 let currentCount = owner.dragPboard.changeCount
                 guard currentCount != owner.dragCountAtMouseDown else {
+                    owner.lastWheelDiagnostic = "Finder 감지 · 드래그 보드 변경 대기 중"
                     return Unmanaged.passUnretained(event)
                 }
                 let files = owner.readValidDraggedFiles(from: owner.dragPboard)
                 guard !files.isEmpty else {
+                    owner.lastWheelDiagnostic = "드래그 보드 변경됨 · 유효한 파일 URL 없음"
                     owner.dragCountAtMouseDown = currentCount
                     return Unmanaged.passUnretained(event)
                 }
                 owner.isCurrentMouseStrokeValidFileDrag = true
+                owner.lastWheelDiagnostic = "Finder 파일 드래그 \(files.count)개 인식 · 키 조합 대기"
                 let bytes = owner.calculateTotalBytesFast(files: files)
                 AppState.shared.draggedFiles = files
                 AppState.shared.totalBytes = bytes
@@ -2885,6 +2934,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             AppState.shared.isQualityOptionActive = qualityPressed
             let matched = settings.matchWheelMode(for: rawFlags)
             if type == .flagsChanged {
+                owner.lastWheelDiagnostic = matched == nil
+                    ? "파일 인식됨 · 입력 키: \(ShortcutSettings.formatFlags(rawFlags)) · 휠 조합 불일치"
+                    : "파일 인식됨 · 입력 키: \(ShortcutSettings.formatFlags(rawFlags)) · 휠 조합 일치"
                 let newlyPressed = !rawFlags.subtracting(owner.previousRawFlags).isEmpty
                 owner.previousRawFlags = rawFlags
                 if matched != nil && newlyPressed { owner.requestedWheelDuringThisDrag = true }
@@ -2964,6 +3016,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let item = AppState.shared.items[index]
         let quality = AppState.shared.isQualityOptionActive
         safeDropWasAccepted = true
+        lastWheelDiagnostic = "파일 \(files.count)개 네이티브 드롭 수락 · 작업 요청"
         hideWheel()
         // 드래그 세션 안에서 변환 창을 열지 않고 종료 후 비동기로 실행합니다.
         DispatchQueue.main.async {
@@ -2989,6 +3042,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             AppState.shared.wheelMode = mode
             AppState.shared.updateItems()
             showWheel(at: mouseLocation)
+            wheelWasShownDuringDrag = true
+            lastWheelDiagnostic = "\(mode) 휠 표시 · 파일 \(AppState.shared.draggedFiles.count)개"
         } else if AppState.shared.wheelMode != mode || fileListChanged {
             AppState.shared.wheelMode = mode
             // 뒤늦게 발견된 추가 드래그 파일도 ACTIONS 휠의 이미지 합치기 항목에 반영합니다.

@@ -1716,6 +1716,7 @@ struct HelpAndSettingsView: View {
     @State private var awakeKeyFlags: NSEvent.ModifierFlags = []
     @State private var awakeKeyMonitor: Any? = nil
     @State private var wheelMonitorStatus = "확인 전"
+    @State private var wheelRecentDiagnostic = "아직 파일 드래그 시도 없음"
     
     let sampleDate: Date = {
         var comp = DateComponents()
@@ -1813,13 +1814,17 @@ struct HelpAndSettingsView: View {
                             }
                         }
                     }
-                    Text("앱 이름 변경·임시 서명 재빌드 후 Shift 변환 휠이 보이지 않으면 입력 모니터링 권한을 다시 확인하세요. 기존 Finder 드래그는 그대로 유지합니다.")
+                    Text("최근 드래그 진단: \(wheelRecentDiagnostic)")
+                        .font(.caption2).foregroundColor(.secondary)
+                        .textSelection(.enabled)
+                    Text("휠 감시 '정상 연결'은 이벤트 탭 활성화만 뜻합니다. 변환이 안 되면 Finder에서 드래그→수정키를 누른 뒤 '상태 새로고침'을 눌러 위 진단을 확인하세요.")
+                        .font(.caption2).foregroundColor(.secondary)
                         .font(.caption2).foregroundColor(.secondary)
                     HStack(spacing: 8) {
                         Button("입력 모니터링 설정") { FolderAccessPreferences.shared.openInputMonitoringSettings() }
                         Button("손쉬운 사용 설정") { FolderAccessPreferences.shared.openAccessibilitySettings() }
                     }
-                    Text("기존 Shift / Option+Shift / Control 키는 유지합니다. 파일 드래그를 시작한 다음 해당 조합을 새로 눌러야만 휠이 열립니다. 평소 Finder의 Shift 선택·드래그에는 반응하지 않습니다.")
+                    Text("기본값: 변환 Shift / 편집 Option+Shift / 액션 Control. 설정에서 다른 조합으로 변경했다면 그 조합을 사용하세요. Finder 파일 드래그 시작 후 키를 새로 눌러야 휠이 열립니다.")
                         .font(.caption2).foregroundColor(.secondary)
                 }
                 .padding(14).background(Color.green.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
@@ -1887,7 +1892,7 @@ struct HelpAndSettingsView: View {
         VStack(alignment: .leading, spacing: 10) {
             Text("3. 잠자기 방지 토글 단축키")
                 .font(.headline).foregroundColor(.orange)
-            Text("파일 변환 단축키와 독립적입니다. 아래에서 기본 조합을 선택하거나 원하는 영문 키 조합을 직접 입력할 수 있습니다.")
+            Text("파일 변환 단축키와 독립적입니다. 기본은 Control+Option+.이며, 영문 A~Z 또는 마침표(.)로 변경할 수 있습니다.")
                 .font(.caption).foregroundColor(.secondary)
             HStack(spacing: 10) {
                 Text("현재: \(FavoriteAwakeHotKey.shared.shortcutLabel)")
@@ -1898,6 +1903,7 @@ struct HelpAndSettingsView: View {
                     Text("⌃⌥⌘K").tag(1)
                     Text("⌃⌥⌘J").tag(2)
                     Text("⌃⌥⌘L").tag(3)
+                    Text("⌃⌥. (권장)").tag(5)
                     if FavoriteAwakeHotKey.shared.preset == .custom {
                         Text("직접 지정: \(FavoriteAwakeHotKey.shared.shortcutLabel)").tag(4)
                     }
@@ -1917,7 +1923,7 @@ struct HelpAndSettingsView: View {
             }
             HStack(spacing: 10) {
                 if awakeIsRecording {
-                    Text(awakeKeyCode == nil ? "Control을 포함한 수정키 2개 이상 + 영문 A~Z 입력" : "입력: \(ShortcutSettings.formatFlags(awakeKeyFlags)) + \(awakeKeyName)")
+                    Text(awakeKeyCode == nil ? "Control을 포함한 수정키 2개 이상 + 영문 A~Z 또는 . 입력" : "입력: \(ShortcutSettings.formatFlags(awakeKeyFlags)) + \(awakeKeyName)")
                         .font(.caption.bold()).foregroundColor(.orange)
                     Button("저장") {
                         guard let code = awakeKeyCode else { return }
@@ -2070,6 +2076,7 @@ struct HelpAndSettingsView: View {
     private func refreshWheelMonitorStatus() {
         if let app = NSApp.delegate as? AppDelegate {
             wheelMonitorStatus = app.isWheelMonitorConnected ? "정상 연결" : "연결되지 않음"
+            wheelRecentDiagnostic = app.lastWheelDiagnostic
         } else { wheelMonitorStatus = "앱 상태 확인 불가" }
     }
 
@@ -2084,7 +2091,8 @@ struct HelpAndSettingsView: View {
             UInt16(kVK_ANSI_P): "P", UInt16(kVK_ANSI_Q): "Q", UInt16(kVK_ANSI_R): "R",
             UInt16(kVK_ANSI_S): "S", UInt16(kVK_ANSI_T): "T", UInt16(kVK_ANSI_U): "U",
             UInt16(kVK_ANSI_V): "V", UInt16(kVK_ANSI_W): "W", UInt16(kVK_ANSI_X): "X",
-            UInt16(kVK_ANSI_Y): "Y", UInt16(kVK_ANSI_Z): "Z"
+            UInt16(kVK_ANSI_Y): "Y", UInt16(kVK_ANSI_Z): "Z",
+            UInt16(kVK_ANSI_Period): "."
         ]
         return letters[code]
     }
@@ -2101,9 +2109,9 @@ struct HelpAndSettingsView: View {
                 self.awakeKeyCode = UInt32(event.keyCode)
                 self.awakeKeyName = label
                 self.awakeKeyFlags = flags
-                self.awakeHotkeyNotice = "설정에서 Control을 포함한 수정키 2개 이상을 사용합니다."
+                self.awakeHotkeyNotice = "Control을 포함한 수정키 2개 이상을 사용합니다."
             } else {
-                self.awakeHotkeyNotice = "영문 A~Z 키로 설정할 수 있습니다."
+                self.awakeHotkeyNotice = "영문 A~Z 또는 마침표(.) 키로 설정할 수 있습니다."
             }
             return nil
         }
