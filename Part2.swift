@@ -1965,14 +1965,14 @@ final class SafeWheelDropTarget: NSView {
     override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
         guard let owner = owner, owner.isNativeWheelReady else {
             owner?.isNativeDragTracking = false
-            owner?.qualityNoCopyHover = false
+            owner?.deferredNoCopyHover = false
             AppState.shared.hoveredIndex = nil
             return []
         }
         let types = sender.draggingPasteboard.types ?? []
         guard types.contains(.fileURL) || types.contains(NSPasteboard.PasteboardType("NSFilenamesPboardType")) else {
             owner.isNativeDragTracking = false
-            owner.qualityNoCopyHover = false
+            owner.deferredNoCopyHover = false
             AppState.shared.hoveredIndex = nil
             return []
         }
@@ -1989,15 +1989,23 @@ final class SafeWheelDropTarget: NSView {
             AppState.shared.wheelMode == .convert &&
             AppState.shared.isQualityOptionActive &&
             index != nil
-        owner.qualityNoCopyHover = canObserveQualityRelease
-        // 드롭을 수락하지 못하더라도 사용자가 선택 중인 조각은 안정적으로 강조합니다.
-        let visualIndex = (canCopy || canObserveQualityRelease) ? index : nil
+        // Finder에서 Control을 누르면 .copy가 아닌 .link만 허용될 수 있습니다.
+        // .link를 .copy로 위장하지 않으며, Finder의 원본 이동도 수락하지 않습니다.
+        // ACTIONS에 놓았을 때는 mouseUp 이후 원본 존재를 확인해 선택한 앱 액션만 시작합니다.
+        let canObserveActionRelease = !canCopy &&
+            !sender.draggingSourceOperationMask.isEmpty &&
+            owner.dragStartedInFinder &&
+            owner.requestedWheelDuringThisDrag &&
+            AppState.shared.wheelMode == .actions &&
+            index != nil
+        owner.deferredNoCopyHover = canObserveQualityRelease || canObserveActionRelease
+        let visualIndex = (canCopy || canObserveQualityRelease || canObserveActionRelease) ? index : nil
         if AppState.shared.hoveredIndex != visualIndex { AppState.shared.hoveredIndex = visualIndex }
         return canCopy && index != nil ? .copy : []
     }
     override func draggingExited(_ sender: NSDraggingInfo?) {
         owner?.isNativeDragTracking = false
-        owner?.qualityNoCopyHover = false
+        owner?.deferredNoCopyHover = false
         AppState.shared.hoveredIndex = nil
     }
     override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool {
@@ -2218,13 +2226,11 @@ final class FavoriteAwakeManager {
 }
 
 
-// MARK: - 독립 잠자기 방지 전역 토글 단축키
-// Carbon의 정식 RegisterEventHotKey로 설정된 조합만 수신합니다.
-// Finder/다른 앱의 키 이벤트를 감시·변조하거나 파일 드래그 입력에 관여하지 않습니다.
+// MARK: - 잠자기 방지 키 조합 감지 — 별도 읽기 전용 AppKit 이벤트 감시
+// Carbon RegisterEventHotKey를 호출하지 않습니다. Finder에 전달되는 키·마우스 입력은
+// 절대 변경하지 않으며, 휠 CGEventTap과 공유하지 않는 별도 감시입니다.
 final class FavoriteAwakeHotKey {
     static let shared = FavoriteAwakeHotKey()
-    private static let signature: OSType = 0x30304656  // '00FV'
-    private static let identifier: UInt32 = 1
     private static let shortcutKey = "favorite_awake_toggle_hotkey_v1"
     private static let durationKey = "favorite_awake_toggle_duration_v1"
     private static let customKeyCodeKey = "favorite_awake_custom_key_code_v2"
@@ -2239,14 +2245,13 @@ final class FavoriteAwakeHotKey {
         case commandOptionControlL = 3
         case custom = 4
         case controlOptionPeriod = 5
-
         var name: String {
             switch self {
             case .disabled: return "사용 안 함"
             case .commandOptionControlK: return "⌃⌥⌘K"
             case .commandOptionControlJ: return "⌃⌥⌘J"
             case .commandOptionControlL: return "⌃⌥⌘L"
-            case .controlOptionPeriod: return "⌃⌥. (권장)"
+            case .controlOptionPeriod: return "⌃⌥. (기본값)"
             case .custom: return "직접 지정"
             }
         }
@@ -2257,7 +2262,7 @@ final class FavoriteAwakeHotKey {
             case .commandOptionControlJ: return UInt32(kVK_ANSI_J)
             case .commandOptionControlL: return UInt32(kVK_ANSI_L)
             case .controlOptionPeriod: return UInt32(kVK_ANSI_Period)
-            case .custom: return nil  // 직접 지정은 사용자 저장 코드 사용
+            case .custom: return nil
             }
         }
     }
@@ -2268,18 +2273,16 @@ final class FavoriteAwakeHotKey {
     private var customModifiers: UInt32
     private var customKeyName: String
     private(set) var lastNotice: String = ""
-    private var hotKeyRef: EventHotKeyRef?
-    private var handlerRef: EventHandlerRef?
+    private var globalKeyMonitor: Any?
+    private var localKeyMonitor: Any?
     private var lastToggleUptime: TimeInterval = -10
     private var suspendedForRecorder = false
 
     private init() {
         let defaults = UserDefaults.standard
-        // HK2의 기본값 ⌃⌥⌘K를 처음 한 번 ⌃⌥.로 전환합니다.
-        // 사용자가 이미 J/L/직접 지정/사용 안 함을 선택했다면 보존합니다.
         let storedPreset = defaults.object(forKey: Self.shortcutKey) as? Int
         if storedPreset == Preset.commandOptionControlK.rawValue &&
-           !defaults.bool(forKey: Self.periodShortcutMigrationKey) {
+            !defaults.bool(forKey: Self.periodShortcutMigrationKey) {
             preset = .controlOptionPeriod
             defaults.set(Preset.controlOptionPeriod.rawValue, forKey: Self.shortcutKey)
         } else {
@@ -2290,9 +2293,9 @@ final class FavoriteAwakeHotKey {
         toggleMinutes = [5, 15, 30, 60, 120, 240, 480, -1].contains(saved) ? saved : 60
         let storedKey = defaults.integer(forKey: Self.customKeyCodeKey)
         let storedMods = defaults.integer(forKey: Self.customModifiersKey)
-        customKeyCode = storedKey > 0 ? UInt32(storedKey) : UInt32(kVK_ANSI_K)
-        customModifiers = storedMods > 0 ? UInt32(storedMods) : UInt32(controlKey | optionKey | cmdKey)
-        customKeyName = defaults.string(forKey: Self.customKeyNameKey) ?? "K"
+        customKeyCode = storedKey > 0 ? UInt32(storedKey) : UInt32(kVK_ANSI_Period)
+        customModifiers = storedMods > 0 ? UInt32(storedMods) : UInt32(controlKey | optionKey)
+        customKeyName = defaults.string(forKey: Self.customKeyNameKey) ?? "."
     }
 
     var shortcutLabel: String {
@@ -2304,7 +2307,6 @@ final class FavoriteAwakeHotKey {
         if customModifiers & UInt32(cmdKey) != 0 { flags += "⌘" }
         return flags + customKeyName
     }
-
     var toggleDurationLabel: String {
         switch toggleMinutes {
         case 5: return "5분"
@@ -2318,169 +2320,123 @@ final class FavoriteAwakeHotKey {
         }
     }
 
-    private static let eventCallback: EventHandlerUPP = { _, event, _ in
-        guard let event = event else { return OSStatus(eventNotHandledErr) }
-        var receivedID = EventHotKeyID()
-        let result = GetEventParameter(
-            event,
-            UInt32(kEventParamDirectObject),
-            EventParamType(typeEventHotKeyID),
-            nil,
-            MemoryLayout<EventHotKeyID>.size,
-            nil,
-            &receivedID
-        )
-        guard result == noErr,
-              receivedID.signature == FavoriteAwakeHotKey.signature,
-              receivedID.id == FavoriteAwakeHotKey.identifier else {
-            return OSStatus(eventNotHandledErr)
-        }
-        DispatchQueue.main.async { FavoriteAwakeHotKey.shared.toggle() }
-        return noErr
+    private static func flagsToCarbon(_ flags: NSEvent.ModifierFlags) -> UInt32 {
+        let f = flags.intersection([.control, .option, .shift, .command])
+        var result: UInt32 = 0
+        if f.contains(.control) { result |= UInt32(controlKey) }
+        if f.contains(.option) { result |= UInt32(optionKey) }
+        if f.contains(.shift) { result |= UInt32(shiftKey) }
+        if f.contains(.command) { result |= UInt32(cmdKey) }
+        return result
     }
 
-    private func ensureHandler() -> Bool {
-        if handlerRef != nil { return true }
-        var eventSpec = EventTypeSpec(
-            eventClass: UInt32(kEventClassKeyboard),
-            eventKind: UInt32(kEventHotKeyPressed)
-        )
-        let result = InstallEventHandler(
-            GetApplicationEventTarget(), Self.eventCallback, 1, &eventSpec, nil, &handlerRef
-        )
-        if result != noErr {
-            lastNotice = "단축키 이벤트 등록 실패 (\(result))"
-            return false
-        }
-        return true
-    }
-
-    private func register(_ chosen: Preset, candidate: (UInt32, UInt32)? = nil) -> Bool {
-        guard chosen != .disabled else { return true }
-        let keyCode: UInt32
-        let mods: UInt32
-        if chosen == .custom {
-            keyCode = candidate?.0 ?? customKeyCode
-            mods = candidate?.1 ?? customModifiers
+    // 다른 앱에 전달되는 keyDown을 읽기만 합니다. 복사/이동 또는 Finder 이벤트를 가로채지 않습니다.
+    private func handleKey(_ event: NSEvent) {
+        guard !suspendedForRecorder, preset != .disabled, !event.isARepeat else { return }
+        // 마우스로 파일을 드래그 중에는 잠자기 토글과 변환 휠이 서로 관여하지 않습니다.
+        if (NSApp.delegate as? AppDelegate)?.mouseIsDownInTap == true || AppState.shared.isDragging { return }
+        let wantedKey: UInt32
+        let wantedModifiers: UInt32
+        if preset == .custom {
+            wantedKey = customKeyCode
+            wantedModifiers = customModifiers
         } else {
-            guard let presetCode = chosen.keyCode else { return false }
-            keyCode = presetCode
-            mods = chosen == .controlOptionPeriod
+            guard let code = preset.keyCode else { return }
+            wantedKey = code
+            wantedModifiers = preset == .controlOptionPeriod
                 ? UInt32(controlKey | optionKey)
                 : UInt32(controlKey | optionKey | cmdKey)
         }
-        guard ensureHandler() else { return false }
-        var newRef: EventHotKeyRef?
-        let id = EventHotKeyID(signature: Self.signature, id: Self.identifier)
-        let result = RegisterEventHotKey(
-            keyCode, mods, id, GetApplicationEventTarget(), 0, &newRef
-        )
-        guard result == noErr, let registeredRef = newRef else {
-            lastNotice = "해당 단축키를 등록하지 못했습니다(\(result)). macOS 또는 다른 앱과 충돌할 수 있습니다."
-            return false
-        }
-        hotKeyRef = registeredRef
-        lastNotice = ""
-        return true
-    }
-
-    func startMonitoring() {
-        _ = register(preset)
-    }
-    // 설정 창에서 기존 단축키를 다시 입력해도 잠자기 토글이 실행되지 않도록 잠시 정지.
-    func suspendForRecorder() {
-        guard !suspendedForRecorder else { return }
-        suspendedForRecorder = true
-        if let ref = hotKeyRef { _ = UnregisterEventHotKey(ref); hotKeyRef = nil }
-    }
-    func resumeAfterRecorder() {
-        guard suspendedForRecorder else { return }
-        suspendedForRecorder = false
-        if hotKeyRef == nil { _ = register(preset) }
+        guard UInt32(event.keyCode) == wantedKey,
+              Self.flagsToCarbon(event.modifierFlags) == wantedModifiers else { return }
+        toggle()
     }
 
     @discardableResult
+    private func ensurePassiveMonitors() -> Bool {
+        if globalKeyMonitor == nil {
+            globalKeyMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
+                self?.handleKey(event)
+            }
+        }
+        if localKeyMonitor == nil {
+            localKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
+                self?.handleKey(event)
+                return event // 사용자/앱의 키 입력을 절대 차단하지 않습니다.
+            }
+        }
+        if globalKeyMonitor == nil || localKeyMonitor == nil {
+            stopMonitoring()
+            lastNotice = "수동 키 감시를 시작하지 못했습니다. 입력 모니터링 권한을 확인하세요. 휠은 독립적으로 작동합니다."
+            return false
+        }
+        lastNotice = ""
+        return true
+    }
+    func startMonitoring() {
+        if preset != .disabled { _ = ensurePassiveMonitors() }
+    }
+    func suspendForRecorder() { suspendedForRecorder = true }
+    func resumeAfterRecorder() { suspendedForRecorder = false }
+
+    @discardableResult
     func changePreset(_ chosen: Preset) -> Bool {
-        guard chosen != preset else { return true }
-        let old = preset
-        if let existing = hotKeyRef { _ = UnregisterEventHotKey(existing); hotKeyRef = nil }
-        if register(chosen) {
+        if chosen == .disabled {
             preset = chosen
+            stopMonitoring()
+            lastNotice = ""
             UserDefaults.standard.set(chosen.rawValue, forKey: Self.shortcutKey)
             return true
         }
-        let failureNotice = lastNotice
-        // 새 단축키가 실패하더라도 기존 단축키를 복구합니다.
-        if !register(old) { lastNotice = failureNotice + " 기존 단축키 재등록도 실패했습니다." }
-        else { lastNotice = failureNotice }
-        return false
+        // 소극적 모니터가 없어도 기존의 CGEventTap은 건드리지 않습니다.
+        guard ensurePassiveMonitors() else { return false }
+        preset = chosen
+        UserDefaults.standard.set(chosen.rawValue, forKey: Self.shortcutKey)
+        return true
     }
 
-    // 설정 화면의 실시간 단축키 입력 결과를 OS에 먼저 등록한 뒤에만 저장합니다.
-    // Shift/Command 파일 드래그 감시와 전혀 연결되지 않는 Carbon 핫키입니다.
     @discardableResult
     func changeCustomShortcut(keyCode: UInt32, keyName: String, flags: NSEvent.ModifierFlags) -> Bool {
         let clean = flags.intersection([.control, .option, .shift, .command])
         let count = [NSEvent.ModifierFlags.control, .option, .shift, .command]
             .filter { clean.contains($0) }.count
-        let isLetter = keyName.range(of: "^[A-Z]$", options: .regularExpression) != nil
-        let isPeriod = keyName == "." && keyCode == UInt32(kVK_ANSI_Period)
-        guard clean.contains(.control), count >= 2, keyName.count == 1,
-              (isLetter || isPeriod) else {
-            lastNotice = "Control을 포함한 수정키 2개 이상 + 영문 A~Z 또는 마침표(.)를 입력하세요."
+        // 기존 파일 변환 휠은 수정키만 사용하므로 반드시 일반 키 하나도 요구합니다.
+        guard clean.contains(.control), count >= 2, !keyName.isEmpty else {
+            lastNotice = "Control을 포함한 수정키 2개 이상 + 일반 키 하나를 눌러주세요."
             return false
         }
-        var newModifiers: UInt32 = 0
-        if clean.contains(.control) { newModifiers |= UInt32(controlKey) }
-        if clean.contains(.option) { newModifiers |= UInt32(optionKey) }
-        if clean.contains(.shift) { newModifiers |= UInt32(shiftKey) }
-        if clean.contains(.command) { newModifiers |= UInt32(cmdKey) }
-        let oldPreset = preset
-        if let previousRef = hotKeyRef {
-            _ = UnregisterEventHotKey(previousRef)
-            hotKeyRef = nil
-        }
-        if register(.custom, candidate: (keyCode, newModifiers)) {
-            customKeyCode = keyCode
-            customModifiers = newModifiers
-            customKeyName = keyName
-            preset = .custom
-            let d = UserDefaults.standard
-            d.set(Preset.custom.rawValue, forKey: Self.shortcutKey)
-            d.set(Int(keyCode), forKey: Self.customKeyCodeKey)
-            d.set(Int(newModifiers), forKey: Self.customModifiersKey)
-            d.set(keyName, forKey: Self.customKeyNameKey)
-            return true
-        }
-        let registrationError = lastNotice
-        if !register(oldPreset) {
-            lastNotice = registrationError + " 기존 단축키 복구도 실패했습니다."
-        } else { lastNotice = registrationError }
-        return false
+        let newModifiers = Self.flagsToCarbon(clean)
+        guard ensurePassiveMonitors() else { return false }
+        customKeyCode = keyCode
+        customModifiers = newModifiers
+        customKeyName = keyName
+        preset = .custom
+        let defaults = UserDefaults.standard
+        defaults.set(Preset.custom.rawValue, forKey: Self.shortcutKey)
+        defaults.set(Int(keyCode), forKey: Self.customKeyCodeKey)
+        defaults.set(Int(newModifiers), forKey: Self.customModifiersKey)
+        defaults.set(keyName, forKey: Self.customKeyNameKey)
+        lastNotice = ""
+        return true
     }
-
     func setToggleMinutes(_ minutes: Int) {
         guard [5, 15, 30, 60, 120, 240, 480, -1].contains(minutes) else { return }
         toggleMinutes = minutes
         UserDefaults.standard.set(minutes, forKey: Self.durationKey)
     }
-
     func toggle() {
         let now = ProcessInfo.processInfo.systemUptime
-        // 누르고 있는 동안 반복 발생하는 키 이벤트로 ON/OFF가 여러 번 바뀌지 않게 보호합니다.
         guard now - lastToggleUptime > 0.5 else { return }
         lastToggleUptime = now
         let awake = FavoriteAwakeManager.shared
-        if awake.isActive {
-            awake.stop()
-        } else if !awake.start(minutes: toggleMinutes == -1 ? nil : toggleMinutes) {
+        if awake.isActive { awake.stop() }
+        else if !awake.start(minutes: toggleMinutes == -1 ? nil : toggleMinutes) {
             ToolWindowManager.shared.showBanner(message: awake.lastNotice.isEmpty ? "잠자기 방지 실행 실패" : awake.lastNotice)
         }
     }
-
     func stopMonitoring() {
-        if let ref = hotKeyRef { _ = UnregisterEventHotKey(ref); hotKeyRef = nil }
-        if let ref = handlerRef { _ = RemoveEventHandler(ref); handlerRef = nil }
+        if let monitor = globalKeyMonitor { NSEvent.removeMonitor(monitor); globalKeyMonitor = nil }
+        if let monitor = localKeyMonitor { NSEvent.removeMonitor(monitor); localKeyMonitor = nil }
     }
 }
 
@@ -2490,7 +2446,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard let path = Bundle.main.path(forResource: "icon_awake", ofType: "png") else { return nil }
         return NSImage(contentsOfFile: path)
     }()
-    private let buildIdentifier = "FAV-20261120-HK3"
+    private let buildIdentifier = "FAV-20261120-HK4"
     var wheelPanel: NSPanel?
     var wheelCenterPoint: NSPoint = .zero
     
@@ -2504,9 +2460,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // 실제 NSDraggingDestination이 커서를 추적할 때 전역 이벤트 콜백이
     // hoveredIndex를 덮어쓰지 않게 하여 조각의 강조 표시 깜빡임을 방지합니다.
     var isNativeDragTracking: Bool = false
-    // Command로 인해 .copy가 사라진 경우에도 원본 Finder 이동을 수락하지 않습니다.
-    // 이 값은 네이티브 드롭 대상 위에서 퀄리티 모드를 보고 있을 때만 참입니다.
-    var qualityNoCopyHover: Bool = false
+    // Command 또는 Control로 인해 .copy가 사라져도 Finder 이동·링크는 수락하지 않습니다.
+    // 네이티브 드롭 영역에서 화질 모드 또는 ACTIONS를 가리킬 때만 참입니다.
+    var deferredNoCopyHover: Bool = false
     var dragSequence: UInt64 = 0
     // NSEvent.pressedMouseButtons는 전역 CGEvent 탭 콜백 순간에 최신 상태가 아닐 수 있습니다.
     // 마우스 down/up을 수동 감시해 드래그 중 여부를 직접 추적합니다.
@@ -2818,7 +2774,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 owner.previousRawFlags = []
                 owner.safeDropWasAccepted = false
                 owner.isNativeDragTracking = false
-                owner.qualityNoCopyHover = false
+                owner.deferredNoCopyHover = false
                 owner.dragSequence &+= 1
                 owner.dragStartedInFinder = (NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.apple.finder")
                 owner.lastWheelDiagnostic = owner.dragStartedInFinder
@@ -2842,10 +2798,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                         owner.lastWheelDiagnostic = "휠 미표시 · 단축키 조합/모드 확인 필요"
                     }
                 }
-                // Command는 macOS Finder의 '이동' 드롭 연산을 지정할 수 있습니다.
-                // 따라서 .move를 복사로 속이거나 mouseUp을 차단하지 않습니다.
-                // 실제 네이티브 대상 위에서 거부된 품질 드래그에 한하여,
-                // Finder가 취소할 시간을 준 후 별도 변환 명령만 시작합니다.
+                // Command/Control은 Finder 드롭 동작을 변경할 수 있습니다.
+                // .move 또는 .link를 .copy로 속이거나 mouseUp을 차단하지 않습니다.
+                // 네이티브 드롭 대상에서 확인한 화질 선택/ACTIONS만,
+                // Finder가 드롭을 정리한 뒤 원본 파일이 있는 경우 별도 실행합니다.
                 let settingsAtRelease = ShortcutSettings.shared
                 let releaseFlags = NSEvent.ModifierFlags(rawValue: UInt(event.flags.rawValue))
                     .intersection([.shift, .option, .control, .command])
@@ -2853,21 +2809,31 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 let isQualityHeld = !qualityKeys.isEmpty && releaseFlags.isSuperset(of: qualityKeys)
                 let pointerAtRelease = NSEvent.mouseLocation
                 let releaseIndex = owner.wheelIndexForGlobalPointer(pointerAtRelease)
-                let shouldUseQualityFallback = owner.qualityNoCopyHover &&
+                let validDeferredDrop = owner.deferredNoCopyHover &&
                     owner.isNativeDragTracking &&
                     owner.isCurrentMouseStrokeValidFileDrag &&
                     owner.dragStartedInFinder &&
                     owner.requestedWheelDuringThisDrag &&
-                    owner.isNativeWheelReady &&
-                    AppState.shared.wheelMode == .convert &&
-                    isQualityHeld &&
-                    settingsAtRelease.matchWheelMode(for: releaseFlags) == .convert &&
-                    releaseIndex != nil
-                let qualityFiles = shouldUseQualityFallback ? AppState.shared.draggedFiles : []
-                let qualityAction = releaseIndex.flatMap { index -> String? in
-                    guard shouldUseQualityFallback, index >= 0, index < AppState.shared.items.count else { return nil }
+                    owner.isNativeWheelReady && releaseIndex != nil
+                let releasedMode = settingsAtRelease.matchWheelMode(for: releaseFlags)
+                let shouldUseQualityFallback = validDeferredDrop &&
+                    AppState.shared.wheelMode == .convert && isQualityHeld && releasedMode == .convert
+                let shouldUseActionFallback = validDeferredDrop &&
+                    AppState.shared.wheelMode == .actions && releasedMode == .actions
+                let deferredFiles = (shouldUseQualityFallback || shouldUseActionFallback)
+                    ? AppState.shared.draggedFiles : []
+                let deferredAction = releaseIndex.flatMap { index -> String? in
+                    guard (shouldUseQualityFallback || shouldUseActionFallback),
+                          index >= 0, index < AppState.shared.items.count else { return nil }
                     let action = AppState.shared.items[index].actionKey
-                    guard action.hasPrefix("conv_"), action != "conv_zip", action != "conv_targz" else { return nil }
+                    if shouldUseQualityFallback {
+                        guard action.hasPrefix("conv_"), action != "conv_zip", action != "conv_targz" else { return nil }
+                    } else {
+                        // 휠에서 명시적으로 선택한 ACTIONS 항목만; 일반 Finder 드롭은 실행하지 않습니다.
+                        let permitted = Set(["act_copy_path", "act_terminal", "act_airdrop", "act_finder",
+                                             "act_duplicate", "act_join_images", "tool_rename_date"])
+                        guard permitted.contains(action) else { return nil }
+                    }
                     return action
                 }
                 owner.isCurrentMouseStrokeValidFileDrag = false
@@ -2879,16 +2845,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) { [weak owner] in
                     guard let owner = owner, owner.dragSequence == sequenceAtRelease,
                           !owner.safeDropWasAccepted else { return }
-                    guard let action = qualityAction, !qualityFiles.isEmpty,
-                          qualityFiles.allSatisfy({ FileManager.default.fileExists(atPath: $0.path) }) else {
+                    guard let action = deferredAction, !deferredFiles.isEmpty,
+                          deferredFiles.allSatisfy({ FileManager.default.fileExists(atPath: $0.path) }) else {
                         owner.hideWheel()
                         return
                     }
-                    // 원본 파일의 이동 또는 삭제를 수행하지 않는 '변환' 액션만 실행합니다.
+                    // 실제 Finder 드롭은 건드리지 않았으며 파일이 그대로 있을 때만 처리합니다.
                     owner.safeDropWasAccepted = true
+                    owner.lastWheelDiagnostic = shouldUseQualityFallback
+                        ? "화질 선택 드롭 · 원본 보존 확인 후 변환"
+                        : "ACTIONS 드롭 · 원본 보존 확인 후 선택 작업"
                     owner.hideWheel()
                     DispatchQueue.main.async {
-                        FileProcessor.execute(actionKey: action, files: qualityFiles, openQualityPopup: true)
+                        FileProcessor.execute(actionKey: action, files: deferredFiles,
+                                              openQualityPopup: shouldUseQualityFallback)
                     }
                 }
                 return Unmanaged.passUnretained(event)
@@ -3142,7 +3112,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         AppState.shared.isQualityOptionActive = false
         AppState.shared.hoveredIndex = nil
         isNativeDragTracking = false
-        qualityNoCopyHover = false
+        deferredNoCopyHover = false
         wheelPanel?.orderOut(nil)
         wheelPanel?.contentView = nil
     }
@@ -3171,9 +3141,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
     
-    // mouseUp을 바꾸거나 차단하지 않습니다. 일반 파일 드롭은 NSDraggingDestination만 처리합니다.
-    // Command가 .copy 권한을 제거하는 퀄리티 변환에는 원본 이동을 수락하지 않는
-    // 별도의 수동 감시 경로만 사용합니다.
+    // mouseUp을 바꾸거나 차단하지 않습니다. .copy면 NSDraggingDestination이 처리합니다.
+    // .copy를 제공하지 않는 화질 선택/ACTIONS만 원본 확인 후 별도의 수동 감시로 처리합니다.
 
 }
 

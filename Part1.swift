@@ -1769,7 +1769,7 @@ struct HelpAndSettingsView: View {
                     stopRecording()
                     settings.resetToFavoriteDefaults()
                     settings.renamePattern = ShortcutSettings.defaultRenamePattern
-                    _ = FavoriteAwakeHotKey.shared.changePreset(.commandOptionControlK)
+                    _ = FavoriteAwakeHotKey.shared.changePreset(.controlOptionPeriod)
                     FavoriteAwakeHotKey.shared.setToggleMinutes(60)
                     awakePresetRaw = FavoriteAwakeHotKey.shared.preset.rawValue
                     awakeMinutes = FavoriteAwakeHotKey.shared.toggleMinutes
@@ -1892,7 +1892,7 @@ struct HelpAndSettingsView: View {
         VStack(alignment: .leading, spacing: 10) {
             Text("3. 잠자기 방지 토글 단축키")
                 .font(.headline).foregroundColor(.orange)
-            Text("파일 변환 단축키와 독립적입니다. 기본은 Control+Option+.이며, 영문 A~Z 또는 마침표(.)로 변경할 수 있습니다.")
+            Text("변환 휠처럼 [단축키 직접 입력]을 누르고 원하는 키 조합을 그대로 눌러 저장하세요. 전역 단축키를 선점하지 않는 읽기 전용 방식입니다. 기본값은 ⌃⌥.입니다.")
                 .font(.caption).foregroundColor(.secondary)
             HStack(spacing: 10) {
                 Text("현재: \(FavoriteAwakeHotKey.shared.shortcutLabel)")
@@ -1923,7 +1923,9 @@ struct HelpAndSettingsView: View {
             }
             HStack(spacing: 10) {
                 if awakeIsRecording {
-                    Text(awakeKeyCode == nil ? "Control을 포함한 수정키 2개 이상 + 영문 A~Z 또는 . 입력" : "입력: \(ShortcutSettings.formatFlags(awakeKeyFlags)) + \(awakeKeyName)")
+                    Text(awakeKeyCode == nil
+                         ? "입력 중: \(awakeKeyFlags.isEmpty ? "Control+Option+일반 키" : ShortcutSettings.formatFlags(awakeKeyFlags) + " + 일반 키")"
+                         : "입력: \(ShortcutSettings.formatFlags(awakeKeyFlags)) + \(awakeKeyName)")
                         .font(.caption.bold()).foregroundColor(.orange)
                     Button("저장") {
                         guard let code = awakeKeyCode else { return }
@@ -1938,7 +1940,8 @@ struct HelpAndSettingsView: View {
                     }.disabled(awakeKeyCode == nil)
                     Button("취소") { stopAwakeRecording() }
                 } else {
-                    Button("단축키 직접 입력") { startAwakeRecording() }
+                    Button("단축키 입력하기") { startAwakeRecording() }
+                        .buttonStyle(.borderedProminent).tint(.orange)
                 }
             }
             HStack(spacing: 8) {
@@ -2092,7 +2095,16 @@ struct HelpAndSettingsView: View {
             UInt16(kVK_ANSI_S): "S", UInt16(kVK_ANSI_T): "T", UInt16(kVK_ANSI_U): "U",
             UInt16(kVK_ANSI_V): "V", UInt16(kVK_ANSI_W): "W", UInt16(kVK_ANSI_X): "X",
             UInt16(kVK_ANSI_Y): "Y", UInt16(kVK_ANSI_Z): "Z",
-            UInt16(kVK_ANSI_Period): "."
+            UInt16(kVK_ANSI_Period): ".", UInt16(kVK_ANSI_Comma): ",",
+            UInt16(kVK_ANSI_Slash): "/", UInt16(kVK_ANSI_Minus): "-",
+            UInt16(kVK_ANSI_Equal): "=", UInt16(kVK_ANSI_Semicolon): ";",
+            UInt16(kVK_ANSI_Quote): "'", UInt16(kVK_ANSI_LeftBracket): "[",
+            UInt16(kVK_ANSI_RightBracket): "]", UInt16(kVK_ANSI_Backslash): "\\",
+            UInt16(kVK_ANSI_0): "0", UInt16(kVK_ANSI_1): "1",
+            UInt16(kVK_ANSI_2): "2", UInt16(kVK_ANSI_3): "3",
+            UInt16(kVK_ANSI_4): "4", UInt16(kVK_ANSI_5): "5",
+            UInt16(kVK_ANSI_6): "6", UInt16(kVK_ANSI_7): "7",
+            UInt16(kVK_ANSI_8): "8", UInt16(kVK_ANSI_9): "9"
         ]
         return letters[code]
     }
@@ -2102,16 +2114,18 @@ struct HelpAndSettingsView: View {
         awakeHotkeyNotice = ""
         awakeIsRecording = true
         FavoriteAwakeHotKey.shared.suspendForRecorder()
-        awakeKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { event in
+        awakeKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.flagsChanged, .keyDown]) { event in
             guard self.awakeIsRecording else { return event }
             let flags = event.modifierFlags.intersection([.control, .option, .shift, .command])
-            if let label = self.awakeKeyLetter(event.keyCode) {
+            if event.type == .flagsChanged {
+                if self.awakeKeyCode == nil { self.awakeKeyFlags = flags }
+            } else if let label = self.awakeKeyLetter(event.keyCode) {
                 self.awakeKeyCode = UInt32(event.keyCode)
                 self.awakeKeyName = label
                 self.awakeKeyFlags = flags
-                self.awakeHotkeyNotice = "Control을 포함한 수정키 2개 이상을 사용합니다."
+                self.awakeHotkeyNotice = "입력한 키를 확인한 뒤 [저장]을 누르세요."
             } else {
-                self.awakeHotkeyNotice = "영문 A~Z 또는 마침표(.) 키로 설정할 수 있습니다."
+                self.awakeHotkeyNotice = "영문 A~Z, 숫자 0~9 또는 일반 문장부호 중 하나를 사용하세요."
             }
             return nil
         }
