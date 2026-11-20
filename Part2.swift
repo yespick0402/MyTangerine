@@ -2299,6 +2299,8 @@ final class FavoriteAwakeHotKey {
     private var globalKeyTap: CFMachPort?
     private var globalKeyTapCanSuppress = false
     private var globalKeySource: CFRunLoopSource?
+    // HK12-R1: 읽기 전용 폴백 이후 권한 승인을 감지해 1회 승격 재시도.
+    private var permissionUpgradeTimer: Timer?
     private var lastToggleUptime: TimeInterval = -10
     private var suspendedForRecorder = false
 
@@ -2393,7 +2395,12 @@ final class FavoriteAwakeHotKey {
         if preset == .disabled { return "사용 안 함" }
         guard let tap = globalKeyTap else { return "연결 안 됨" }
         guard CGEvent.tapIsEnabled(tap: tap) else { return "전역 감시 중단됨" }
-        return globalKeyTapCanSuppress ? "전역 단축키 연결됨 · 입력 중복 방지" : "읽기 전용 감시 · 단축키 문자가 입력될 수 있음"
+        return globalKeyTapCanSuppress ? "입력 차단 활성 · 단축키 문자는 전달하지 않음" : "읽기 전용 · 단축키 문자가 입력될 수 있음"
+    }
+    var needsSuppressionRepair: Bool {
+        guard preset != .disabled else { return false }
+        guard let tap = globalKeyTap else { return true }
+        return !globalKeyTapCanSuppress || !CGEvent.tapIsEnabled(tap: tap)
     }
 
     @discardableResult
@@ -2403,7 +2410,8 @@ final class FavoriteAwakeHotKey {
                 CGEvent.tapEnable(tap: tap, enable: true)
             }
             if CGEvent.tapIsEnabled(tap: tap) {
-                lastNotice = ""
+                // 이미 읽기 전용 탭이 연결되어 있다고 해서 입력 차단까지 된 것은 아닙니다.
+                if globalKeyTapCanSuppress { lastNotice = "" }
                 return true
             }
             stopMonitoring()
@@ -2462,11 +2470,68 @@ final class FavoriteAwakeHotKey {
             lastNotice = "전역 단축키 감시를 활성화하지 못했습니다."
             return false
         }
-        lastNotice = globalKeyTapCanSuppress ? "" : "읽기 전용으로 연결됨: ⌃⌥. 입력 시 다른 앱에 마침표가 입력될 수 있습니다."
+        if globalKeyTapCanSuppress {
+            lastNotice = ""
+        } else if !AXIsProcessTrusted() {
+            lastNotice = "입력 차단을 위한 손쉬운 사용 권한이 현재 00Favorite 프로세스에 승인되지 않았습니다."
+        } else {
+            lastNotice = "손쉬운 사용은 승인되었지만 능동형 이벤트 감시 생성이 실패했습니다. '입력 차단 재연결'을 실행해 주세요."
+        }
         return true
     }
+
+    // 읽기 전용 tap을 유지하는 기존 코드가 권한이 바뀌어도 능동형으로 승격하지 못하던 문제 해결.
+    // 이 메서드는 메인 스레드에서만 실행하고, 기존 tap을 정리한 다음 단 1개만 생성합니다.
+    @discardableResult
+    func reconnectForSuppression() -> Bool {
+        guard preset != .disabled else { return false }
+        if let tap = globalKeyTap, globalKeyTapCanSuppress, CGEvent.tapIsEnabled(tap: tap) {
+            lastNotice = ""
+            return true
+        }
+        guard CGPreflightListenEventAccess() else {
+            lastNotice = "입력 모니터링 권한이 없습니다. macOS 설정에서 00Favorite을 승인해 주세요."
+            return false
+        }
+        guard AXIsProcessTrusted() else {
+            lastNotice = "손쉬운 사용(기기 제어 및 데이터 접근) 권한을 00Favorite에 승인한 뒤 다시 연결해 주세요."
+            return false
+        }
+        // 이전 listenOnly tap을 남겨 두면 한 번의 keyDown을 두 번 받아 토글할 수 있습니다.
+        stopMonitoring()
+        let connected = ensurePassiveMonitors()
+        if connected && !globalKeyTapCanSuppress {
+            lastNotice = "손쉬운 사용 승인 확인 · 능동형 감시 생성 실패. 00Favorite을 완전히 종료했다가 실행하고 다시 연결해 주세요."
+        }
+        return connected && globalKeyTapCanSuppress
+    }
+
+    // 실행 당시 읽기 전용이었다가 사용자가 macOS 설정에서 승인한 경우의 자동 복구.
+    // 수 초마다 승인 상태만 검사하고, 권한을 얻으면 딱 한 번 재연결을 시도합니다.
+    // 감시 실패가 계속될 때 재설치·재등록을 무한 반복하지 않습니다.
+    private func schedulePermissionUpgradeCheck() {
+        guard preset != .disabled, needsSuppressionRepair, permissionUpgradeTimer == nil else { return }
+        let timer = Timer(timeInterval: 4.0, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            if self.preset == .disabled || !self.needsSuppressionRepair {
+                self.permissionUpgradeTimer?.invalidate()
+                self.permissionUpgradeTimer = nil
+                return
+            }
+            guard AXIsProcessTrusted(), CGPreflightListenEventAccess() else { return }
+            self.permissionUpgradeTimer?.invalidate()
+            self.permissionUpgradeTimer = nil
+            _ = self.reconnectForSuppression()
+            (NSApp.delegate as? AppDelegate)?.updateStatusBarMenu()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        permissionUpgradeTimer = timer
+    }
     func startMonitoring() {
-        if preset != .disabled { _ = ensurePassiveMonitors() }
+        if preset != .disabled {
+            _ = ensurePassiveMonitors()
+            schedulePermissionUpgradeCheck()
+        }
     }
     func suspendForRecorder() { suspendedForRecorder = true }
     func resumeAfterRecorder() { suspendedForRecorder = false }
@@ -2484,6 +2549,7 @@ final class FavoriteAwakeHotKey {
         guard ensurePassiveMonitors() else { return false }
         preset = chosen
         UserDefaults.standard.set(chosen.rawValue, forKey: Self.shortcutKey)
+        schedulePermissionUpgradeCheck()
         return true
     }
 
@@ -2509,6 +2575,7 @@ final class FavoriteAwakeHotKey {
         defaults.set(Int(newModifiers), forKey: Self.customModifiersKey)
         defaults.set(keyName, forKey: Self.customKeyNameKey)
         lastNotice = ""
+        schedulePermissionUpgradeCheck()
         return true
     }
     func setToggleMinutes(_ minutes: Int) {
@@ -2529,6 +2596,8 @@ final class FavoriteAwakeHotKey {
         }
     }
     func stopMonitoring() {
+        permissionUpgradeTimer?.invalidate()
+        permissionUpgradeTimer = nil
         if let source = globalKeySource {
             CFRunLoopRemoveSource(CFRunLoopGetMain(), source, CFRunLoopMode.commonModes)
             CFRunLoopSourceInvalidate(source)
@@ -2549,7 +2618,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard let path = Bundle.main.path(forResource: "icon_awake", ofType: "png") else { return nil }
         return NSImage(contentsOfFile: path)
     }()
-    private let buildIdentifier = "FAV-20261121-HK12"
+    private let buildIdentifier = "FAV-20261121-HK12R1"
     var wheelPanel: NSPanel?
     var wheelCenterPoint: NSPoint = .zero
     
@@ -2775,6 +2844,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let hotkeyStatusItem = NSMenuItem(title: "전역 단축키: \(hotkey.globalShortcutMonitorStatus)", action: nil, keyEquivalent: "")
         hotkeyStatusItem.isEnabled = false
         submenu.addItem(hotkeyStatusItem)
+        if hotkey.needsSuppressionRepair {
+            let repair = NSMenuItem(title: "⌨️ 단축키 문자 입력 차단 재연결…", action: #selector(reconnectAwakeHotkeySuppression), keyEquivalent: "")
+            repair.target = self
+            submenu.addItem(repair)
+        }
         let toggleItem = NSMenuItem(title: "⏻ 잠자기 방지 토글 (\(hotkey.shortcutLabel))", action: #selector(toggleAwakeByMenu), keyEquivalent: "")
         toggleItem.target = self
         submenu.addItem(toggleItem)
@@ -2833,6 +2907,42 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func toggleAwakeByMenu() {
         FavoriteAwakeHotKey.shared.toggle()
         updateStatusBarMenu()
+    }
+    @objc private func reconnectAwakeHotkeySuppression() {
+        let hotkey = FavoriteAwakeHotKey.shared
+        if hotkey.reconnectForSuppression() {
+            updateStatusBarMenu()
+            return
+        }
+        updateStatusBarMenu()
+        let inputGranted = CGPreflightListenEventAccess()
+        let accessibilityGranted = AXIsProcessTrusted()
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "단축키 입력 차단을 연결하지 못했습니다"
+        alert.informativeText = """
+        입력 모니터링: \(inputGranted ? "승인" : "미승인")
+        기기 제어 및 데이터 접근(손쉬운 사용): \(accessibilityGranted ? "승인" : "미승인")
+
+        \(hotkey.lastNotice)
+
+        읽기 전용 감시에서는 잠자기 토글은 작동하지만 Chrome 입력창에 마침표가 들어갈 수 있습니다.
+        설정을 변경한 뒤 00Favorite을 다시 실행하고 '입력 차단 재연결'을 선택해 주세요.
+        """
+        if !inputGranted || !accessibilityGranted {
+            alert.addButton(withTitle: inputGranted ? "기기 제어 권한 설정 열기" : "입력 모니터링 설정 열기")
+            alert.addButton(withTitle: "닫기")
+            if alert.runModal() == .alertFirstButtonReturn {
+                if !inputGranted {
+                    FolderAccessPreferences.shared.openInputMonitoringSettings()
+                } else {
+                    FolderAccessPreferences.shared.openAccessibilitySettings()
+                }
+            }
+        } else {
+            alert.addButton(withTitle: "확인")
+            alert.runModal()
+        }
     }
     @objc private func changeAwakeHotkey(_ sender: NSMenuItem) {
         guard let choice = FavoriteAwakeHotKey.Preset(rawValue: sender.tag) else { return }
