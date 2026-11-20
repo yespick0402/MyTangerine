@@ -143,6 +143,75 @@ jobs:
           fi
           "$FF_BIN" -version | head -n 1
 
+      - name: Bundle official ExifTool 13.64 and verify runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          # CaptureDateInspector.exifTags()는 아래 두 경로를 직접 사용합니다.
+          # Contents/Resources/exiftool.pl + Contents/Resources/exiftool-lib/
+          ET_VERSION='13.64'
+          ET_SHA256='dcb9f6be1f6705ee826a92d1522e3fec1d0b3749cdc061b03c46873d5fe204fc'
+          ET_RES='00Favorite.app/Contents/Resources'
+          ET_WORK="$(mktemp -d)"
+          trap 'rm -rf "$ET_WORK"' EXIT
+          ET_ARCHIVE="$ET_WORK/Image-ExifTool-${ET_VERSION}.tar.gz"
+          ET_SOURCE="$ET_WORK/Image-ExifTool-${ET_VERSION}"
+          ET_OK=0
+          # 두 URL 모두 공식 SourceForge ExifTool 파일을 가리킵니다.
+          ET_URLS=(
+            "https://sourceforge.net/projects/exiftool/files/Image-ExifTool-${ET_VERSION}.tar.gz/download"
+            "https://downloads.sourceforge.net/project/exiftool/Image-ExifTool-${ET_VERSION}.tar.gz"
+          )
+          for ET_URL in "${ET_URLS[@]}"; do
+            rm -f "$ET_ARCHIVE"
+            echo "ExifTool official source: $ET_URL"
+            if ! curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 20 --max-time 240 "$ET_URL" -o "$ET_ARCHIVE"; then
+              echo 'Download failed; try the alternate official endpoint.' >&2
+              continue
+            fi
+            ET_ACTUAL_SHA256="$(shasum -a 256 "$ET_ARCHIVE" | awk '{print $1}')"
+            if [ "$ET_ACTUAL_SHA256" != "$ET_SHA256" ]; then
+              echo "SHA256 mismatch (got $ET_ACTUAL_SHA256); refusing archive." >&2
+              continue
+            fi
+            ET_OK=1
+            break
+          done
+          if [ "$ET_OK" -ne 1 ]; then
+            echo 'ERROR: Official ExifTool 13.64 could not be downloaded and SHA256-verified.' >&2
+            exit 1
+          fi
+          echo 'ExifTool 13.64 official archive SHA256: VERIFIED'
+          tar -tzf "$ET_ARCHIVE" >/dev/null
+          tar -xzf "$ET_ARCHIVE" -C "$ET_WORK"
+          test -s "$ET_SOURCE/exiftool" || { echo 'ERROR: ExifTool Perl script missing'; exit 1; }
+          test -s "$ET_SOURCE/lib/Image/ExifTool.pm" || { echo 'ERROR: ExifTool Perl library missing'; exit 1; }
+          test -s "$ET_SOURCE/README" || { echo 'ERROR: ExifTool license notice missing'; exit 1; }
+          mkdir -p "$ET_RES/exiftool-lib"
+          cp "$ET_SOURCE/exiftool" "$ET_RES/exiftool.pl"
+          cp -R "$ET_SOURCE/lib/." "$ET_RES/exiftool-lib/"
+          cp "$ET_SOURCE/README" "$ET_RES/ExifTool-README-LICENSE.txt"
+          printf 'ExifTool version: %s\nSHA256: %s\nSource: official ExifTool / SourceForge full Perl distribution\n' "$ET_VERSION" "$ET_SHA256" > "$ET_RES/ExifTool-VERSION.txt"
+          ET_SCRIPT="$ET_RES/exiftool.pl"
+          ET_LIB="$ET_RES/exiftool-lib"
+          test -s "$ET_SCRIPT"
+          test -s "$ET_LIB/Image/ExifTool.pm"
+          ET_ACTUAL_VERSION="$(PERL5LIB="$ET_LIB" /usr/bin/perl "$ET_SCRIPT" -ver)"
+          [ "$ET_ACTUAL_VERSION" = "$ET_VERSION" ] || { echo "ERROR: ExifTool version mismatch: $ET_ACTUAL_VERSION" >&2; exit 1; }
+          # Swift exifTags() 호출과 동일한 옵션으로 메타데이터를 직접 읽어 봅니다.
+          PERL5LIB="$ET_LIB" /usr/bin/perl "$ET_SCRIPT" \
+            -j -G1 -a -s -api QuickTimeUTC=0 -api LargeFileSupport=1 \
+            "$ET_RES/icon.png" > "$ET_WORK/exiftool-test.json"
+          python3 - "$ET_WORK/exiftool-test.json" <<'PY_EXIF_VERIFY'
+          import json, sys
+          with open(sys.argv[1], encoding='utf-8') as f:
+              value = json.load(f)
+          assert isinstance(value, list) and len(value) == 1 and isinstance(value[0], dict), 'ExifTool JSON output missing'
+          tags = value[0]
+          assert any(k.endswith(':FileType') and v == 'PNG' for k, v in tags.items()), f'Unexpected ExifTool output tags: {list(tags)[:12]}'
+          print('ExifTool Perl + library + app-resource JSON reading: VERIFIED')
+          PY_EXIF_VERIFY
+
       - name: Compile and verify native macOS app
         shell: bash
         run: |
@@ -183,10 +252,26 @@ jobs:
           unzip -p 00Favorite.zip '00Favorite.app/Contents/Info.plist' > packaged-Info.plist
           [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' packaged-Info.plist)" = "$ID" ]
           [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleName' packaged-Info.plist)" = '00Favorite' ]
+          # 최종 ZIP에도 ExifTool Perl 스크립트와 모듈이 실제로 들어 있어야 합니다.
+          python3 - <<'PY_PACKAGED_EXIF'
+          from zipfile import ZipFile
+          prefix = '00Favorite.app/Contents/Resources/'
+          required = [
+              'exiftool.pl',
+              'exiftool-lib/Image/ExifTool.pm',
+              'ExifTool-README-LICENSE.txt',
+              'ExifTool-VERSION.txt',
+          ]
+          with ZipFile('00Favorite.zip') as archive:
+              for name in required:
+                  info = archive.getinfo(prefix + name)
+                  assert info.file_size > 0, f'Empty bundled ExifTool resource: {name}'
+          print('Final ZIP ExifTool resources: VERIFIED')
+          PY_PACKAGED_EXIF
 
       - name: Upload Finished Mac App
         uses: actions/upload-artifact@v4
         with:
-          name: 00Favorite-4.8-FAV-20261121-HK13-Mac-ARM64
+          name: 00Favorite-4.8-HK13-ExifToolFix1-Mac-ARM64
           path: 00Favorite.zip
           if-no-files-found: error
