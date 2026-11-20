@@ -1563,7 +1563,11 @@ struct FolderPermissionView: View {
     }
 
     var body: some View {
-        ScrollView {
+        ScrollView { content }
+    }
+
+    // 고급 설정 내부에 중첩 ScrollView 없이 삽입할 수 있는 동일한 폴더 접근 UI.
+    var content: some View {
             VStack(alignment: .leading, spacing: 16) {
                 Label("파일·폴더 접근 설정", systemImage: "folder.badge.gearshape")
                     .font(.title3.bold()).foregroundColor(.orange)
@@ -1623,7 +1627,6 @@ struct FolderPermissionView: View {
                     .font(.caption).foregroundColor(.secondary)
             }
             .padding(22)
-        }
     }
 }
 
@@ -1632,6 +1635,8 @@ class ToolWindowManager {
     static let shared = ToolWindowManager()
     var activeWindows: [NSWindow] = []
     var bannerWindow: NSPanel?
+    private var settingsWindow: NSWindow?
+    static let settingsNavigation = Notification.Name("00Favorite.Settings.Navigate")
     
     func openWindow<V: View>(title: String, view: V, size: NSSize, minSize: NSSize = NSSize(width: 680, height: 500)) {
         let win = NSWindow(
@@ -1671,11 +1676,36 @@ class ToolWindowManager {
     func showImageJoinWindow(urls: [URL]) {
         openWindow(title: "이미지 세로 합치기", view: ImageJoinView(files: urls), size: NSSize(width: 780, height: 660), minSize: NSSize(width: 640, height: 500))
     }
-    func showHelpAndSettingsWindow() {
-        openWindow(title: "⭐ 00Favorite — 설명 및 설정", view: HelpAndSettingsView(), size: NSSize(width: 820, height: 700), minSize: NSSize(width: 740, height: 600))
+    func showHelpAndSettingsWindow(tab: Int? = nil) {
+        // 설명 및 설정은 단 하나의 창만 유지합니다. 최소화·가림·닫힘 상태도 복원합니다.
+        if let window = settingsWindow {
+            if window.isMiniaturized { window.deminiaturize(nil) }
+            NSApp.activate(ignoringOtherApps: true)
+            window.makeKeyAndOrderFront(nil)
+            // 평소 설정 버튼 재클릭은 기존 탭을 유지합니다. 명시적 고급 설정 이동에만 탭 변경.
+            if let tab = tab {
+                NotificationCenter.default.post(name: Self.settingsNavigation, object: nil,
+                                                userInfo: ["tab": tab])
+            }
+            return
+        }
+        let window = NSWindow(
+            contentRect: NSRect(origin: .zero, size: NSSize(width: 860, height: 740)),
+            styleMask: [.titled, .closable, .resizable, .miniaturizable, .fullSizeContentView],
+            backing: .buffered, defer: false
+        )
+        window.title = "⭐ 00Favorite — 설명 및 설정"
+        window.minSize = NSSize(width: 740, height: 600)
+        window.isReleasedWhenClosed = false
+        window.center()
+        window.contentView = NSHostingView(rootView: HelpAndSettingsView(initialTab: tab ?? 0))
+        settingsWindow = window
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
     }
     func showFolderPermissionsWindow() {
-        openWindow(title: "🔐 00Favorite — 파일·폴더 접근 설정", view: FolderPermissionView(), size: NSSize(width: 760, height: 640), minSize: NSSize(width: 650, height: 540))
+        // 최초 폴더 접근 안내도 같은 설정창의 고급 설정으로 열립니다.
+        showHelpAndSettingsWindow(tab: 3)
     }
     func showConvertQualityWindow(urls: [URL], targetExt: String) {
         openWindow(title: "포맷 변환 퀄리티 설정 (\(targetExt.uppercased()))", view: ConvertQualityPopupView(files: urls, targetExt: targetExt), size: NSSize(width: 500, height: 390), minSize: NSSize(width: 460, height: 360))
@@ -1702,12 +1732,15 @@ class ToolWindowManager {
 
 struct HelpAndSettingsView: View {
     @ObservedObject var settings = ShortcutSettings.shared
-    @State private var selectedTab: Int = 0
+    @State private var selectedTab: Int
+
+    init(initialTab: Int = 0) {
+        _selectedTab = State(initialValue: initialTab)
+    }
     @State private var recordingTarget: String? = nil
     @State private var tempRecordedFlags: NSEvent.ModifierFlags = []
     @State private var localMonitor: Any? = nil
     @State private var shortcutValidationWarning: String = ""
-    @State private var awakePresetRaw: Int = FavoriteAwakeHotKey.shared.preset.rawValue
     @State private var awakeMinutes: Int = FavoriteAwakeHotKey.shared.toggleMinutes
     @State private var awakeHotkeyNotice: String = ""
     @State private var awakeIsRecording = false
@@ -1744,7 +1777,7 @@ struct HelpAndSettingsView: View {
                     Text("⌨️ 단축키 설정").tag(0)
                     Text("🏷️ 이름 변환 양식").tag(1)
                     Text("📖 사용 설명서").tag(2)
-                    Text("🔐 폴더 접근").tag(3)
+                    Text("⚙️ 고급 설정").tag(3)
                 }.labelsHidden().pickerStyle(.segmented)
             }
             .padding(18).background(.regularMaterial)
@@ -1755,7 +1788,7 @@ struct HelpAndSettingsView: View {
             } else if selectedTab == 1 {
                 renamePatternTab
             } else if selectedTab == 3 {
-                FolderPermissionView()
+                advancedTab
             } else {
                 usageGuideTab
             }
@@ -1771,29 +1804,44 @@ struct HelpAndSettingsView: View {
                     settings.renamePattern = ShortcutSettings.defaultRenamePattern
                     _ = FavoriteAwakeHotKey.shared.changePreset(.controlOptionPeriod)
                     FavoriteAwakeHotKey.shared.setToggleMinutes(60)
-                    awakePresetRaw = FavoriteAwakeHotKey.shared.preset.rawValue
                     awakeMinutes = FavoriteAwakeHotKey.shared.toggleMinutes
                     (NSApp.delegate as? AppDelegate)?.updateStatusBarMenu()
                     FileProcessor.showToast("단축키 및 작동 방식이 기본값으로 복원되었습니다.")
                 }
-                Button("닫기") { stopRecording(); NSApp.keyWindow?.close() }
+                Button("닫기") { stopRecording(); stopAwakeRecording(); NSApp.keyWindow?.close() }
                     .buttonStyle(.borderedProminent).tint(.orange)
             }
             .padding(14).background(.regularMaterial)
         }.onAppear { refreshWheelMonitorStatus() }
+         .onReceive(NotificationCenter.default.publisher(for: ToolWindowManager.settingsNavigation)) { note in
+             if let newTab = note.userInfo?["tab"] as? Int, (0...3).contains(newTab) {
+                 selectedTab = newTab
+             }
+         }
          .onChange(of: selectedTab) { _ in stopRecording(); stopAwakeRecording() }
+         .onReceive(NotificationCenter.default.publisher(for: NSWindow.willCloseNotification)) { note in
+             if let window = note.object as? NSWindow,
+                window.title == "⭐ 00Favorite — 설명 및 설정" {
+                 stopRecording()
+                 stopAwakeRecording()
+             }
+         }
          .onDisappear { stopRecording(); stopAwakeRecording() }
     }
     
-    var shortcutRecorderTab: some View {
+    // 사용자에게는 필요할 때만 표시하는 입력 감시·폴더 접근 관리 화면.
+    var advancedTab: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
+                Text("고급 설정").font(.title3.bold()).foregroundColor(.orange)
+                Text("평상시에는 변경하지 않아도 됩니다. 휠 안전 모드는 기본 적용되며, 문제가 있을 때만 진단·재연결을 사용하세요.")
+                    .font(.caption).foregroundColor(.secondary)
                 VStack(alignment: .leading, spacing: 9) {
                     Label("안전 모드 (항상 적용)", systemImage: "shield.checkered")
                         .font(.headline).foregroundColor(.green)
                     Text("Finder의 키 입력과 마우스 드래그를 가로채거나 변경하지 않습니다. 휠 조각 위에 실제 파일을 드롭한 경우에만 00Favorite 작업이 시작됩니다. 다른 위치에 놓으면 macOS가 원래 드롭을 처리합니다.")
                         .font(.caption).foregroundColor(.secondary)
-                    Toggle("휠 감지 켜기 (메뉴바에서도 일시 정지 가능)", isOn: $settings.wheelDetectionEnabled)
+                    Toggle("휠 감지 사용 (문제 해결 시에만 변경)", isOn: $settings.wheelDetectionEnabled)
                         .onChange(of: settings.wheelDetectionEnabled) { enabled in
                             let delegate = NSApp.delegate as? AppDelegate
                             if !enabled { delegate?.hideWheel() }
@@ -1828,8 +1876,18 @@ struct HelpAndSettingsView: View {
                         .font(.caption2).foregroundColor(.secondary)
                 }
                 .padding(14).background(Color.green.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+                Divider()
+                FolderPermissionView().content
+            }
+            .padding(20)
+        }
+    }
+
+    var shortcutRecorderTab: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
                 VStack(alignment: .leading, spacing: 10) {
-                    Text("1. 파일 드래그 시 휠 활성화 방식 선택").font(.headline).foregroundColor(.orange)
+                    Text("원형 휠 표시 방식").font(.headline).foregroundColor(.orange)
                     Picker("작동 방식", selection: $settings.isToggleMode) {
                         Text("누르고 있는 동안만 켜기 (Hold 방식)").tag(false)
                         Text("한 번 누르면 켜지고 다시 누르면 끄기 (Toggle 버튼 방식)").tag(true)
@@ -1846,8 +1904,8 @@ struct HelpAndSettingsView: View {
                 .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
                 
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("2. 원형 휠 및 퀄리티 옵션 단축키 설정").font(.headline).foregroundColor(.orange)
-                    Text("바꾸고 싶은 기능의 [단축키 입력하기] 버튼을 누른 뒤, 키보드에서 원하는 키를 누르고 마우스로 [완료]를 클릭하세요.")
+                    Text("단축키 설정").font(.headline).foregroundColor(.orange)
+                    Text("모든 단축키를 같은 방식으로 설정합니다. 각 항목에서 [단축키 입력하기]를 누른 후 실제 키 조합을 눌러 저장하세요.")
                         .font(.caption).foregroundColor(.secondary)
                 }
                 
@@ -1886,62 +1944,63 @@ struct HelpAndSettingsView: View {
         }
     }
     
-    // 독립된 컴포넌트로 분리해 SwiftUI 타입 검사 부담을 줄입니다.
+    // 원형 휠과 동일한 카드 레이아웃으로 표시하는 잠자기 방지 단축키.
+    // 다른 입력 감시 코드와 별도로 등록되며, 파일 변환과 연동하지 않습니다.
     var awakeHotkeySettingsCard: some View {
-        // 파일 드래그와 독립적인 잠자기 방지 전역 핫키 설정
-        VStack(alignment: .leading, spacing: 10) {
-            Text("3. 잠자기 방지 토글 단축키")
-                .font(.headline).foregroundColor(.orange)
-            Text("변환 휠처럼 [단축키 직접 입력]을 누르고 원하는 키 조합을 그대로 눌러 저장하세요. 전역 단축키를 선점하지 않는 읽기 전용 방식입니다. 기본값은 ⌃⌥.입니다.")
-                .font(.caption).foregroundColor(.secondary)
-            HStack(spacing: 10) {
-                Text("현재: \(FavoriteAwakeHotKey.shared.shortcutLabel)")
-                    .font(.subheadline.bold())
-                Spacer()
-                Picker("토글 단축키", selection: $awakePresetRaw) {
-                    Text("사용 안 함").tag(0)
-                    Text("⌃⌥⌘K").tag(1)
-                    Text("⌃⌥⌘J").tag(2)
-                    Text("⌃⌥⌘L").tag(3)
-                    Text("⌃⌥. (권장)").tag(5)
-                    if FavoriteAwakeHotKey.shared.preset == .custom {
-                        Text("직접 지정: \(FavoriteAwakeHotKey.shared.shortcutLabel)").tag(4)
-                    }
-                }
-                .frame(width: 240)
-                .onChange(of: awakePresetRaw) { proposed in
-                    guard let preset = FavoriteAwakeHotKey.Preset(rawValue: proposed),
-                          preset != .custom else { return }
-                    if !FavoriteAwakeHotKey.shared.changePreset(preset) {
-                        awakeHotkeyNotice = FavoriteAwakeHotKey.shared.lastNotice
-                        awakePresetRaw = FavoriteAwakeHotKey.shared.preset.rawValue
-                    } else {
-                        awakeHotkeyNotice = "잠자기 방지 단축키를 저장했습니다."
-                        (NSApp.delegate as? AppDelegate)?.updateStatusBarMenu()
-                    }
-                }
+        VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("🌙 잠자기 방지 켜기/끄기").font(.system(size: 14, weight: .bold))
+                Text("파일 드래그와 무관하게 사용합니다. Control을 포함한 수정키 2개 이상 + 일반 키 1개. 기본 ⌃⌥.")
+                    .font(.caption).foregroundColor(.secondary)
             }
-            HStack(spacing: 10) {
+            HStack(spacing: 12) {
+                HStack {
+                    Image(systemName: awakeIsRecording ? "keyboard.badge.ellipsis" : "keyboard")
+                        .foregroundColor(awakeIsRecording ? .orange : .secondary)
+                    Text(awakeIsRecording
+                         ? (awakeKeyCode == nil
+                             ? (awakeKeyFlags.isEmpty ? "원하는 단축키를 눌러주세요..." : ShortcutSettings.formatFlags(awakeKeyFlags) + " + 일반 키")
+                             : ShortcutSettings.formatFlags(awakeKeyFlags) + " + " + awakeKeyName)
+                         : FavoriteAwakeHotKey.shared.shortcutLabel)
+                        .font(.system(size: 13, weight: .bold, design: .rounded))
+                        .foregroundColor(awakeIsRecording ? .orange : .primary)
+                    Spacer()
+                }
+                .padding(.horizontal, 12).padding(.vertical, 8)
+                .background(Color.black.opacity(awakeIsRecording ? 0.28 : 0.14), in: RoundedRectangle(cornerRadius: 8))
+                .overlay(RoundedRectangle(cornerRadius: 8)
+                    .stroke(awakeIsRecording ? Color.orange : Color.white.opacity(0.2),
+                            lineWidth: awakeIsRecording ? 2 : 1))
                 if awakeIsRecording {
-                    Text(awakeKeyCode == nil
-                         ? "입력 중: \(awakeKeyFlags.isEmpty ? "Control+Option+일반 키" : ShortcutSettings.formatFlags(awakeKeyFlags) + " + 일반 키")"
-                         : "입력: \(ShortcutSettings.formatFlags(awakeKeyFlags)) + \(awakeKeyName)")
-                        .font(.caption.bold()).foregroundColor(.orange)
-                    Button("저장") {
+                    Button("완료") {
                         guard let code = awakeKeyCode else { return }
-                        if FavoriteAwakeHotKey.shared.changeCustomShortcut(keyCode: code, keyName: awakeKeyName, flags: awakeKeyFlags) {
-                            awakePresetRaw = FavoriteAwakeHotKey.shared.preset.rawValue
-                            awakeHotkeyNotice = "직접 지정한 잠자기 방지 단축키가 저장되었습니다."
+                        if FavoriteAwakeHotKey.shared.changeCustomShortcut(keyCode: code,
+                              keyName: awakeKeyName, flags: awakeKeyFlags) {
+                            awakeHotkeyNotice = "잠자기 방지 단축키가 저장되었습니다."
                             stopAwakeRecording()
                             (NSApp.delegate as? AppDelegate)?.updateStatusBarMenu()
                         } else {
                             awakeHotkeyNotice = FavoriteAwakeHotKey.shared.lastNotice
                         }
-                    }.disabled(awakeKeyCode == nil)
+                    }
+                    .buttonStyle(.borderedProminent).tint(.green)
+                    .disabled(awakeKeyCode == nil)
                     Button("취소") { stopAwakeRecording() }
                 } else {
                     Button("단축키 입력하기") { startAwakeRecording() }
                         .buttonStyle(.borderedProminent).tint(.orange)
+                    Button("초기화") {
+                        if FavoriteAwakeHotKey.shared.changePreset(.controlOptionPeriod) {
+                            awakeHotkeyNotice = "기본 단축키 ⌃⌥.으로 복원했습니다."
+                            (NSApp.delegate as? AppDelegate)?.updateStatusBarMenu()
+                        } else { awakeHotkeyNotice = FavoriteAwakeHotKey.shared.lastNotice }
+                    }
+                    Button("사용 안 함") {
+                        if FavoriteAwakeHotKey.shared.changePreset(.disabled) {
+                            awakeHotkeyNotice = "잠자기 방지 단축키가 비활성화되었습니다."
+                            (NSApp.delegate as? AppDelegate)?.updateStatusBarMenu()
+                        }
+                    }
                 }
             }
             HStack(spacing: 8) {
@@ -1966,7 +2025,7 @@ struct HelpAndSettingsView: View {
                 Text(awakeHotkeyNotice).font(.caption).foregroundColor(.secondary)
             }
         }
-        .padding(14).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .padding(12).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
     }
 
     var renamePatternTab: some View {
@@ -2070,7 +2129,23 @@ struct HelpAndSettingsView: View {
                     }.buttonStyle(.borderedProminent).tint(.green).disabled(tempRecordedFlags.isEmpty)
                     Button("취소") { stopRecording() }
                 } else {
-                    Button("단축키 입력하기") { startRecording(for: targetID) }.buttonStyle(.borderedProminent).tint(.orange)
+                    Button("단축키 입력하기") { startRecording(for: targetID) }
+                        .buttonStyle(.borderedProminent).tint(.orange)
+                    Button("초기화") {
+                        let original: NSEvent.ModifierFlags
+                        switch targetID {
+                        case "convert": original = NSEvent.ModifierFlags(rawValue: ShortcutSettings.defaultConvertRaw)
+                        case "tools": original = NSEvent.ModifierFlags(rawValue: ShortcutSettings.defaultToolsRaw)
+                        case "actions": original = NSEvent.ModifierFlags(rawValue: ShortcutSettings.defaultActionsRaw)
+                        default: original = NSEvent.ModifierFlags(rawValue: ShortcutSettings.defaultQualityRaw)
+                        }
+                        if let warning = settings.validationMessage(for: original, target: targetID) {
+                            shortcutValidationWarning = warning
+                        } else {
+                            shortcutValidationWarning = ""
+                            onSave(original)
+                        }
+                    }
                 }
             }
         }.padding(12).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))

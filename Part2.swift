@@ -2467,7 +2467,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard let path = Bundle.main.path(forResource: "icon_awake", ofType: "png") else { return nil }
         return NSImage(contentsOfFile: path)
     }()
-    private let buildIdentifier = "FAV-20261120-HK5"
+    private let buildIdentifier = "FAV-20261120-HK6"
     var wheelPanel: NSPanel?
     var wheelCenterPoint: NSPoint = .zero
     
@@ -2553,7 +2553,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             btn.image = NSImage(systemSymbolName: "circle.hexagongrid.fill", accessibilityDescription: "00Favorite")
         }
-        btn.toolTip = isAwake ? "잠자기 방지 켜짐 · 00Favorite" : "잠자기 방지 꺼짐 · 00Favorite"
+        // 상태는 케이크 아이콘과 메뉴에서만 알립니다. hover 툴팁을 원천 비활성화합니다.
+        btn.toolTip = nil
         btn.needsDisplay = true
     }
 
@@ -2586,16 +2587,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem.separator())
         menu.addItem(makeAwakeMenu())
         menu.addItem(NSMenuItem.separator())
-        let paused = !ShortcutSettings.shared.wheelDetectionEnabled
-        let pauseItem = NSMenuItem(title: paused ? "▶ 안전 모드 휠 감지 재개" : "⏸ 안전 모드 휠 감지 일시 정지", action: #selector(toggleWheelDetection), keyEquivalent: "")
-        pauseItem.target = self
-        menu.addItem(pauseItem)
-        let tapStatus = isWheelMonitorConnected ? "휠 감시 연결됨" : "휠 감시 연결되지 않음 · 설정에서 재연결"
-        menu.addItem(NSMenuItem(title: "🛡️ 읽기 전용 입력 감시 · " + tapStatus, action: nil, keyEquivalent: ""))
-        let folderPermissionsItem = NSMenuItem(title: "🔐 파일·폴더 접근 설정…", action: #selector(openFolderPermissions), keyEquivalent: "")
-        folderPermissionsItem.target = self
-        menu.addItem(folderPermissionsItem)
-        let helpItem = NSMenuItem(title: "📖 설명 및 설정 (단축키 / 홀드·토글 / 이름 양식)...", action: #selector(openHelpAndSettings), keyEquivalent: ",")
+        let helpItem = NSMenuItem(title: "⚙️ 설명 및 설정…", action: #selector(openHelpAndSettings), keyEquivalent: ",")
         helpItem.target = self
         menu.addItem(helpItem)
         menu.addItem(NSMenuItem.separator())
