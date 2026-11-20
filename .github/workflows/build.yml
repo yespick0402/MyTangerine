@@ -21,10 +21,12 @@ jobs:
           test -s Part1.swift || { echo 'ERROR: Part1.swift 없음'; exit 1; }
           test -s Part2.swift || { echo 'ERROR: Part2.swift 없음'; exit 1; }
           test -s icon.png || { echo 'ERROR: icon.png 없음'; exit 1; }
+          test -s icon_awake.png || { echo 'ERROR: icon_awake.png 없음'; exit 1; }
           cat Part1.swift Part2.swift > combined_main.swift
           grep -q 'struct ImageJoinView: View' combined_main.swift || { echo 'ERROR: 이미지 합치기 소스 누락'; exit 1; }
           grep -q 'final class FavoriteAwakeManager' combined_main.swift || { echo 'ERROR: 독립 잠자기 방지 기능 소스 누락'; exit 1; }
           grep -q 'import IOKit.pwr_mgt' combined_main.swift || { echo 'ERROR: IOKit 전원관리 연동 누락'; exit 1; }
+          grep -q 'final class FavoriteAwakeHotKey' combined_main.swift || { echo 'ERROR: 잠자기 토글 단축키 코드 누락'; exit 1; }
 
       - name: Create App Bundle and Icon
         shell: bash
@@ -44,6 +46,7 @@ jobs:
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleShortVersionString</key><string>4.8</string>
             <key>CFBundleVersion</key><string>4.8</string>
+            <key>FavoriteBuildID</key><string>FAV-20261120-HK1</string>
             <key>LSMinimumSystemVersion</key><string>14.0</string>
             <key>LSArchitecturePriority</key><array><string>arm64</string></array>
             <key>LSUIElement</key><true/>
@@ -58,6 +61,7 @@ jobs:
           EOF
           plutil -lint 00Favorite.app/Contents/Info.plist
           cp icon.png 00Favorite.app/Contents/Resources/icon.png
+          cp icon_awake.png 00Favorite.app/Contents/Resources/icon_awake.png
           mkdir -p AppIcon.iconset
           sips -z 16 16 -s format png icon.png --out AppIcon.iconset/icon_16x16.png
           sips -z 32 32 -s format png icon.png --out AppIcon.iconset/icon_16x16@2x.png
@@ -108,7 +112,7 @@ jobs:
         run: |
           set -euo pipefail
           swiftc combined_main.swift \
-            -framework IOKit \
+            -framework IOKit -framework Carbon \
             -o 00Favorite.app/Contents/MacOS/00Favorite \
             -target arm64-apple-macos14.0 -Osize
           strip -x 00Favorite.app/Contents/MacOS/00Favorite
@@ -123,6 +127,6 @@ jobs:
       - name: Upload Finished Mac App
         uses: actions/upload-artifact@v4
         with:
-          name: 00Favorite-4.8-Mac-ARM64
+          name: 00Favorite-4.8-FAV-20261120-HK1-Mac-ARM64
           path: 00Favorite.zip
           if-no-files-found: error
