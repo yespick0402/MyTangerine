@@ -2028,8 +2028,8 @@ final class SafeWheelDropTarget: NSView {
 final class FavoriteAwakeManager {
     static let shared = FavoriteAwakeManager()
 
+    // 사용자 확정: 잠자기 방지는 Mac과 화면 모두 유지하는 단일 모드만 지원합니다.
     enum WakeMode: String {
-        case systemOnly = "system"
         case keepDisplayOn = "display"
     }
 
@@ -2053,7 +2053,9 @@ final class FavoriteAwakeManager {
 
     private init() {
         let defaults = UserDefaults.standard
-        wakeMode = WakeMode(rawValue: defaults.string(forKey: Keys.mode) ?? "system") ?? .systemOnly
+        // HK13의 이전 'Mac만 깨어 있기' 저장값은 화면 유지 모드로 자동 교정합니다.
+        wakeMode = .keepDisplayOn
+        defaults.set(WakeMode.keepDisplayOn.rawValue, forKey: Keys.mode)
         batterySafetyEnabled = defaults.object(forKey: Keys.batterySafetyEnabled) as? Bool ?? true
         let stored = defaults.integer(forKey: Keys.batteryThreshold)
         batteryThreshold = [10, 20, 30].contains(stored) ? stored : 20
@@ -2068,7 +2070,7 @@ final class FavoriteAwakeManager {
 
     var statusText: String {
         guard isActive else { return "꺼짐" }
-        let modeLabel = wakeMode == .keepDisplayOn ? "화면도 유지" : "화면 꺼짐 허용"
+        let modeLabel = "Mac과 화면 모두 유지"
         if let m = remainingMinutes { return "켜짐 · \(m)분 남음 · \(modeLabel)" }
         return "켜짐 · 직접 해제할 때까지 · \(modeLabel)"
     }
@@ -2109,9 +2111,8 @@ final class FavoriteAwakeManager {
         // Swift에서 IOKit의 assertion 이름 상수는 String으로 전달됩니다.
         // IOPMAssertionCreateWithName은 CFString과 UInt32 레벨을 요구하므로
         // 경계를 명시적으로 변환합니다. 파일 변환/전역 입력 처리와는 무관합니다.
-        let assertionTypeName = (mode == .keepDisplayOn)
-            ? kIOPMAssertionTypePreventUserIdleDisplaySleep
-            : kIOPMAssertionTypePreventUserIdleSystemSleep
+        // Mac과 화면을 함께 유지하는 유일한 assertion. 시스템 전용 모드는 사용하지 않습니다.
+        let assertionTypeName = kIOPMAssertionTypePreventUserIdleDisplaySleep
         guard let assertionType = CFStringCreateWithCString(
             kCFAllocatorDefault,
             assertionTypeName,
@@ -2157,16 +2158,6 @@ final class FavoriteAwakeManager {
         }
         let end = minutes.map { Date().addingTimeInterval(TimeInterval($0) * 60.0) }
         return activate(mode: wakeMode, until: end)
-    }
-
-    @discardableResult
-    func setMode(_ mode: WakeMode) -> Bool {
-        guard mode != wakeMode else { return true }
-        if isActive { return activate(mode: mode, until: expiresAt) }
-        wakeMode = mode
-        UserDefaults.standard.set(mode.rawValue, forKey: Keys.mode)
-        onChange?()
-        return true
     }
 
     func setBatterySafetyEnabled(_ enabled: Bool) {
@@ -2798,14 +2789,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         submenu.addItem(durationRoot)
         submenu.addItem(NSMenuItem.separator())
 
-        let computerOnly = NSMenuItem(title: "Mac만 깨어 있기 (화면 자동 꺼짐 허용)", action: #selector(useSystemOnlyAwake), keyEquivalent: "")
-        computerOnly.target = self
-        computerOnly.state = awake.wakeMode == .systemOnly ? .on : .off
-        submenu.addItem(computerOnly)
-        let keepScreen = NSMenuItem(title: "Mac과 화면 모두 켜두기", action: #selector(useDisplayAwake), keyEquivalent: "")
-        keepScreen.target = self
-        keepScreen.state = awake.wakeMode == .keepDisplayOn ? .on : .off
-        submenu.addItem(keepScreen)
+        let fixedModeItem = NSMenuItem(title: "유지 방식: Mac과 화면 모두 켜두기 (고정)", action: nil, keyEquivalent: "")
+        fixedModeItem.isEnabled = false
+        submenu.addItem(fixedModeItem)
         submenu.addItem(NSMenuItem.separator())
 
         let guardItem = NSMenuItem(title: "배터리 부족 시 자동 해제", action: #selector(toggleAwakeBatteryGuard), keyEquivalent: "")
@@ -2872,14 +2858,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
     @objc private func stopAwake() {
         FavoriteAwakeManager.shared.stop()
-        updateStatusBarMenu()
-    }
-    @objc private func useSystemOnlyAwake() {
-        if !FavoriteAwakeManager.shared.setMode(.systemOnly) { showAwakeErrorIfNeeded() }
-        updateStatusBarMenu()
-    }
-    @objc private func useDisplayAwake() {
-        if !FavoriteAwakeManager.shared.setMode(.keepDisplayOn) { showAwakeErrorIfNeeded() }
         updateStatusBarMenu()
     }
     @objc private func toggleAwakeBatteryGuard() {
