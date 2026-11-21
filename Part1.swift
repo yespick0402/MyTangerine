@@ -252,7 +252,7 @@ struct RenameCandidate: Identifiable {
 }
 
 enum CaptureDateInspector {
-    private static let photos: Set<String> = ["jpg","jpeg","heic","heif","png","tif","tiff","webp","bmp","gif","avif","dng","arw","cr2","cr3","nef","raf","orf","rw2"]
+    private static let photos: Set<String> = ["jpg","jpeg","heic","heif","hif","png","tif","tiff","webp","bmp","gif","avif","dng","arw","cr2","cr3","nef","raf","orf","rw2"]
     private static let videos: Set<String> = ["mp4","mov","m4v","mkv","avi","mts","m2ts","3gp","webm","wmv"]
     private static let dateRegex = try! NSRegularExpression(pattern: #"^\s*(\d{4})[:\-](\d{2})[:\-](\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:\s*(Z|[+\-]\d{2}:?\d{2}))?\s*$"#)
 
