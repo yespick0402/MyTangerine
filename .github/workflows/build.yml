@@ -34,6 +34,10 @@ jobs:
           grep -q 'final class FavoriteAwakeHotKey' combined_main.swift || { echo 'ERROR: 잠자기 토글 단축키 코드 누락'; exit 1; }
           if grep -Fq 'NSEvent.addGlobalMonitorForEvents(matching: [.keyDown])' combined_main.swift; then echo 'ERROR: 구형 전역 AppKit 키 감시 재도입 금지'; exit 1; fi
           # Owly와 같은 Carbon 등록형 전역 단축키만 지원. 이벤트 탭은 Finder 휠 읽기 전용 1개뿐.
+          # Mac+화면 단일 모드 검증: 구형 시스템 전용 assertion/선택 메뉴 재유입 금지.
+          grep -q 'kIOPMAssertionTypePreventUserIdleDisplaySleep' combined_main.swift || { echo 'ERROR: 화면 유지 assertion 누락'; exit 1; }
+          if grep -q 'kIOPMAssertionTypePreventUserIdleSystemSleep' combined_main.swift; then echo 'ERROR: 사용하지 않는 Mac만 유지 assertion 재도입 금지'; exit 1; fi
+          if grep -q 'case systemOnly' combined_main.swift; then echo 'ERROR: 제거한 시스템 전용 모드 재도입 금지'; exit 1; fi
           grep -q 'RegisterEventHotKey(' combined_main.swift || { echo 'ERROR: Carbon 전역 단축키 등록 코드 누락'; exit 1; }
           grep -q 'UnregisterEventHotKey(' combined_main.swift || { echo 'ERROR: 등록 해제 코드 누락'; exit 1; }
           grep -q 'InstallEventHandler(' combined_main.swift || { echo 'ERROR: Carbon 단축키 이벤트 핸들러 누락'; exit 1; }
@@ -81,8 +85,8 @@ jobs:
             <key>CFBundleIconFile</key><string>AppIcon</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleShortVersionString</key><string>4.8</string>
-            <key>CFBundleVersion</key><string>4815</string>
-            <key>FavoriteBuildID</key><string>FAV-20261121-HK13</string>
+            <key>CFBundleVersion</key><string>4816</string>
+            <key>FavoriteBuildID</key><string>FAV-20261121-HK13-SCREEN1</string>
             <key>LSMinimumSystemVersion</key><string>14.0</string>
             <key>LSArchitecturePriority</key><array><string>arm64</string></array>
             <key>LSUIElement</key><true/>
@@ -272,6 +276,6 @@ jobs:
       - name: Upload Finished Mac App
         uses: actions/upload-artifact@v4
         with:
-          name: 00Favorite-4.8-HK13-ExifToolFix1-Mac-ARM64
+          name: 00Favorite-4.8-HK13-ScreenOnly1-ExifToolFix1-Mac-ARM64
           path: 00Favorite.zip
           if-no-files-found: error
