@@ -7,7 +7,7 @@ on:
 
 # One source of truth: app build identity. Do not duplicate this literal in checks.
 env:
-  FAVORITE_BUILD_ID: FAV-20261121-HK13-SCREEN1
+  FAVORITE_BUILD_ID: FAV-20261121-HK13-SCREEN1-HIF1
 
 jobs:
   build:
@@ -56,6 +56,20 @@ jobs:
           print('HOTKEY / WHEEL ISOLATION: VERIFIED')
           PY
           grep -q 'canObserveActionRelease' combined_main.swift || { echo 'ERROR: Control 액션 드롭 보완 소스 누락'; exit 1; }
+          # HIF1 regression guard: camera HEIF in Sony .HIF naming is a supported photo.
+          python3 - <<'PY_HIF'
+          import re
+          from pathlib import Path
+          src = Path('Part1.swift').read_text()
+          matched = re.search(r'private static let photos: Set<String> = \[([^\]]+)\]', src)
+          if not matched:
+              raise SystemExit('ERROR: CaptureDateInspector photo extension list not found')
+          allowed = set(re.findall(r'"([a-z0-9]+)"', matched.group(1)))
+          missing = {'arw', 'heic', 'heif', 'hif'} - allowed
+          if missing:
+              raise SystemExit('ERROR: photo capture-date extensions missing: ' + str(sorted(missing)))
+          print('Capture date photo formats ARW/HEIF/HEIC/HIF: VERIFIED')
+          PY_HIF
 
       - name: Preflight - macOS SDK Swift typecheck
         shell: bash
@@ -90,7 +104,7 @@ jobs:
             <key>CFBundleIconFile</key><string>AppIcon</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleShortVersionString</key><string>4.8</string>
-            <key>CFBundleVersion</key><string>4816</string>
+            <key>CFBundleVersion</key><string>4817</string>
             <key>FavoriteBuildID</key><string>${FAVORITE_BUILD_ID}</string>
             <key>LSMinimumSystemVersion</key><string>14.0</string>
             <key>LSArchitecturePriority</key><array><string>arm64</string></array>
@@ -298,6 +312,6 @@ jobs:
       - name: Upload Finished Mac App
         uses: actions/upload-artifact@v4
         with:
-          name: 00Favorite-4.8-HK13-ScreenOnly1-ExifToolFix1-Mac-ARM64
+          name: 00Favorite-4.8-HK13-ScreenOnly1-HIF1-ExifToolFix1-Mac-ARM64
           path: 00Favorite.zip
           if-no-files-found: error
